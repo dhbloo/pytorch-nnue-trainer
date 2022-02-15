@@ -3,7 +3,8 @@ import os, sys
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))
 
 from utils import sgf
-from utils.bin import *
+from dataset.packed_binary import *
+from dataset.basic_types import Rule
 import argparse
 import os
 import lz4.frame
