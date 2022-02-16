@@ -1,8 +1,9 @@
 from torch.utils.data.dataloader import DataLoader
-from configargparse import ArgParser
 from dataset import build_dataset
-import numpy as np
+import torch
 import matplotlib.pyplot as plt
+import configargparse
+import yaml
 
 
 def process_bin(index, result, ply, boardsize, rule, move, position):
@@ -19,7 +20,8 @@ def process_bin(index, result, ply, boardsize, rule, move, position):
     pass
 
 
-def visualize_entry(board_size,
+def visualize_entry(fixed_side_input,
+                    board_size,
                     board_input,
                     stm_input=None,
                     policy_target=None,
@@ -27,6 +29,11 @@ def visualize_entry(board_size,
                     last_move=None,
                     **kwargs):
     H, W = board_size
+
+    if not fixed_side_input and stm_input == 1:
+        board_input = torch.flip(board_input, dims=(1, ))
+        value_target = torch.stack([value_target[:, 1], value_target[:, 0], value_target[:, 2]],
+                                   dim=1)
 
     fig = plt.figure(figsize=[5, 5])
     fig.patch.set_facecolor((1, 1, 1))
@@ -92,16 +99,22 @@ def visualize_dataset(dataset):
         if 'position_string' in data:
             optional_texts += [f"pos={data['position_string']}"]
         print(f"Data Entry[{index}]: bs={(bs[0][0], bs[1][0])} {' '.join(optional_texts)}")
-        visualize_entry(**data)
+        visualize_entry(dataset.fixed_side_input, **data)
 
 
 if __name__ == "__main__":
-    parser = ArgParser(description="Dataset visualizer")
+    parser = configargparse.ArgParser(description="Dataset visualizer",
+                                      config_file_parser_class=configargparse.YAMLConfigFileParser)
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
     parser.add('data_paths', nargs='+', help="Dataset file or directory paths")
     parser.add('--dataset_type', required=True, help="Dataset type")
+    parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--shuffle', action='store_true', default=True, help="Shuffle dataset")
     parser.add('--max_show_num', type=int, default=None, help="Max number of entries to show")
-    options = parser.parse_args()
-    options_dict = {k: v for k, v in vars(options).items() if v is not None}
-    dataset = build_dataset(**options_dict)
+    args = parser.parse_args()
+
+    dataset = build_dataset(args.dataset_type,
+                            args.data_paths,
+                            shuffle=args.shuffle,
+                            **args.dataset_args)
     visualize_dataset(dataset)

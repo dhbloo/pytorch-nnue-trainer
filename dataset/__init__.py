@@ -1,6 +1,6 @@
 from .packed_binary import PackedBinaryDataset
 from .katago import KatagoNumpyDataset, ProcessedKatagoNumpyDataset
-import os
+from utils.file_utils import make_file_list
 
 DATASETS = {
     'packed_binary': PackedBinaryDataset,
@@ -14,23 +14,14 @@ DATASET_FILE_EXTS = {
 }
 
 
-def make_file_list(data_paths, file_exts=None):
-    file_lists = []
-    for path in data_paths:
-        if os.path.isfile(path):
-            file_lists.append(path)
-        elif os.path.isdir(path):
-            for root, dirs, files in os.walk(path):
-                for file in files:
-                    ext = os.path.splitext(file)[1][1:]
-                    if file_exts is None or ext in file_exts:
-                        file_lists.append(os.path.join(root, file))
-        else:
-            raise IOError(f'"{path}" is not a file or directory')
-    return file_lists
-
-
-def build_dataset(dataset_type, data_paths, rules=None, boardsizes=None, boardsize=None, **kwargs):
+def build_dataset(dataset_type,
+                  data_paths,
+                  rules=None,
+                  boardsizes=None,
+                  boardsize=None,
+                  fixed_side_input=False,
+                  shuffle=False,
+                  **kwargs):
     assert dataset_type in DATASETS
 
     file_list = make_file_list(data_paths, DATASET_FILE_EXTS[dataset_type])
@@ -44,4 +35,6 @@ def build_dataset(dataset_type, data_paths, rules=None, boardsizes=None, boardsi
     return DATASETS[dataset_type](file_list=file_list,
                                   rules=rules,
                                   boardsizes=boardsizes,
+                                  fixed_side_input=fixed_side_input,
+                                  shuffle=shuffle,
                                   **kwargs)

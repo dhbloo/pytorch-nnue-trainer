@@ -3,7 +3,8 @@ from torch.utils.data.dataset import IterableDataset
 from enum import Enum
 import lz4.frame
 import ctypes
-from utils.data_util import Move, Rule, Symmetry
+import random
+from utils.data_utils import Move, Rule, Symmetry
 
 
 class Result(Enum):
@@ -58,12 +59,27 @@ def read_entry(f):
 
 
 class PackedBinaryDataset(IterableDataset):
-    def __init__(self, file_list, rules, boardsizes, apply_symmetry=False, **kwargs):
+    def __init__(self,
+                 file_list,
+                 rules,
+                 boardsizes,
+                 fixed_side_input,
+                 apply_symmetry=False,
+                 shuffle=False,
+                 sample_rate=1.0,
+                 **kwargs):
         super().__init__()
         self.file_list = file_list
         self.rules = rules
         self.boardsizes = boardsizes
+        self.fixed_side_input = fixed_side_input
         self.apply_symmetry = apply_symmetry
+        self.shuffle = shuffle
+        self.sample_rate = sample_rate
+
+    @property
+    def is_fixed_side_input(self):
+        return self.fixed_side_input
 
     def _open_binary_file(self, filename: str):
         if filename.endswith("lz4"):
@@ -80,15 +96,22 @@ class PackedBinaryDataset(IterableDataset):
             return None
 
         stm_is_black = ply % 2 == 0
-        if not stm_is_black:
-            result = Result.opposite(result)
-        board_input = np.zeros((2, bsize, bsize), dtype=np.float32)
-        policy_target = np.zeros(boardsize, dtype=np.float32)
-        value_target = np.array(
-            [result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.float32)
+
+        board_input = np.zeros((2, bsize, bsize), dtype=np.int8)
         for i, m in enumerate(position):
-            board_input[i % 2, m.y, m.x] = 1.0
-        policy_target[move.y, move.x] = 1.0
+            if self.fixed_side_input:
+                side_idx = i % 2
+            else:
+                side_idx = 0 if i % 2 == ply % 2 else 1
+            board_input[side_idx, m.y, m.x] = 1
+
+        if self.fixed_side_input and not stm_is_black:
+            result = Result.opposite(result)
+        value_target = np.array(
+            [result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.int8)
+
+        policy_target = np.zeros(boardsize, dtype=np.int8)
+        policy_target[move.y, move.x] = 1
 
         if self.apply_symmetry:
             symmetries = Symmetry.available_symmetries(boardsize)
@@ -117,9 +140,12 @@ class PackedBinaryDataset(IterableDataset):
         }
 
     def __iter__(self):
-        for filename in self.file_list:
+        file_list = [fn for fn in self.file_list]
+        if self.shuffle:
+            random.shuffle(file_list)
+        for filename in file_list:
             with self._open_binary_file(filename) as f:
                 while f.peek() != b'':
                     data = self._prepare_data_from_entry(*read_entry(f))
-                    if data is not None:
+                    if data is not None and random.random() < self.sample_rate:
                         yield data

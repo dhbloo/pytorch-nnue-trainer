@@ -1,15 +1,31 @@
 import numpy as np
 from torch.utils.data.dataset import Dataset, IterableDataset
-from utils.data_util import Symmetry
+from utils.data_utils import Symmetry
+import random
 
 
 class KatagoNumpyDataset(IterableDataset):
-    def __init__(self, file_list, rules, boardsizes, apply_symmetry=False, **kwargs):
+    def __init__(self,
+                 file_list,
+                 rules,
+                 boardsizes,
+                 fixed_side_input,
+                 apply_symmetry=False,
+                 shuffle=False,
+                 sample_rate=1.0,
+                 **kwargs):
         super().__init__()
         self.file_list = file_list
         self.rules = rules
         self.boardsizes = boardsizes
+        self.fixed_side_input = fixed_side_input
         self.apply_symmetry = apply_symmetry
+        self.shuffle = shuffle
+        self.sample_rate = sample_rate
+
+    @property
+    def is_fixed_side_input(self):
+        return self.fixed_side_input
 
     def _unpack_global_feature(self, packed_data):
         # Channel 5: side to move (black = -1, white = 1)
@@ -26,7 +42,7 @@ class KatagoNumpyDataset(IterableDataset):
 
         board_input_stm = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder='big')
         board_input_stm = board_input_stm.reshape(length, 2, bsize, bsize)
-        return board_input_stm.astype(np.float32)
+        return board_input_stm
 
     def _unpack_global_target(self, packed_data):
         # Channel 0: stm win probability
@@ -69,7 +85,7 @@ class KatagoNumpyDataset(IterableDataset):
             return None
 
         # Flip side when stm is white
-        if data['stm_input'] == 1:
+        if self.fixed_side_input and data['stm_input'] == 1:
             data['board_input'] = np.flip(data['board_input'], axis=0).copy()
             value_target = data['value_target']
             value_target[0], value_target[1] = value_target[1], value_target[0]
@@ -83,20 +99,30 @@ class KatagoNumpyDataset(IterableDataset):
         return data
 
     def __iter__(self):
-        for filename in self.file_list:
+        file_list = [fn for fn in self.file_list]
+        if self.shuffle:
+            random.shuffle(file_list)
+        for filename in file_list:
             data_dict, length = self._unpack_data(**np.load(filename))
             for idx in range(length):
                 data = self._prepare_entry_data(data_dict, idx)
-                if data is not None:
+                if data is not None and random.random() < self.sample_rate:
                     yield data
 
 
 class ProcessedKatagoNumpyDataset(Dataset):
-    def __init__(self, file_list, rules, boardsizes, apply_symmetry=False):
+    def __init__(self,
+                 file_list,
+                 rules,
+                 boardsizes,
+                 fixed_side_input,
+                 apply_symmetry=False,
+                 **kwargs):
         super().__init__()
         self.file_list = file_list
         self.rules = rules
         self.boardsizes = boardsizes
+        self.fixed_side_input = fixed_side_input
         self.apply_symmetry = apply_symmetry
 
         self.tensor_lists = {
@@ -118,6 +144,10 @@ class ProcessedKatagoNumpyDataset(Dataset):
             self.symmetries = Symmetry.available_symmetries(self.boardsize)
         else:
             self.symmetries = [Symmetry.IDENTITY]
+
+    @property
+    def is_fixed_side_input(self):
+        return self.fixed_side_input
 
     def __len__(self):
         return len(self.tensor_lists) * len(self.symmetries)
