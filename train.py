@@ -46,7 +46,7 @@ def parse_args_and_init():
     parser.add('--val_interval', type=int, default=10000, help="Num iterations to do validation")
     parser.add('--avg_loss_interval',
                type=int,
-               default=1000,
+               default=2500,
                help="Num iterations to average loss")
 
     args = parser.parse_args()  # parse args
@@ -54,8 +54,8 @@ def parse_args_and_init():
     os.makedirs(args.rundir, exist_ok=True)  # make run directory
     # write run config
     run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
-    if (args.config is not None
-            and os.path.abspath(args.config) != os.path.abspath(run_cfg_filename)):
+    if (args.config is None
+            or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename)):
         parser.write_config_file(args, [run_cfg_filename])
     seed_everything(args.seed)  # set seed
     print('-' * 60)

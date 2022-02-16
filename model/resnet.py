@@ -48,8 +48,8 @@ class BasicInputPlane(nn.Module):
 class OutputHeadV0(nn.Module):
     def __init__(self, dim_feature, dim_value=3, dim_policy=1):
         super().__init__()
-        self.value_head = LinearBlock(dim_feature, dim_value)
-        self.policy_head = Conv2dBlock(dim_feature, dim_policy, ks=1, st=1)
+        self.value_head = LinearBlock(dim_feature, dim_value, activation='none')
+        self.policy_head = Conv2dBlock(dim_feature, dim_policy, ks=1, st=1, activation='none')
 
     def forward(self, feature):
         # value head

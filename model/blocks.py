@@ -37,8 +37,7 @@ class ClippedReLU(nn.Module):
 class LinearBlock(nn.Module):
     def __init__(self, in_dim, out_dim, norm='none', activation='relu'):
         super(LinearBlock, self).__init__()
-        use_bias = True
-        self.fc = nn.Linear(in_dim, out_dim, bias=use_bias)
+        self.fc = nn.Linear(in_dim, out_dim)
 
         # initialize normalization
         norm_dim = out_dim
