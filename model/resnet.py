@@ -15,9 +15,15 @@ def build_input_plane(input_type):
         assert 0, f"Unsupported input: {input_type}"
 
 
-def build_head(head_type, dim_feature, dim_value=3, dim_policy=1):
+def build_head(head_type, dim_feature):
+    if '-nodraw' in head_type:
+        dim_value = 1
+        head_type = head_type.replace('-nodraw', '')
+    else:
+        dim_value = 3
+
     if head_type == 'v0':
-        return OutputHeadV0(dim_feature, dim_value, dim_policy)
+        return OutputHeadV0(dim_feature, dim_value)
     else:
         assert 0, f"Unsupported head: {head_type}"
 
@@ -46,10 +52,10 @@ class BasicInputPlane(nn.Module):
 
 
 class OutputHeadV0(nn.Module):
-    def __init__(self, dim_feature, dim_value=3, dim_policy=1):
+    def __init__(self, dim_feature, dim_value=3):
         super().__init__()
         self.value_head = LinearBlock(dim_feature, dim_value, activation='none')
-        self.policy_head = Conv2dBlock(dim_feature, dim_policy, ks=1, st=1, activation='none')
+        self.policy_head = Conv2dBlock(dim_feature, 1, ks=1, st=1, activation='none')
 
     def forward(self, feature):
         # value head

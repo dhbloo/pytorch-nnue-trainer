@@ -1,5 +1,6 @@
 import torch
 import numpy as np
+import torch.nn.functional as F
 from accelerate import Accelerator
 from tensorboardX import SummaryWriter
 from collections import deque
@@ -43,7 +44,7 @@ def parse_args_and_init():
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
     parser.add('--save_interval', type=int, default=10000, help="Num iterations to save snapshot")
-    parser.add('--val_interval', type=int, default=50000, help="Num iterations to do validation")
+    parser.add('--val_interval', type=int, default=20000, help="Num iterations to do validation")
     parser.add('--avg_loss_interval',
                type=int,
                default=2500,
@@ -63,6 +64,7 @@ def parse_args_and_init():
 
 
 def calc_loss(loss_type, value, policy, data):
+    value_loss_type, policy_loss_type = loss_type.split('+')
     value_target = data['value_target']
     policy_target = data['policy_target']
 
@@ -70,14 +72,34 @@ def calc_loss(loss_type, value, policy, data):
     policy_target = torch.flatten(policy_target, start_dim=1)
     policy = torch.flatten(policy, start_dim=1)
 
-    if loss_type == 'CE+CE':
-        value_loss = cross_entropy_with_softlabel(value, value_target, adjust=True)
-        policy_loss = cross_entropy_with_softlabel(policy, policy_target, adjust=True)
-    elif loss_type == 'CE+MSE':
-        value_loss = cross_entropy_with_softlabel(value, value_target, adjust=True)
-        policy_loss = ((policy - policy_target)**2).mean()
+    # convert value_target if value has no draw info
+    if value.size(1) == 1:
+        value = value[:, 0]
+        value_target = value_target[:, 0] - value_target[:, 1]
+        value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
+
+    # value loss
+    if value_loss_type == 'CE':
+        if value.ndim == 1:
+            value_loss = (F.binary_cross_entropy_with_logits(value, value_target) -
+                          F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target))
+        else:
+            value_loss = cross_entropy_with_softlabel(value, value_target, adjust=True)
+    elif value_loss_type == 'MSE':
+        if value.ndim == 1:
+            value_loss = F.mse_loss(value, value_target)
+        else:
+            assert 0, "MSE value loss must be used with '-nodraw' model"
     else:
-        assert 0, f"Unsupported loss: {loss_type}"
+        assert 0, f"Unsupported value loss: {value_loss_type}"
+
+    # policy loss
+    if policy_loss_type == 'CE':
+        policy_loss = cross_entropy_with_softlabel(policy, policy_target, adjust=True)
+    elif policy_loss_type == 'MSE':
+        policy_loss = F.mse_loss(policy, policy_target)
+    else:
+        assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
     total_loss = value_loss + policy_loss
     return total_loss, {
@@ -127,7 +149,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
         model.load_state_dict(state_dicts['model'])
         optimizer.load_state_dict(state_dicts['optimizer'])
         accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
-        epoch, it = state_dicts.get('iteration', 0), state_dicts.get('epoch', 0)
+        epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
     else:
         model.apply(weights_init(init_type))
         epoch, it = 0, 0
@@ -179,8 +201,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                 log_value_dict(
                     tb_logger, 'running_stat', {
                         'epoch': epoch,
-                        'total_entries': it * batch_size,
-                        'elasped(s)': elasped,
+                        'elasped_seconds': elasped,
                         'it/s': speed,
                         'entry/s': speed * batch_size,
                     }, it)
