@@ -13,7 +13,7 @@ from dataset import build_dataset
 from model import build_model
 from utils.training_utils import cross_entropy_with_softlabel, \
     build_optimizer, weights_init, build_data_loader
-from utils.misc_utils import add_dict_to, seed_everything, write_loss_dict
+from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
 from utils.file_utils import find_latest_model_file
 
 
@@ -37,13 +37,13 @@ def parse_args_and_init():
     parser.add('--batch_size', type=int, default=128, help="Batch size")
     parser.add('--num_worker', type=int, default=8, help="Num of dataloader workers")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
-    parser.add('--weight_decay', type=float, default=1e-6, help="Weight decay")
+    parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
     parser.add('--shuffle', action='store_true', default=True, help="Shuffle dataset")
     parser.add('--seed', type=int, default=42, help="Random seed")
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
     parser.add('--save_interval', type=int, default=10000, help="Num iterations to save snapshot")
-    parser.add('--val_interval', type=int, default=10000, help="Num iterations to do validation")
+    parser.add('--val_interval', type=int, default=50000, help="Num iterations to do validation")
     parser.add('--avg_loss_interval',
                type=int,
                default=2500,
@@ -54,8 +54,7 @@ def parse_args_and_init():
     os.makedirs(args.rundir, exist_ok=True)  # make run directory
     # write run config
     run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
-    if (args.config is None
-            or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename)):
+    if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
         parser.write_config_file(args, [run_cfg_filename])
     seed_everything(args.seed)  # set seed
     print('-' * 60)
@@ -128,16 +127,18 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
         model.load_state_dict(state_dicts['model'])
         optimizer.load_state_dict(state_dicts['optimizer'])
         accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
+        epoch, it = state_dicts.get('iteration', 0), state_dicts.get('epoch', 0)
     else:
         model.apply(weights_init(init_type))
+        epoch, it = 0, 0
 
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader:
         val_loader = accelerator.prepare_data_loader(val_loader)
 
-    epoch, it = 0, 0
-    last_it = 0
+    accelerator.print(f'Start training from iteration {it}, epoch {epoch}')
+    last_it = it
     last_time = time.time()
     stop_training = False
     avg_loss_dict = {}
@@ -165,7 +166,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
 
             # logging
             if it % log_interval == 0 and accelerator.is_local_main_process:
-                write_loss_dict(tb_logger, 'train', {'epoch': epoch, **loss_dict}, it)
+                log_value_dict(tb_logger, 'train', loss_dict, it)
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({'it': it, 'train_loss': loss_dict})
                     log.writelines([json_text, '\n'])
@@ -174,7 +175,16 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
             if it % show_interval == 0 and accelerator.is_local_main_process:
                 elasped = time.time() - last_time
                 num_it = it - last_it
-                print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{num_it/elasped:.2f}it/s]" +
+                speed = num_it / elasped
+                log_value_dict(
+                    tb_logger, 'running_stat', {
+                        'epoch': epoch,
+                        'total_entries': it * batch_size,
+                        'elasped(s)': elasped,
+                        'it/s': speed,
+                        'entry/s': speed * batch_size,
+                    }, it)
+                print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]" +
                       f" total: {loss_dict['total_loss']:.4f}," +
                       f" value: {loss_dict['value_loss']:.4f}," +
                       f" policy: {loss_dict['policy_loss']:.4f}")
@@ -186,6 +196,8 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                 snapshot_filename = os.path.join(rundir, f"ckpt_{model.name}_{it:08d}.pth")
                 torch.save(
                     {
+                        "iteration": it,
+                        "epoch": epoch,
                         "model": accelerator.get_state_dict(model),
                         "optimizer": optimizer.state_dict(),
                     }, snapshot_filename)
@@ -206,7 +218,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                 for k in val_loss_dict:
                     val_loss_dict[k] /= num_val_entries
 
-                write_loss_dict(tb_logger, 'validation', val_loss_dict, it)
+                log_value_dict(tb_logger, 'validation', val_loss_dict, it)
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({'it': it, 'val_loss': val_loss_dict})
                     log.writelines([json_text, '\n'])

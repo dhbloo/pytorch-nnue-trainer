@@ -21,6 +21,6 @@ def add_dict_to(total_dict, dict_to_add):
             total_dict[k] = v
 
 
-def write_loss_dict(tb_logger, tag, loss_dict, it):
-    for name, loss in loss_dict.items():
-        tb_logger.add_scalar(f'{tag}/{name}', loss, it)
+def log_value_dict(tb_logger, tag, value_dict, it):
+    for name, value in value_dict.items():
+        tb_logger.add_scalar(f'{tag}/{name}', value, it)

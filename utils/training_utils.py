@@ -11,8 +11,7 @@ from torch.utils.data.dataloader import DataLoader
 def weights_init(init_type):
     def init_fun(m):
         classname = m.__class__.__name__
-        if (classname.find('Conv') == 0 or classname.find(
-                'Linear') == 0) and hasattr(m, 'weight'):
+        if (classname.find('Conv') == 0 or classname.find('Linear') == 0) and hasattr(m, 'weight'):
             if init_type == 'gaussian':
                 init.normal_(m.weight.data, 0.0, 0.02)
             elif init_type == 'xavier':
@@ -37,16 +36,11 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
     if optim_type == 'adamw':
         opt = optim.AdamW(parameters,
                           lr=lr,
-                          betas=(kwargs.get('beta1', 0.9),
-                                 kwargs.get('beta2', 0.999)),
+                          betas=(kwargs.get('beta1', 0.9), kwargs.get('beta2', 0.999)),
                           eps=1e-8,
                           weight_decay=weight_decay)
     elif optim_type == 'sgd':
-        opt = optim.SGD(parameters,
-                        lr=lr,
-                        momentum=0,
-                        dampening=0,
-                        weight_decay=weight_decay)
+        opt = optim.SGD(parameters, lr=lr, momentum=0, dampening=0, weight_decay=weight_decay)
     elif optim_type == 'sgd_momentum':
         opt = optim.SGD(parameters,
                         lr=lr,
@@ -59,12 +53,21 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
     return opt
 
 
-def build_data_loader(dataset, batch_size=1, shuffle=False, shuffle_buffer_size=8192, **kwargs):
+def build_data_loader(dataset,
+                      batch_size=1,
+                      shuffle=False,
+                      shuffle_buffer_size=8192,
+                      drop_last=True,
+                      **kwargs):
     if shuffle and isinstance(dataset, IterableDataset):
         dataset = ShuffleDataset(dataset, shuffle_buffer_size)
-        dataloader = DataLoader(dataset, batch_size, **kwargs)
+        dataloader = DataLoader(dataset, batch_size, drop_last=drop_last, **kwargs)
     else:
-        dataloader = DataLoader(dataset, batch_size, shuffle=shuffle, **kwargs)
+        dataloader = DataLoader(dataset,
+                                batch_size,
+                                shuffle=shuffle,
+                                drop_last=drop_last,
+                                **kwargs)
     return dataloader
 
 

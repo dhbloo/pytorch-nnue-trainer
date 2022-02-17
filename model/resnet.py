@@ -90,4 +90,4 @@ class ResNet(nn.Module):
     @property
     def name(self):
         b, f = self.model_size
-        return f"Resnet_{self.input_type}_{b}b{f}f{self.head_type}"
+        return f"resnet_{self.input_type}_{b}b{f}f{self.head_type}"
