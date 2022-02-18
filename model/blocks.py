@@ -15,6 +15,8 @@ def build_activation_layer(activation):
         return nn.Sigmoid()
     elif activation == 'gelu':
         return nn.GELU()
+    elif activation == 'silu':
+        return nn.SiLU(inplace=True)
     elif activation == 'none':
         return None
     else:
@@ -35,9 +37,9 @@ class ClippedReLU(nn.Module):
 
 
 class LinearBlock(nn.Module):
-    def __init__(self, in_dim, out_dim, norm='none', activation='relu'):
+    def __init__(self, in_dim, out_dim, norm='none', activation='relu', bias=True):
         super(LinearBlock, self).__init__()
-        self.fc = nn.Linear(in_dim, out_dim)
+        self.fc = nn.Linear(in_dim, out_dim, bias)
 
         # initialize normalization
         norm_dim = out_dim
@@ -72,9 +74,10 @@ class Conv2dBlock(nn.Module):
                  norm='none',
                  activation='relu',
                  pad_type='zeros',
-                 use_bias=True,
-                 activation_first=False,
+                 bias=True,
                  dilation=(1, ),
+                 groups=1,
+                 activation_first=False,
                  use_spectral_norm=False):
         super(Conv2dBlock, self).__init__()
         assert pad_type in ['zeros', 'reflect', 'replicate',
@@ -102,7 +105,8 @@ class Conv2dBlock(nn.Module):
             st,
             padding=padding,
             dilation=dilation,
-            bias=use_bias,
+            groups=groups,
+            bias=bias,
             padding_mode=pad_type,
         )
 
