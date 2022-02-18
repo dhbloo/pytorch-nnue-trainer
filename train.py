@@ -22,12 +22,24 @@ def parse_args_and_init():
     parser = configargparse.ArgParser(description="Trainer",
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
-    parser.add('-d', '--train_datas', nargs='+', help="Training dataset file or directory paths")
+    parser.add('-d',
+               '--train_datas',
+               nargs='+',
+               required=True,
+               help="Training dataset file or directory paths")
     parser.add('-v', '--val_datas', nargs='+', help="Validation dataset file or directory paths")
     parser.add('-r', '--rundir', required=True, help="Run directory")
     parser.add('--use_cpu', action='store_true', help="Use cpu only")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--dataloader_args',
+               type=yaml.safe_load,
+               default={},
+               help="Extra dataloader arguments")
+    parser.add('--num_worker',
+               type=int,
+               default=min(8, os.cpu_count()),
+               help="Num of dataloader workers")
     parser.add('--model_type', required=True, help="Model type")
     parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add('--optim_type', default='adamw', help='Optimizer type')
@@ -36,7 +48,6 @@ def parse_args_and_init():
     parser.add('--loss_type', default='CE+CE', help='Loss type')
     parser.add('--iterations', type=int, default=1000000, help="Num iterations")
     parser.add('--batch_size', type=int, default=128, help="Batch size")
-    parser.add('--num_worker', type=int, default=8, help="Num of dataloader workers")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
     parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
     parser.add('--shuffle', action='store_true', default=True, help="Shuffle dataset")
@@ -109,10 +120,11 @@ def calc_loss(loss_type, value, policy, data):
     }
 
 
-def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset_args, model_type,
-                  model_args, optim_type, optim_args, init_type, loss_type, iterations, batch_size,
-                  num_worker, learning_rate, weight_decay, shuffle, log_interval, show_interval,
-                  save_interval, val_interval, avg_loss_interval, **kwargs):
+def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
+                  dataloader_args, model_type, model_args, optim_type, optim_args, init_type,
+                  loss_type, iterations, batch_size, num_worker, learning_rate, weight_decay,
+                  shuffle, log_interval, show_interval, save_interval, val_interval,
+                  avg_loss_interval, **kwargs):
     tb_logger = SummaryWriter(os.path.join(rundir, "log"))
     log_filename = os.path.join(rundir, 'training_log.json')
 
@@ -124,13 +136,15 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     train_loader = build_data_loader(train_dataset,
                                      batch_size,
                                      num_workers=num_worker,
-                                     shuffle=shuffle)
+                                     shuffle=shuffle,
+                                     **dataloader_args)
     if val_datas:
         val_dataset = build_dataset(dataset_type, val_datas, shuffle=shuffle, **dataset_args)
         val_loader = build_data_loader(val_dataset,
                                        batch_size,
                                        num_workers=num_worker,
-                                       shuffle=shuffle)
+                                       shuffle=False,
+                                       **dataloader_args)
     else:
         val_dataset, val_loader = None, None
 
@@ -145,7 +159,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     # load checkpoint if exists
     ckpt_filename = find_latest_model_file(rundir, f"ckpt_{model.name}")
     if ckpt_filename:
-        state_dicts = torch.load(ckpt_filename)
+        state_dicts = torch.load(ckpt_filename, map_location=accelerator.device)
         model.load_state_dict(state_dicts['model'])
         optimizer.load_state_dict(state_dicts['optimizer'])
         accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
@@ -156,7 +170,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
 
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
-    if val_loader:
+    if val_loader is not None:
         val_loader = accelerator.prepare_data_loader(val_loader)
 
     accelerator.print(f'Start training from iteration {it}, epoch {epoch}')
@@ -224,25 +238,50 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                     }, snapshot_filename)
 
             # validation
-            if it % val_interval == 0 and val_loader and accelerator.is_local_main_process:
+            if it % val_interval == 0 and val_loader is not None:
+                val_start_time = time.time()
                 val_loss_dict = {}
-                num_val_entries = 0
+                num_val_batches = 0
 
                 with torch.no_grad():
                     for val_data in val_loader:
                         value, policy = model(val_data)
                         _, val_losses = calc_loss(loss_type, value, policy, val_data)
                         add_dict_to(val_loss_dict, val_losses)
-                        num_val_entries += 1
+                        num_val_batches += 1
 
-                # average all losses
-                for k in val_loss_dict:
-                    val_loss_dict[k] /= num_val_entries
+                # convert losses floats to tensor
+                for k, loss in val_loss_dict.items():
+                    val_loss_dict[k] = torch.FloatTensor([loss])
+                val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches])
+                # gather all loss dict across processes
+                all_val_loss_dict = accelerator.gather(val_loss_dict)
 
-                log_value_dict(tb_logger, 'validation', val_loss_dict, it)
-                with open(log_filename, 'a') as log:
-                    json_text = json.dumps({'it': it, 'val_loss': val_loss_dict})
-                    log.writelines([json_text, '\n'])
+                if accelerator.is_local_main_process:
+                    # average all losses
+                    num_val_batches_tensor = all_val_loss_dict.pop('num_val_batches')
+                    num_val_batches = torch.sum(num_val_batches_tensor).item()
+                    val_loss_dict = {}
+                    for k, loss_tensor in all_val_loss_dict.items():
+                        val_loss_dict[k] = torch.sum(loss_tensor).item() / num_val_batches
+
+                    val_elasped = time.time() - val_start_time
+                    num_val_entries = num_val_batches * batch_size
+                    # log validation results
+                    log_value_dict(tb_logger, 'validation', val_loss_dict, it)
+                    with open(log_filename, 'a') as log:
+                        json_text = json.dumps({
+                            'it': it,
+                            'epoch': epoch,
+                            'val_loss': val_loss_dict,
+                            'num_val_entries': num_val_entries,
+                            'elasped_seconds': val_elasped,
+                        })
+                        log.writelines([json_text, '\n'])
+                    print(f"[validation][{num_val_entries} entries][{val_elasped:.2f}s]" +
+                          f" total: {val_loss_dict['total_loss']:.4f}," +
+                          f" value: {val_loss_dict['value_loss']:.4f}," +
+                          f" policy: {val_loss_dict['policy_loss']:.4f}")
 
 
 if __name__ == "__main__":

@@ -174,7 +174,7 @@ class Mix6Net(nn.Module):
         policy = self.policy_activation(policy)
 
         # value head
-        value = feature[:, dim_policy:].mean((2, 3))
+        value = torch.mean(feature[:, dim_policy:], dim=(2, 3))
         value = self.value_activation(value)
         value = value + self.value_linear(value)
         value = self.value_linear_final(value)

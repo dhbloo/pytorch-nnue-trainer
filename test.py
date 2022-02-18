@@ -1,0 +1,190 @@
+import torch
+import numpy as np
+from accelerate import Accelerator
+from tqdm.auto import tqdm
+import configargparse
+import yaml
+import json
+import time
+import os
+
+from dataset import build_dataset
+from model import build_model
+from utils.training_utils import build_data_loader
+from utils.misc_utils import add_dict_to, seed_everything
+from utils.file_utils import find_latest_model_file
+
+
+def parse_args_and_init():
+    parser = configargparse.ArgParser(description="Trainer",
+                                      config_file_parser_class=configargparse.YAMLConfigFileParser)
+    parser.add('checkpoint', help="Model checkpoint file to test")
+    parser.add('-c', '--config', is_config_file=True, help='Config file path')
+    parser.add('-d',
+               '--datas',
+               nargs='+',
+               required=True,
+               help="Test dataset file or directory paths")
+    parser.add('--use_cpu', action='store_true', help="Use cpu only")
+    parser.add('--dataset_type', required=True, help="Dataset type")
+    parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--dataloader_args',
+               type=yaml.safe_load,
+               default={},
+               help="Extra dataloader arguments")
+    parser.add('--model_type', required=True, help="Model type")
+    parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add('--batch_size', type=int, default=128, help="Batch size")
+    parser.add('--num_worker', type=int, default=8, help="Num of dataloader workers")
+    parser.add('--seed', type=int, default=42, help="Random seed")
+
+    args, _ = parser.parse_known_args()  # parse args
+    parser.print_values()  # print out values
+    seed_everything(args.seed)  # set seed
+    print('-' * 60)
+
+    return args
+
+
+def top_k_accuracy(policy, policy_target, k):
+    _, topkmoves = torch.topk(policy, dim=1, k=k, sorted=False)
+    _, topkmoves_target = torch.topk(policy_target, dim=1, k=k, sorted=False)
+    move_correct_count = 0
+    for moves, moves_target in zip(topkmoves, topkmoves_target):
+        moveset = set(moves.tolist())
+        moveset_target = set(moves_target.tolist())
+        move_correct_count += len(moveset.intersection(moveset_target))
+    return move_correct_count / k / len(topkmoves)
+
+
+def calc_metric(value, policy, data):
+    value_target = data['value_target']
+    policy_target = data['policy_target']
+
+    # reshape policy
+    policy_target = torch.flatten(policy_target, start_dim=1)
+    policy = torch.flatten(policy, start_dim=1)
+
+    # convert value_target if value has no draw info
+    if value.size(1) == 1:
+        value = value[:, 0]
+        value_target = value_target[:, 0] - value_target[:, 1]
+        value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
+
+    # calc metrics
+    metrics = {}
+
+    # 1. bestmove accuracy
+    bestmove_eq = torch.argmax(policy, dim=1) == torch.argmax(policy_target, dim=1)
+    bestmove_acc = torch.sum(bestmove_eq) / bestmove_eq.size(0)
+    metrics['bestmove_acc'] = bestmove_acc.item()
+    metrics['top2move_acc'] = top_k_accuracy(policy, policy_target, k=2)
+    metrics['top3move_acc'] = top_k_accuracy(policy, policy_target, k=3)
+
+    # 2. value accuracy, mse
+    if value.ndim == 1:
+        # sigmoid activation
+        value = torch.sigmoid(value)
+
+        winrate_correct = (value - 0.5) * (value_target - 0.5) >= 0
+        winrate_mse = torch.mean((value - value_target)**2)
+    else:
+        # softmax activation
+        value = torch.softmax(value, dim=1)
+
+        value_iswin = value[:, 0] >= value[:, 1]
+        value_iswin_target = value_target[:, 0] >= value_target[:, 1]
+        winrate_correct = value_iswin == value_iswin_target
+
+        value_norm = (value[:, 0] - value[:, 1] + 1) / 2
+        value_norm_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2
+        winrate_mse = torch.mean((value_norm - value_norm_target)**2)
+
+        value_isdraw = torch.argmax(value, dim=1) == 2
+        value_isdraw_target = torch.argmax(value_target, dim=1) == 2
+        drawrate_correct = value_isdraw == value_isdraw_target
+        drawrate_mse = torch.mean((value[:, 2] - value_target[:, 2])**2)
+
+        drawrate_acc = torch.sum(drawrate_correct) / drawrate_correct.size(0)
+        metrics['drawrate_acc'] = drawrate_acc.item()
+        metrics['drawrate_mse'] = drawrate_mse.item()
+    winrate_acc = torch.sum(winrate_correct) / winrate_correct.size(0)
+    metrics['winrate_acc'] = winrate_acc.item()
+    metrics['winrate_mse'] = winrate_mse.item()
+
+    return metrics
+
+
+def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args, model_type,
+         model_args, batch_size, num_worker, **kwargs):
+    if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
+        raise RuntimeError(f'Checkpoint {checkpoint} must be a valid file')
+    rundir = os.path.dirname(checkpoint)
+    ckpt_filename_noext = os.path.splitext(os.path.basename(checkpoint))[0]
+    log_filename = os.path.join(rundir, f'{ckpt_filename_noext}_test_result.json')
+
+    # use accelerator
+    accelerator = Accelerator(cpu=use_cpu)
+
+    # load test dataset
+    test_dataset = build_dataset(dataset_type, datas, shuffle=False, **dataset_args)
+    test_loader = build_data_loader(test_dataset,
+                                    batch_size,
+                                    num_workers=num_worker,
+                                    shuffle=False,
+                                    **dataloader_args)
+
+    # build model
+    model = build_model(model_type, **model_args)
+
+    # load checkpoint if exists
+    state_dicts = torch.load(checkpoint, map_location=accelerator.device)
+    model.load_state_dict(state_dicts['model'])
+    epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
+    accelerator.print(f'Loaded from checkpoint: {checkpoint}, epoch: {epoch}, it: {it}')
+
+    # accelerate model testing
+    model, test_loader = accelerator.prepare(model, test_loader)
+
+    # testing
+    metric_dict = {}
+    num_batches = 0
+    start_time = time.time()
+    with torch.no_grad():
+        model.eval()
+        for data in tqdm(test_loader, disable=not accelerator.is_local_main_process):
+            value, policy = model(data)
+            metrics = calc_metric(value, policy, data)
+            add_dict_to(metric_dict, metrics)
+            num_batches += 1
+
+    # convert metrics floats to tensor
+    for k, loss in metric_dict.items():
+        metric_dict[k] = torch.FloatTensor([loss])
+    metric_dict['num_batches'] = torch.LongTensor([num_batches])
+    # gather all metric dict across processes
+    all_metric_dict = accelerator.gather(metric_dict)
+
+    if accelerator.is_local_main_process:
+        # average all metrics
+        num_batches_tensor = all_metric_dict.pop('num_batches')
+        num_batches = torch.sum(num_batches_tensor).item()
+        metric_dict = {}
+        for k, metric_tensor in all_metric_dict.items():
+            metric_dict[k] = torch.sum(metric_tensor).item() / num_batches
+
+        elasped = time.time() - start_time
+        num_entries = num_batches * batch_size
+        # log test results
+        with open(log_filename, 'w') as log:
+            json_text = json.dumps(metric_dict)
+            log.writelines([json_text, '\n'])
+        print(f"Test finished with {num_entries} entries, in {elasped:.2f}s.")
+        print("Metrics:")
+        for k, metric in metric_dict.items():
+            print(f"\t{k}: {metric:.4f}")
+
+
+if __name__ == "__main__":
+    args = parse_args_and_init()
+    test(**vars(args))
