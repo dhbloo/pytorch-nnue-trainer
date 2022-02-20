@@ -98,7 +98,7 @@ def calc_loss(loss_type, value, policy, data):
             value_loss = cross_entropy_with_softlabel(value, value_target, adjust=True)
     elif value_loss_type == 'MSE':
         if value.ndim == 1:
-            value_loss = F.mse_loss(value, value_target)
+            value_loss = F.mse_loss(torch.sigmoid(value), value_target)
         else:
             assert 0, "MSE value loss must be used with '-nodraw' model"
     else:
@@ -108,7 +108,7 @@ def calc_loss(loss_type, value, policy, data):
     if policy_loss_type == 'CE':
         policy_loss = cross_entropy_with_softlabel(policy, policy_target, adjust=True)
     elif policy_loss_type == 'MSE':
-        policy_loss = F.mse_loss(policy, policy_target)
+        policy_loss = F.mse_loss(torch.softmax(policy, dim=1), policy_target)
     else:
         assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
