@@ -12,14 +12,13 @@ from dataset import build_dataset
 from model import build_model
 from utils.training_utils import build_data_loader
 from utils.misc_utils import add_dict_to, seed_everything
-from utils.file_utils import find_latest_model_file
 
 
 def parse_args_and_init():
-    parser = configargparse.ArgParser(description="Trainer",
+    parser = configargparse.ArgParser(description="Test",
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
-    parser.add('checkpoint', help="Model checkpoint file to test")
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
+    parser.add('-p', '--checkpoint', required=True, help="Model checkpoint file to test")
     parser.add('-d',
                '--datas',
                nargs='+',
