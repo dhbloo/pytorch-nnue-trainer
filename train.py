@@ -182,7 +182,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
         epoch += 1
         for data in train_loader:
             it += 1
-            if it >= iterations:
+            if it > iterations:
                 stop_training = True
                 break
 
