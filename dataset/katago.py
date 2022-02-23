@@ -83,6 +83,7 @@ class KatagoNumpyDataset(IterableDataset):
         data['board_size'] = data['board_input'].shape[1:]
         if data['board_size'] not in self.boardsizes:
             return None
+        data['board_size'] = np.array(data['board_size'], dtype=np.int8)
 
         # Flip side when stm is white
         if self.fixed_side_input and data['stm_input'] == 1:

@@ -122,7 +122,7 @@ class PackedBinaryDataset(IterableDataset):
 
         return {
             # global info
-            'board_size': boardsize,  # H, W
+            'board_size': np.array(boardsize, dtype=np.int8),  # H, W
             'rule': str(rule),
 
             # inputs

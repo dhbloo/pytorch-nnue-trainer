@@ -136,7 +136,7 @@ def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args
     # build model
     model = build_model(model_type, **model_args)
 
-    # load checkpoint if exists
+    # load checkpoint
     state_dicts = torch.load(checkpoint, map_location=accelerator.device)
     model.load_state_dict(state_dicts['model'])
     epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
