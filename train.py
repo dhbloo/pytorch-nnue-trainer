@@ -50,7 +50,7 @@ def parse_args_and_init():
     parser.add('--batch_size', type=int, default=128, help="Batch size")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
     parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
-    parser.add('--shuffle', action='store_true', default=True, help="Shuffle dataset")
+    parser.add('--no_shuffle', action='store_true', help="Do not shuffle dataset")
     parser.add('--seed', type=int, default=42, help="Random seed")
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
@@ -123,7 +123,7 @@ def calc_loss(loss_type, value, policy, data):
 def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
                   dataloader_args, model_type, model_args, optim_type, optim_args, init_type,
                   loss_type, iterations, batch_size, num_worker, learning_rate, weight_decay,
-                  shuffle, log_interval, show_interval, save_interval, val_interval,
+                  no_shuffle, log_interval, show_interval, save_interval, val_interval,
                   avg_loss_interval, **kwargs):
     tb_logger = SummaryWriter(os.path.join(rundir, "log"))
     log_filename = os.path.join(rundir, 'training_log.json')
@@ -132,14 +132,17 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     accelerator = Accelerator(cpu=use_cpu)
 
     # load train and validation dataset
-    train_dataset = build_dataset(dataset_type, train_datas, shuffle=shuffle, **dataset_args)
+    train_dataset = build_dataset(dataset_type,
+                                  train_datas,
+                                  shuffle=not no_shuffle,
+                                  **dataset_args)
     train_loader = build_data_loader(train_dataset,
                                      batch_size,
                                      num_workers=num_worker,
-                                     shuffle=shuffle,
+                                     shuffle=not no_shuffle,
                                      **dataloader_args)
     if val_datas:
-        val_dataset = build_dataset(dataset_type, val_datas, shuffle=shuffle, **dataset_args)
+        val_dataset = build_dataset(dataset_type, val_datas, shuffle=False, **dataset_args)
         val_loader = build_data_loader(val_dataset,
                                        batch_size,
                                        num_workers=num_worker,

@@ -140,12 +140,19 @@ class PackedBinaryDataset(IterableDataset):
         }
 
     def __iter__(self):
+        # randomly shuffle file list
         file_list = [fn for fn in self.file_list]
         if self.shuffle:
             random.shuffle(file_list)
+
         for filename in file_list:
             with self._open_binary_file(filename) as f:
                 while f.peek() != b'':
                     data = self._prepare_data_from_entry(*read_entry(f))
-                    if data is not None and random.random() < self.sample_rate:
+
+                    # random skip data according to sample rate
+                    if random.random() >= self.sample_rate:
+                        continue
+
+                    if data is not None:
                         yield data

@@ -56,7 +56,7 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
 def build_data_loader(dataset,
                       batch_size=1,
                       shuffle=False,
-                      shuffle_buffer_size=8192,
+                      shuffle_buffer_size=10000,
                       drop_last=True,
                       **kwargs):
     if shuffle and isinstance(dataset, IterableDataset):

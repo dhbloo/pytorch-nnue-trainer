@@ -100,14 +100,28 @@ class KatagoNumpyDataset(IterableDataset):
         return data
 
     def __iter__(self):
+        # randomly shuffle file list
         file_list = [fn for fn in self.file_list]
         if self.shuffle:
             random.shuffle(file_list)
+
         for filename in file_list:
             data_dict, length = self._unpack_data(**np.load(filename))
+
+            if self.shuffle:
+                indices = list(range(length))
+                random.shuffle(indices)
+            else:
+                indices = None
+
             for idx in range(length):
-                data = self._prepare_entry_data(data_dict, idx)
-                if data is not None and random.random() < self.sample_rate:
+                # random skip data according to sample rate
+                if random.random() >= self.sample_rate:
+                    continue
+
+                index = idx if indices is None else indices[idx]
+                data = self._prepare_entry_data(data_dict, index)
+                if data is not None:
                     yield data
 
 
