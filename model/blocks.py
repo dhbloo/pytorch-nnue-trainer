@@ -75,7 +75,7 @@ class Conv2dBlock(nn.Module):
                  activation='relu',
                  pad_type='zeros',
                  bias=True,
-                 dilation=(1, ),
+                 dilation=1,
                  groups=1,
                  activation_first=False,
                  use_spectral_norm=False):

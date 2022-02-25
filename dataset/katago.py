@@ -28,7 +28,7 @@ class KatagoNumpyDataset(IterableDataset):
         return self.fixed_side_input
 
     def _unpack_global_feature(self, packed_data):
-        # Channel 5: side to move (black = -1, white = 1)
+        # Channel 5: side to move (black = -1.0, white = 1.0)
         stm_input = packed_data[:, 5]
         return stm_input
 
@@ -41,7 +41,7 @@ class KatagoNumpyDataset(IterableDataset):
         packed_data = packed_data[:, [1, 2]]
 
         board_input_stm = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder='big')
-        board_input_stm = board_input_stm.reshape(length, 2, bsize, bsize)
+        board_input_stm = board_input_stm.reshape(length, 2, bsize, bsize).astype(np.int8)
         return board_input_stm
 
     def _unpack_global_target(self, packed_data):

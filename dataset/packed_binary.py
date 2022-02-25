@@ -127,7 +127,7 @@ class PackedBinaryDataset(IterableDataset):
 
             # inputs
             'board_input': board_input,  # [C, H, W], C=(Black,White)
-            'stm_input': -1 if stm_is_black else 1,  # [1] Black = -1, White = 1
+            'stm_input': -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
 
             # targets
             'value_target': value_target,  # [3] (Black Win, White Win, Draw)
