@@ -12,7 +12,7 @@ import os
 
 from dataset import build_dataset
 from model import build_model
-from utils.training_utils import cross_entropy_with_softlabel, \
+from utils.training_utils import build_lr_scheduler, cross_entropy_with_softlabel, \
     build_optimizer, weights_init, build_data_loader
 from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
 from utils.file_utils import find_latest_model_file
@@ -44,6 +44,11 @@ def parse_args_and_init():
     parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add('--optim_type', default='adamw', help='Optimizer type')
     parser.add('--optim_args', type=yaml.safe_load, default={}, help="Extra optimizer arguments")
+    parser.add('--lr_scheduler_type', default='constant', help='LR scheduler type')
+    parser.add('--lr_scheduler_args',
+               type=yaml.safe_load,
+               default={},
+               help="Extra LR scheduler arguments")
     parser.add('--init_type', default='kaiming', help='Initialization type')
     parser.add('--loss_type', default='CE+CE', help='Loss type')
     parser.add('--iterations', type=int, default=1000000, help="Num iterations")
@@ -121,10 +126,10 @@ def calc_loss(loss_type, value, policy, data):
 
 
 def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  dataloader_args, model_type, model_args, optim_type, optim_args, init_type,
-                  loss_type, iterations, batch_size, num_worker, learning_rate, weight_decay,
-                  no_shuffle, log_interval, show_interval, save_interval, val_interval,
-                  avg_loss_interval, **kwargs):
+                  dataloader_args, model_type, model_args, optim_type, optim_args,
+                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
+                  batch_size, num_worker, learning_rate, weight_decay, no_shuffle, log_interval,
+                  show_interval, save_interval, val_interval, avg_loss_interval, **kwargs):
     tb_logger = SummaryWriter(os.path.join(rundir, "log"))
     log_filename = os.path.join(rundir, 'training_log.json')
 
@@ -160,7 +165,8 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                                 **optim_args)
 
     # load checkpoint if exists
-    ckpt_filename = find_latest_model_file(rundir, f"ckpt_{model.name}")
+    model_name = model.name
+    ckpt_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
     if ckpt_filename:
         state_dicts = torch.load(ckpt_filename, map_location=accelerator.device)
         model.load_state_dict(state_dicts['model'])
@@ -175,6 +181,12 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
         val_loader = accelerator.prepare_data_loader(val_loader)
+
+    # build lr scheduler
+    lr_scheduler = build_lr_scheduler(optimizer,
+                                      lr_scheduler_type,
+                                      last_it=it - 1,
+                                      **lr_scheduler_args)
 
     accelerator.print(f'Start training from iteration {it}, epoch {epoch}')
     last_it = it
@@ -195,6 +207,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
             loss, loss_dict = calc_loss(loss_type, value, policy, data)
             accelerator.backward(loss)
             optimizer.step()
+            lr_scheduler.step()
 
             # update running average loss
             for key, value in loss_dict.items():
@@ -207,7 +220,11 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
             if it % log_interval == 0 and accelerator.is_local_main_process:
                 log_value_dict(tb_logger, 'train', loss_dict, it)
                 with open(log_filename, 'a') as log:
-                    json_text = json.dumps({'it': it, 'train_loss': loss_dict})
+                    json_text = json.dumps({
+                        'it': it,
+                        'train_loss': loss_dict,
+                        'lr': lr_scheduler.get_last_lr()[0],
+                    })
                     log.writelines([json_text, '\n'])
 
             # display current progress
@@ -221,6 +238,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
                         'elasped_seconds': elasped,
                         'it/s': speed,
                         'entry/s': speed * batch_size,
+                        'lr': lr_scheduler.get_last_lr()[0],
                     }, it)
                 print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]" +
                       f" total: {loss_dict['total_loss']:.4f}," +
@@ -231,7 +249,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
 
             # snapshot saving
             if it % save_interval == 0 and accelerator.is_local_main_process:
-                snapshot_filename = os.path.join(rundir, f"ckpt_{model.name}_{it:08d}.pth")
+                snapshot_filename = os.path.join(rundir, f"ckpt_{model_name}_{it:08d}.pth")
                 torch.save(
                     {
                         "iteration": it,
