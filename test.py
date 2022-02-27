@@ -159,8 +159,8 @@ def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args
 
     # convert metrics floats to tensor
     for k, loss in metric_dict.items():
-        metric_dict[k] = torch.FloatTensor([loss])
-    metric_dict['num_batches'] = torch.LongTensor([num_batches])
+        metric_dict[k] = torch.FloatTensor([loss]).to(accelerator.device)
+    metric_dict['num_batches'] = torch.LongTensor([num_batches]).to(accelerator.device)
     # gather all metric dict across processes
     all_metric_dict = accelerator.gather(metric_dict)
 

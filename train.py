@@ -273,8 +273,9 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
 
                 # convert losses floats to tensor
                 for k, loss in val_loss_dict.items():
-                    val_loss_dict[k] = torch.FloatTensor([loss])
-                val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches])
+                    val_loss_dict[k] = torch.FloatTensor([loss]).to(accelerator.device)
+                val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches
+                                                                     ]).to(accelerator.device)
                 # gather all loss dict across processes
                 all_val_loss_dict = accelerator.gather(val_loss_dict)
 
