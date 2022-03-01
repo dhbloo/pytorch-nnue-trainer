@@ -53,19 +53,19 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
     return opt
 
 
-def build_lr_scheduler(optimizer, lr_schedule_type='constant', it=-1, **kwargs):
+def build_lr_scheduler(optimizer, lr_schedule_type='constant', last_it=-1, **kwargs):
     if lr_schedule_type == 'constant':
         scheduler = optim.lr_scheduler.ConstantLR(optimizer,
                                                   factor=1.0,
                                                   total_iters=0,
-                                                  last_epoch=it)
+                                                  last_epoch=last_it)
     elif lr_schedule_type == 'step':
         step_size = kwargs.get('step_size', 50000)
         step_gamma = kwargs.get('step_gamma', 0.9)
         scheduler = optim.lr_scheduler.StepLR(optimizer,
                                               step_size=step_size,
                                               gamma=step_gamma,
-                                              last_epoch=it)
+                                              last_epoch=last_it)
     else:
         assert 0, f"Unsupported lr scheduler: {lr_schedule_type}"
 
