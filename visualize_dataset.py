@@ -28,7 +28,7 @@ def visualize_entry(fixed_side_input,
                     value_target=None,
                     last_move=None,
                     **kwargs):
-    H, W = board_size
+    H, W = board_size[0]
 
     if not fixed_side_input and stm_input == 1:
         board_input = torch.flip(board_input, dims=(1, ))
@@ -92,13 +92,13 @@ def visualize_entry(fixed_side_input,
 def visualize_dataset(dataset):
     dataloader = DataLoader(dataset, batch_size=1)
     for index, data in enumerate(dataloader):
-        bs = data['board_size']
+        bs = data['board_size'][0]
         optional_texts = []
         if 'ply' in data:
             optional_texts += [f"ply={data['ply'][0]}"]
         if 'position_string' in data:
             optional_texts += [f"pos={data['position_string']}"]
-        print(f"Data Entry[{index}]: bs={(bs[0][0], bs[1][0])} {' '.join(optional_texts)}")
+        print(f"Data Entry[{index}]: bs={(bs[0], bs[1])} {' '.join(optional_texts)}")
         visualize_entry(dataset.fixed_side_input, **data)
 
 
@@ -109,8 +109,7 @@ if __name__ == "__main__":
     parser.add('data_paths', nargs='+', help="Dataset file or directory paths")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
-    parser.add('--shuffle', action='store_true', default=True, help="Shuffle dataset")
-    parser.add('--max_show_num', type=int, default=None, help="Max number of entries to show")
+    parser.add('--shuffle', action='store_true', help="Shuffle dataset")
     args = parser.parse_args()
 
     dataset = build_dataset(args.dataset_type,

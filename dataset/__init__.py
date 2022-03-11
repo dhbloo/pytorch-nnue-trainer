@@ -1,16 +1,19 @@
 from .packed_binary import PackedBinaryDataset
 from .katago import KatagoNumpyDataset, ProcessedKatagoNumpyDataset
+from .sparse_numpy import SparseNumpyDataset
 from utils.file_utils import make_file_list
 
 DATASETS = {
     'packed_binary': PackedBinaryDataset,
     'katago_numpy': KatagoNumpyDataset,
     'processed_katago_numpy': ProcessedKatagoNumpyDataset,
+    'sparse_numpy': SparseNumpyDataset,
 }
 DATASET_FILE_EXTS = {
     'packed_binary': ['lz4', 'bin'],
     'katago_numpy': 'npz',
     'processed_katago_numpy': 'npz',
+    'sparse_numpy': 'npz',
 }
 
 
