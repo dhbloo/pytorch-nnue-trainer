@@ -16,7 +16,7 @@ def make_file_list(data_paths, file_exts=None):
         elif os.path.isdir(path):
             for root, dirs, files in os.walk(path):
                 for file in files:
-                    ext = os.path.splitext(file)[1][1:]
+                    ext = os.path.splitext(file)[1]
                     if file_exts is None or ext in file_exts:
                         file_lists.append(os.path.join(root, file))
         else:
@@ -52,10 +52,10 @@ def find_latest_model_file(dirname, prefix, ext='.pth'):
     if not os.path.exists(dirname):
         return None
 
-    model_list = [os.path.join(dirname, f) for f in os.listdir(dirname)
-                  if os.path.isfile(os.path.join(dirname, f))
-                  and f.startswith(prefix)
-                  and f.endswith(ext)]
+    model_list = [
+        os.path.join(dirname, f) for f in os.listdir(dirname)
+        if os.path.isfile(os.path.join(dirname, f)) and f.startswith(prefix) and f.endswith(ext)
+    ]
     if len(model_list) == 0:
         return None
 

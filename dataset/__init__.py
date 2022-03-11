@@ -10,10 +10,10 @@ DATASETS = {
     'sparse_numpy': SparseNumpyDataset,
 }
 DATASET_FILE_EXTS = {
-    'packed_binary': ['lz4', 'bin'],
-    'katago_numpy': 'npz',
-    'processed_katago_numpy': 'npz',
-    'sparse_numpy': 'npz',
+    'packed_binary': ['.lz4', '.bin'],
+    'katago_numpy': '.npz',
+    'processed_katago_numpy': '.npz',
+    'sparse_numpy': '.npz',
 }
 
 
