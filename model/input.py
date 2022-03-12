@@ -16,6 +16,24 @@ def build_input_plane(input_type):
             with_stm = True
         feature_dim = int(input_type)
         return PatternCodeEmbeddingInputPlane(feature_dim, with_stm=with_stm)
+    elif input_type.startswith('combpat'):
+        input_type = input_type[7:]
+        if input_type.endswith('-nostm'):
+            with_stm = False
+            input_type = input_type[:-6]
+        else:
+            with_stm = True
+        feature_dim = int(input_type)
+        return CombPatEmbeddingInputPlane(feature_dim, with_stm=with_stm)
+    elif input_type.startswith('linepat'):
+        input_type = input_type[7:]
+        if input_type.endswith('-nostm'):
+            with_stm = False
+            input_type = input_type[:-6]
+        else:
+            with_stm = True
+        feature_dim = int(input_type)
+        return LinePatEmbeddingInputPlane(feature_dim, with_stm=with_stm)
     elif input_type == 'raw':
         return lambda x: x  # identity transform
     else:
@@ -46,14 +64,14 @@ class BasicInputPlane(nn.Module):
 
 
 class PatternCodeEmbeddingInputPlane(BasicInputPlane):
-    def __init__(self, feature_dim, pcode_dim=2380, with_stm=True):
+    def __init__(self, feature_dim, pcode_dim=2380, with_basic=True, with_stm=True):
         super().__init__(with_stm)
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
+        self.with_basic = with_basic
         self.pcode_embedding = nn.Embedding(num_embeddings=pcode_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        input_plane = super().forward(data)
         assert torch.all(self.pcode_dim == data['sparse_feature_dim'][:, 10:12])
 
         # convert sparse input to dense feature through embedding
@@ -68,24 +86,28 @@ class PatternCodeEmbeddingInputPlane(BasicInputPlane):
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         pcode_feature = torch.masked_fill(pcode_feature, non_empty_mask, 0)
 
-        input_plane = torch.cat([input_plane, pcode_feature], dim=1)  # [B, dim_plane, H, W]
+        if self.with_basic:
+            input_plane = super().forward(data)
+            input_plane = torch.cat([input_plane, pcode_feature], dim=1)  # [B, dim_plane, H, W]
+        else:
+            input_plane = pcode_feature
         return input_plane
 
     @property
     def dim_plane(self):
-        base_dim = super().dim_plane
+        base_dim = super().dim_plane if self.with_basic else 0
         return base_dim + self.feature_dim
 
 
-class Pattern4EmbeddingInputPlane(BasicInputPlane):
-    def __init__(self, feature_dim, p4_dim=14, with_stm=True):
+class CombPatEmbeddingInputPlane(BasicInputPlane):
+    def __init__(self, feature_dim, p4_dim=14, with_basic=True, with_stm=True):
         super().__init__(with_stm)
         self.feature_dim = feature_dim
         self.p4_dim = p4_dim
+        self.with_basic = with_basic
         self.p4_embedding = nn.Embedding(num_embeddings=p4_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        input_plane = super().forward(data)
         assert torch.all(self.p4_dim == data['sparse_feature_dim'][:, 8:10])
 
         # convert sparse input to dense feature through embedding
@@ -100,24 +122,28 @@ class Pattern4EmbeddingInputPlane(BasicInputPlane):
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         p4_feature = torch.masked_fill(p4_feature, non_empty_mask, 0)
 
-        input_plane = torch.cat([input_plane, p4_feature], dim=1)  # [B, dim_plane, H, W]
+        if self.with_basic:
+            input_plane = super().forward(data)
+            input_plane = torch.cat([input_plane, p4_feature], dim=1)  # [B, dim_plane, H, W]
+        else:
+            input_plane = p4_feature
         return input_plane
 
     @property
     def dim_plane(self):
-        base_dim = super().dim_plane
+        base_dim = super().dim_plane if self.with_basic else 0
         return base_dim + self.feature_dim
 
 
-class PatternEmbeddingInputPlane(BasicInputPlane):
-    def __init__(self, feature_dim, p_dim=14, with_stm=True):
+class LinePatEmbeddingInputPlane(BasicInputPlane):
+    def __init__(self, feature_dim, p_dim=14, with_basic=True, with_stm=True):
         super().__init__(with_stm)
         self.feature_dim = feature_dim
         self.p_dim = p_dim
+        self.with_basic = with_basic
         self.p_embedding = nn.Embedding(num_embeddings=p_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        input_plane = super().forward(data)
         assert torch.all(self.p_dim == data['sparse_feature_dim'][:, 0:8])
 
         # convert sparse input to dense feature through embedding
@@ -136,10 +162,14 @@ class PatternEmbeddingInputPlane(BasicInputPlane):
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         p_feature = torch.masked_fill(p_feature, non_empty_mask, 0)
 
-        input_plane = torch.cat([input_plane, p_feature], dim=1)  # [B, dim_plane, H, W]
+        if self.with_basic:
+            input_plane = super().forward(data)
+            input_plane = torch.cat([input_plane, p_feature], dim=1)  # [B, dim_plane, H, W]
+        else:
+            input_plane = p_feature
         return input_plane
 
     @property
     def dim_plane(self):
-        base_dim = super().dim_plane
+        base_dim = super().dim_plane if self.with_basic else 0
         return base_dim + self.feature_dim * 4
