@@ -1,6 +1,7 @@
 import numpy as np
+import torch.utils.data
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Symmetry
+from utils.data_utils import Symmetry, make_subset_range
 import random
 
 
@@ -12,6 +13,7 @@ class SparseNumpyDataset(IterableDataset):
                  apply_symmetry=False,
                  shuffle=False,
                  sample_rate=1.0,
+                 max_worker_per_file=2,
                  **kwargs):
         super().__init__()
         self.file_list = file_list
@@ -20,10 +22,15 @@ class SparseNumpyDataset(IterableDataset):
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
+        self.max_worker_per_file = max_worker_per_file
 
     @property
     def is_fixed_side_input(self):
         return self.fixed_side_input
+
+    @property
+    def is_internal_shuffleable(self):
+        return True
 
     def _unpack_global_feature(self, packed_data):
         # Channel 0: side to move (black = -1.0, white = 1.0)
@@ -123,34 +130,32 @@ class SparseNumpyDataset(IterableDataset):
             data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
 
         # convert uint16 to int16, uint32 to int32 due to pytorch requirement
-        assert data['sparse_feature_input'].max() <= np.iinfo(np.int16).max
+        # assert data['sparse_feature_input'].max() <= np.iinfo(np.int16).max
         assert data['sparse_feature_dim'].max() <= np.iinfo(np.int32).max
-        data['sparse_feature_input'] = data['sparse_feature_input'].astype(np.int16)
+        data['sparse_feature_input'] = data['sparse_feature_input'].astype(np.int32)
         data['sparse_feature_dim'] = data['sparse_feature_dim'].astype(np.int32)
 
         return data
 
     def __iter__(self):
-        # randomly shuffle file list
-        file_list = [fn for fn in self.file_list]
-        if self.shuffle:
-            random.shuffle(file_list)
+        worker_info = torch.utils.data.get_worker_info()
+        worker_num = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
+        worker_per_file = min(worker_num, self.max_worker_per_file)
+        assert worker_num % worker_per_file == 0
 
-        for filename in file_list:
+        for file_index in make_subset_range(len(self.file_list),
+                                            partition_num=worker_num // worker_per_file,
+                                            partition_idx=worker_id // worker_per_file,
+                                            shuffle=self.shuffle):
+            filename = self.file_list[file_index]
             data_dict, length = self._unpack_data(**np.load(filename))
 
-            if self.shuffle:
-                indices = list(range(length))
-                random.shuffle(indices)
-            else:
-                indices = None
-
-            for idx in range(length):
-                # random skip data according to sample rate
-                if random.random() >= self.sample_rate:
-                    continue
-
-                index = idx if indices is None else indices[idx]
+            for index in make_subset_range(length,
+                                           partition_num=worker_per_file,
+                                           partition_idx=worker_id % worker_per_file,
+                                           shuffle=self.shuffle,
+                                           sample_rate=self.sample_rate):
                 data = self._prepare_entry_data(data_dict, index)
                 if data is not None:
                     yield data

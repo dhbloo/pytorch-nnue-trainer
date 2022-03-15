@@ -81,3 +81,54 @@ class Symmetry(Enum):
         if flip_y: array = np.flip(array, axis=y_dim)
         if swap: array = np.swapaxes(array, x_dim, y_dim)
         return array.copy()
+
+
+def even_select_range(N, M):
+    """
+    Selects M elements from N elements evenly.
+
+    Returns:
+        A range of N booleans indicating whether to select one element.
+    """
+    assert 0 < M < N
+
+    if M > N / 2:
+        q, r = divmod(N, N - M)
+        j = 0
+        for i in range(N):
+            if q * j + min(j, r) == i:
+                j = min(j + 1, N - M - 1)
+                yield False
+            else:
+                yield True
+    else:
+        q, r = divmod(N, M)
+        j = 0
+        for i in range(N):
+            if q * j + min(j, r) == i:
+                j = min(j + 1, M - 1)
+                yield True
+            else:
+                yield False
+
+
+def make_subset_range(length, partition_num, partition_idx, shuffle=False, sample_rate=1.0):
+    """Make a subset range from a partition of randomly (shuffled) sampled range(length)."""
+    # divide indices according to worker id and worker num
+    assert 0 <= partition_idx < partition_num
+    indices = np.arange(partition_idx, length, partition_num)
+    length = len(indices)
+
+    # randomly shuffle indices
+    if shuffle:
+        np.random.shuffle(indices)
+
+    # select a subset of indices according to sample rate
+    assert 0.0 <= sample_rate <= 1.0
+    if sample_rate == 1.0:
+        for index in indices:
+            yield index
+    elif sample_rate > 0:
+        for index in indices:
+            if np.random.random() < sample_rate:
+                yield index

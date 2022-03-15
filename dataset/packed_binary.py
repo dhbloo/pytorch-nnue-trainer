@@ -81,6 +81,10 @@ class PackedBinaryDataset(IterableDataset):
     def is_fixed_side_input(self):
         return self.fixed_side_input
 
+    @property
+    def is_internal_shuffleable(self):
+        return False
+
     def _open_binary_file(self, filename: str):
         if filename.endswith("lz4"):
             return lz4.frame.open(filename, "rb")
