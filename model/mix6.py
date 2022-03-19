@@ -112,7 +112,7 @@ class ChannelWiseLeakyReLU(nn.Module):
             slope = torch.tanh(slope / self.bound) * self.bound
 
         x += -torch.relu(-x) * (slope - 1)
-        if self.bias:
+        if self.bias is not None:
             x += self.bias.view(shape)
         return x
 
@@ -166,6 +166,7 @@ class Mix6Net(nn.Module):
             feature = self.map_max * torch.tanh(feature / self.map_max)
         # average feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, PC+VC, H, W]
+        feature = self.mapping_activation(feature)
 
         # policy head
         policy = feature[:, :dim_policy]
