@@ -204,58 +204,7 @@ class PatternCodeSymBoardEmbedding(nn.Module):
         return pcode_feature.contiguous()
 
 
-class PatternCodeBlockBoardEmbedding(nn.Module):
-    def __init__(self, feature_dim, board_size, pcode_dim=2380, block_size=3):
-        super().__init__()
-        self.feature_dim = feature_dim
-        self.pcode_dim = pcode_dim
-        self.board_size = board_size
-        self.cell_dim = board_size * board_size
-
-        embed_dim = 2 * (pcode_dim + 1)
-        self.pcode_embedding = nn.Embedding(num_embeddings=embed_dim, embedding_dim=feature_dim)
-
-        num_blocks = (self.board_size // block_size)**2
-        self.pcode_symboard_embedding = nn.Embedding(num_embeddings=num_blocks * embed_dim,
-                                                     embedding_dim=feature_dim)
-        self.offset_map = nn.parameter.Parameter(
-            self._make_block_board_map(block_size) * embed_dim, False)
-
-    def _make_block_board_map(self, block_size):
-        assert self.board_size % block_size == 0
-        map = torch.zeros(self.board_size, self.board_size, dtype=torch.int32)
-        block_dim = self.board_size // block_size
-        for y in range(self.board_size):
-            for x in range(self.board_size):
-                bx, by = x // block_size, y // block_size
-                map[y, x] = by * block_dim + bx
-        return map
-
-    def forward(self, data):
-        assert torch.all(self.pcode_dim == data['sparse_feature_dim'][:, 10:12])
-        pcode_sparse_input = data['sparse_feature_input'][:, [10, 11]].int()  # [B, 2, H, W]
-
-        # set sparse input at non-empty cell
-        board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
-
-        # add index offset for opponent side
-        pcode_sparse_input[:, 1] += self.pcode_dim + 1
-
-        # add index offset for board
-        pcode_symboard_sparse_input = pcode_sparse_input + self.offset_map
-
-        # convert sparse input to dense feature through embedding
-        pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
-        pcode_board_feature = self.pcode_symboard_embedding(pcode_symboard_sparse_input)
-        pcode_feature = pcode_feature + pcode_board_feature
-
-        pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
-        pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
-
-
-class PatternCodeOuterBoardEmbedding(nn.Module):
+class PatternCodeSymOuterBoardEmbedding(nn.Module):
     def __init__(self, feature_dim, board_size, pcode_dim=2380, outer_size=5):
         super().__init__()
         self.feature_dim = feature_dim
@@ -275,21 +224,18 @@ class PatternCodeOuterBoardEmbedding(nn.Module):
     def _make_outer_board_map(self, outer_size):
         assert outer_size <= self.board_size // 2
         map = torch.zeros(self.board_size, self.board_size, dtype=torch.int32)
-        s = self.board_size - 1
-        cnt = 0
+        cnt = 1
         for i in reversed(range(outer_size)):
-            for j in range(outer_size, self.board_size - outer_size):
-                map[i, j] = 0 * outer_size + cnt
-                map[s - i, j] = 1 * outer_size + cnt
-                map[j, i] = 2 * outer_size + cnt
-                map[j, s - i] = 3 * outer_size + cnt
+            for j in range(outer_size, (self.board_size + 1) // 2):
+                map[i, j] = cnt
             cnt += 1
-        cnt += 3 * outer_size
-        for y in range(self.board_size):
-            for x in range(self.board_size):
-                if min(x, s - x) < outer_size and min(y, s - y) < outer_size:
-                    map[y, x] = cnt
-                    cnt += 1
+        for y in reversed(range(outer_size)):
+            for x in reversed(range(y, outer_size)):
+                map[y, x] = cnt
+                cnt += 1
+        map = torch.max(map, torch.fliplr(map))
+        map = torch.max(map, torch.flipud(map))
+        map = torch.max(map, torch.transpose(map, 0, 1))
         return map
 
     def forward(self, data):
@@ -451,7 +397,7 @@ class PatNNUEv1(nn.Module):
         self.board_size = board_size
         in_dim = dim_policy + dim_value
 
-        self.embedding = PatternCodeBoardEmbedding(in_dim, board_size)
+        self.embedding = PatternCodeSymBoardEmbedding(in_dim, board_size)
 
         # policy net
         self.policy_dw_conv = Conv2dBlock(dim_policy,
