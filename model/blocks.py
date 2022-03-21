@@ -7,6 +7,9 @@ def build_activation_layer(activation):
         return nn.ReLU(inplace=True)
     elif activation == 'lrelu':
         return nn.LeakyReLU(0.1, inplace=True)
+    elif activation.startswith('lrelu/'):  # custom slope
+        neg_slope = 1.0 / int(activation[6:])
+        return nn.LeakyReLU(neg_slope, inplace=True)
     elif activation == 'crelu':
         return ClippedReLU(inplace=True)
     elif activation == 'tanh':
@@ -17,6 +20,8 @@ def build_activation_layer(activation):
         return nn.GELU()
     elif activation == 'silu':
         return nn.SiLU(inplace=True)
+    elif activation == 'mish':
+        return nn.Mish(inplace=True)
     elif activation == 'none':
         return None
     else:
