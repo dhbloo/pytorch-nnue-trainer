@@ -152,4 +152,5 @@ cython_debug/
 #.idea/
 
 # Training runs
+run_dirs
 run_dirs/**

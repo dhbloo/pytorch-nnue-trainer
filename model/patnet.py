@@ -20,7 +20,9 @@ class PatternCodeEmbedding(nn.Module):
 
         # set sparse input at non-empty cell
         board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
+        non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
+        non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
+        pcode_sparse_input.masked_fill_(non_empty_mask > 0, self.pcode_dim)
 
         # add index offset for opponent side
         pcode_sparse_input[:, 1] += self.pcode_dim + 1
@@ -46,7 +48,9 @@ class PatternCodeTwoSideEmbedding(nn.Module):
 
         # set sparse input at non-empty cell
         board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
+        non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
+        non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
+        pcode_sparse_input.masked_fill_(non_empty_mask > 0, self.pcode_dim)
 
         # get sparse index for two side
         pcode_two_side_sparse_input = (pcode_sparse_input[:, 1] * (self.pcode_dim + 1) +
@@ -80,7 +84,9 @@ class PatternCodeBoardEmbedding(nn.Module):
 
         # set sparse input at non-empty cell
         board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
+        non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
+        non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
+        pcode_sparse_input.masked_fill_(non_empty_mask > 0, self.pcode_dim)
 
         # add index offset for opponent side
         pcode_sparse_input[:, 1] += self.pcode_dim + 1
@@ -135,7 +141,9 @@ class PatternCodeSymBoardEmbedding(nn.Module):
 
         # set sparse input at non-empty cell
         board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
+        non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
+        non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
+        pcode_sparse_input.masked_fill_(non_empty_mask > 0, self.pcode_dim)
 
         # add index offset for opponent side
         pcode_sparse_input[:, 1] += self.pcode_dim + 1
@@ -193,7 +201,9 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
 
         # set sparse input at non-empty cell
         board_input = data['board_input']  # [B, 2, H, W]
-        pcode_sparse_input.masked_fill_(board_input > 0, self.pcode_dim)
+        non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
+        non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
+        pcode_sparse_input.masked_fill_(non_empty_mask > 0, self.pcode_dim)
 
         # add index offset for opponent side
         pcode_sparse_input[:, 1] += self.pcode_dim + 1
@@ -424,7 +434,9 @@ class PatNNUEv1(nn.Module):
 
         # value net
         self.value_linear = nn.Sequential(
-            *[LinearBlock(dim_value, dim_value, activation='lrelu/16') for _ in range(2)])
+            LinearBlock(dim_value, dim_value, activation='lrelu/16'),
+            LinearBlock(dim_value, dim_value, activation='lrelu/16'),
+        )
         self.value_final_linear = LinearBlock(dim_value, 3, activation='none')
 
     def forward(self, data):
