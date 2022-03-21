@@ -6,6 +6,21 @@ from .blocks import Conv2dBlock, LinearBlock
 from .mix6 import ChannelWiseLeakyReLU
 
 
+def build_embedding(type, feature_dim, board_size=15, pcode_dim=2380, **kwargs):
+    if type == 'pcode':
+        return PatternCodeEmbedding(feature_dim, pcode_dim)
+    elif type == 'pcode-twoside':
+        return PatternCodeTwoSideEmbedding(feature_dim, pcode_dim)
+    elif type == 'pcode-board':
+        return PatternCodeBoardEmbedding(feature_dim, board_size, pcode_dim)
+    elif type == 'pcode-symboard':
+        return PatternCodeSymBoardEmbedding(feature_dim, board_size, pcode_dim, **kwargs)
+    elif type == 'pcode-symouterboard':
+        return PatternCodeSymOuterBoardEmbedding(feature_dim, board_size, pcode_dim, **kwargs)
+    else:
+        assert 0, f"Unsupported embedding: {type}"
+
+
 class PatternCodeEmbedding(nn.Module):
     def __init__(self, feature_dim, pcode_dim=2380):
         super().__init__()
@@ -172,11 +187,10 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
         embed_dim = 2 * (pcode_dim + 1)
         self.pcode_embedding = nn.Embedding(num_embeddings=embed_dim, embedding_dim=feature_dim)
 
-        self.pcode_outerboard_embedding = nn.Embedding(num_embeddings=(2 * outer_size + 1)**2 *
-                                                       embed_dim,
+        map, max_offset = self._make_outer_board_map(outer_size)
+        self.pcode_outerboard_embedding = nn.Embedding(num_embeddings=(max_offset + 1) * embed_dim,
                                                        embedding_dim=feature_dim)
-        self.offset_map = nn.parameter.Parameter(
-            self._make_outer_board_map(outer_size) * embed_dim, False)
+        self.offset_map = nn.parameter.Parameter(map * embed_dim, False)
 
     def _make_outer_board_map(self, outer_size):
         assert outer_size <= self.board_size // 2
@@ -193,7 +207,7 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
         map = torch.max(map, torch.fliplr(map))
         map = torch.max(map, torch.flipud(map))
         map = torch.max(map, torch.transpose(map, 0, 1))
-        return map
+        return map, torch.max(map)
 
     def forward(self, data):
         assert torch.all(self.pcode_dim == data['sparse_feature_dim'][:, 10:12])
@@ -222,15 +236,21 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
 
 
 class PatNetBaseline(nn.Module):
-    def __init__(self, dim_policy=16, dim_value=32, board_size=15, map_max=30):
+    def __init__(self,
+                 dim_policy=16,
+                 dim_value=32,
+                 board_size=15,
+                 embedding_type='pcode-symboard',
+                 map_max=30,
+                 **kwargs):
         super().__init__()
         self.model_size = (dim_policy, dim_value)
         self.board_size = board_size
+        self.embedding_type = embedding_type
         self.map_max = map_max
         dim_out = dim_policy + dim_value
 
-        self.embedding = PatternCodeSymBoardEmbedding(dim_out, board_size)
-        self.mapping_activation = ChannelWiseLeakyReLU(dim_out, bound=6)
+        self.embedding = build_embedding(embedding_type, dim_out, board_size, **kwargs)
 
         # policy nets
         self.policy_conv = Conv2dBlock(dim_policy,
@@ -279,18 +299,24 @@ class PatNetBaseline(nn.Module):
     @property
     def name(self):
         p, v = self.model_size
-        return f"patnetbaseline_{p}p{v}v-b{self.board_size}" + (f"-{self.map_max}mm"
-                                                                if self.map_max != 0 else "")
+        return f"patnetbaseline_{self.embedding_type}_{p}p{v}v-b{self.board_size}" + (
+            f"-{self.map_max}mm" if self.map_max != 0 else "")
 
 
 class PatNetv1(nn.Module):
-    def __init__(self, dim_policy=16, dim_value=16, board_size=15) -> None:
+    def __init__(self,
+                 dim_policy=16,
+                 dim_value=16,
+                 board_size=15,
+                 embedding_type='pcode-symboard',
+                 **kwargs):
         super().__init__()
         self.model_size = (dim_policy, dim_value)
         self.board_size = board_size
-        in_dim = dim_policy + dim_value
+        self.embedding_type = embedding_type
 
-        self.embedding = PatternCodeSymBoardEmbedding(in_dim, board_size)
+        self.embedding = build_embedding(embedding_type, dim_policy + dim_value, board_size,
+                                         **kwargs)
 
         # policy net
         self.policy_dw_conv = Conv2dBlock(dim_policy,
@@ -337,17 +363,23 @@ class PatNetv1(nn.Module):
     @property
     def name(self):
         p, v = self.model_size
-        return f"patnetv1_{p}p{v}v-b{self.board_size}"
+        return f"patnetv1_{self.embedding_type}_{p}p{v}v-b{self.board_size}"
 
 
 class PatNetv2(nn.Module):
-    def __init__(self, dim_policy=16, dim_value=32, board_size=15) -> None:
+    def __init__(self,
+                 dim_policy=16,
+                 dim_value=32,
+                 board_size=15,
+                 embedding_type='pcode-symboard',
+                 **kwargs):
         super().__init__()
         self.model_size = (dim_policy, dim_value)
         self.board_size = board_size
+        self.embedding_type = embedding_type
         in_dim = dim_policy + dim_value
 
-        self.embedding = PatternCodeSymBoardEmbedding(in_dim, board_size)
+        self.embedding = build_embedding(embedding_type, in_dim, board_size, **kwargs)
         self.conv = Conv2dBlock(in_dim,
                                 in_dim,
                                 ks=3,
@@ -406,7 +438,7 @@ class PatNetv2(nn.Module):
     @property
     def name(self):
         p, v = self.model_size
-        return f"patnetv2_{p}p{v}v-b{self.board_size}"
+        return f"patnetv2_{self.embedding_type}_{p}p{v}v-b{self.board_size}"
 
 
 class PatNNUEv1(nn.Module):
