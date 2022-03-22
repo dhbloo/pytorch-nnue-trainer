@@ -1,7 +1,9 @@
 import torch
 import torch.nn as nn
+from . import MODELS
 
 
+@MODELS.register('linear')
 class LinearModel(nn.Module):
     def __init__(self,
                  pcode_dim=2380,

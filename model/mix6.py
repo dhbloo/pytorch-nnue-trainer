@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
+from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock
 from .input import build_input_plane
 
@@ -117,6 +118,7 @@ class ChannelWiseLeakyReLU(nn.Module):
         return x
 
 
+@MODELS.register('mix6')
 class Mix6Net(nn.Module):
     def __init__(self,
                  dim_middle=128,

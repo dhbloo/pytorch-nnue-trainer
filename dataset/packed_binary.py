@@ -5,6 +5,7 @@ import lz4.frame
 import ctypes
 import random
 from utils.data_utils import Move, Rule, Symmetry
+from . import DATASETS
 
 
 class Result(Enum):
@@ -58,7 +59,10 @@ def read_entry(f):
     return result, ply, boardsize, rule, move, position
 
 
+@DATASETS.register('packed_binary')
 class PackedBinaryDataset(IterableDataset):
+    FILE_EXTS = ['.lz4', '.bin']
+
     def __init__(self,
                  file_list,
                  rules,

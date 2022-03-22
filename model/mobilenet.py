@@ -1,5 +1,6 @@
 import torch.nn as nn
 
+from . import MODELS
 from .blocks import Conv2dBlock
 from .input import build_input_plane
 from .resnet import build_head
@@ -81,6 +82,7 @@ class InvertedResidual(nn.Module):
             return self.conv(x)
 
 
+@MODELS.register('mobilenetv1')
 class MobileNetV1(nn.Module):
     def __init__(self, num_blocks, dim_feature, head_type='v0', input_type='basic'):
         super().__init__()
@@ -111,6 +113,7 @@ class MobileNetV1(nn.Module):
         return f"mobilenetv1_{self.input_type}_{b}b{f}f{self.head_type}"
 
 
+@MODELS.register('mobilenetv2')
 class MobileNetV2(nn.Module):
     def __init__(self,
                  num_blocks,

@@ -2,10 +2,13 @@ import numpy as np
 import torch.utils.data
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.data_utils import Symmetry, make_subset_range
-import random
+from . import DATASETS
 
 
+@DATASETS.register('katago_numpy')
 class KatagoNumpyDataset(IterableDataset):
+    FILE_EXTS = ['.npz']
+
     def __init__(self,
                  file_list,
                  boardsizes,
@@ -128,7 +131,10 @@ class KatagoNumpyDataset(IterableDataset):
                     yield data
 
 
+@DATASETS.register('processed_katago_numpy')
 class ProcessedKatagoNumpyDataset(Dataset):
+    FILE_EXTS = ['.npz']
+
     def __init__(self, file_list, boardsizes, fixed_side_input, apply_symmetry=False, **kwargs):
         super().__init__()
         self.file_list = file_list

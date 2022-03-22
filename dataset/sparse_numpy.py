@@ -2,10 +2,13 @@ import numpy as np
 import torch.utils.data
 from torch.utils.data.dataset import IterableDataset
 from utils.data_utils import Symmetry, make_subset_range
-import random
+from . import DATASETS
 
 
+@DATASETS.register('sparse_numpy')
 class SparseNumpyDataset(IterableDataset):
+    FILE_EXTS = ['.npz']
+
     def __init__(self,
                  file_list,
                  boardsizes,

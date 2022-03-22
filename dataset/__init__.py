@@ -1,20 +1,8 @@
-from .packed_binary import PackedBinaryDataset
-from .katago import KatagoNumpyDataset, ProcessedKatagoNumpyDataset
-from .sparse_numpy import SparseNumpyDataset
 from utils.file_utils import make_file_list
+from utils.misc_utils import Register, import_submodules
 
-DATASETS = {
-    'packed_binary': PackedBinaryDataset,
-    'katago_numpy': KatagoNumpyDataset,
-    'processed_katago_numpy': ProcessedKatagoNumpyDataset,
-    'sparse_numpy': SparseNumpyDataset,
-}
-DATASET_FILE_EXTS = {
-    'packed_binary': ['.lz4', '.bin'],
-    'katago_numpy': '.npz',
-    'processed_katago_numpy': '.npz',
-    'sparse_numpy': '.npz',
-}
+DATASETS = Register('dataset')
+import_submodules(__name__)
 
 
 def build_dataset(dataset_type,
@@ -26,8 +14,9 @@ def build_dataset(dataset_type,
                   shuffle=False,
                   **kwargs):
     assert dataset_type in DATASETS
+    dataset_cls = DATASETS[dataset_type]
 
-    file_list = make_file_list(data_paths, DATASET_FILE_EXTS[dataset_type])
+    file_list = make_file_list(data_paths, dataset_cls.FILE_EXTS)
     rules = rules or ['freestyle', 'standard', 'renju']
     if boardsizes is None:
         if isinstance(boardsize, int):
@@ -35,9 +24,9 @@ def build_dataset(dataset_type,
         else:
             boardsizes = [(s, s) for s in range(5, 21)]
 
-    return DATASETS[dataset_type](file_list=file_list,
-                                  rules=rules,
-                                  boardsizes=boardsizes,
-                                  fixed_side_input=fixed_side_input,
-                                  shuffle=shuffle,
-                                  **kwargs)
+    return dataset_cls(file_list=file_list,
+                       rules=rules,
+                       boardsizes=boardsizes,
+                       fixed_side_input=fixed_side_input,
+                       shuffle=shuffle,
+                       **kwargs)

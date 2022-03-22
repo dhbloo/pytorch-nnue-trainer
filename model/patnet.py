@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock
 from .mix6 import ChannelWiseLeakyReLU
 
@@ -235,6 +236,7 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
         return pcode_feature.contiguous()
 
 
+@MODELS.register('patnetbaseline')
 class PatNetBaseline(nn.Module):
     def __init__(self,
                  dim_policy=16,
@@ -303,6 +305,7 @@ class PatNetBaseline(nn.Module):
             f"-{self.map_max}mm" if self.map_max != 0 else "")
 
 
+@MODELS.register('patnetv1')
 class PatNetv1(nn.Module):
     def __init__(self,
                  dim_policy=16,
@@ -366,6 +369,7 @@ class PatNetv1(nn.Module):
         return f"patnetv1_{self.embedding_type}_{p}p{v}v-b{self.board_size}"
 
 
+@MODELS.register('patnetv2')
 class PatNetv2(nn.Module):
     def __init__(self,
                  dim_policy=16,
@@ -441,6 +445,7 @@ class PatNetv2(nn.Module):
         return f"patnetv2_{self.embedding_type}_{p}p{v}v-b{self.board_size}"
 
 
+@MODELS.register('patnnuev1')
 class PatNNUEv1(nn.Module):
     def __init__(self, dim_policy=4, dim_value=4) -> None:
         super().__init__()

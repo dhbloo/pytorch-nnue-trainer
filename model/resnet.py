@@ -1,10 +1,12 @@
 import torch.nn as nn
 
+from . import MODELS
 from .blocks import Conv2dBlock, ResBlock
 from .input import build_input_plane
 from .head import build_head
 
 
+@MODELS.register('resnet')
 class ResNet(nn.Module):
     def __init__(self, num_blocks, dim_feature, head_type='v0', input_type='basic'):
         super().__init__()
