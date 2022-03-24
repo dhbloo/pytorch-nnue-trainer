@@ -49,9 +49,11 @@ def visualize_entry(fixed_side_input,
     ax.set_position([0, 0, 1, 1])
     # get rid of axes and everything (the figure background will show through)
     ax.set_axis_off()
-    # scale the plot area conveniently (the board is in 0,0..18,18)
+    # scale the plot area conveniently (the board is in 0,0..H,W)
     ax.set_xlim(-1, W)
     ax.set_ylim(-1, H)
+
+    markersize = 300 / max(H, W)
 
     # draw stones and policy
     for y in range(H):
@@ -70,13 +72,13 @@ def visualize_entry(fixed_side_input,
             ax.plot(x,
                     y,
                     'o',
-                    markersize=20,
+                    markersize=markersize,
                     markerfacecolor=color,
                     markeredgecolor=(0, 0, 0),
                     markeredgewidth=edgewidth)
 
     if last_move is not None:
-        ax.plot(*last_move, '+', markersize=10, markeredgecolor='g', markeredgewidth=2)
+        ax.plot(*last_move, '+', markersize=markersize / 2, markeredgecolor='g', markeredgewidth=2)
 
     texts = []
     if stm_input is not None:
@@ -97,15 +99,14 @@ def visualize_dataset(dataset):
         if 'ply' in data:
             optional_texts += [f"ply={data['ply'][0]}"]
         if 'position_string' in data:
-            optional_texts += [f"pos={data['position_string']}"]
-        print(f"Data Entry[{index}]: bs={(bs[0], bs[1])} {' '.join(optional_texts)}")
+            optional_texts += [f"pos={data['position_string'][0]}"]
+        print(f"Data Entry[{index}]: bs={(bs[0].item(), bs[1].item())} {' '.join(optional_texts)}")
         visualize_entry(dataset.fixed_side_input, **data)
 
 
 if __name__ == "__main__":
     parser = configargparse.ArgParser(description="Dataset visualizer",
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
-    parser.add('-c', '--config', is_config_file=True, help='Config file path')
     parser.add('data_paths', nargs='+', help="Dataset file or directory paths")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")

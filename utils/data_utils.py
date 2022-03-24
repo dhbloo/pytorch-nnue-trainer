@@ -14,7 +14,7 @@ class Rule(Enum):
 
 class Move():
     def __init__(self, x=None, y=None, pos=None):
-        assert pos or (x and y)
+        assert pos is not None or (x is not None and y is not None)
         if pos:
             self.x, self.y = pos
         else:
