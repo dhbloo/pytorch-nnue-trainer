@@ -322,16 +322,23 @@ class PatNetv1(nn.Module):
                                          **kwargs)
 
         # policy net
+        assert dim_policy >= 4
         self.policy_dw_conv = Conv2dBlock(dim_policy,
                                           dim_policy,
                                           ks=3,
                                           st=1,
                                           padding=1,
                                           groups=dim_policy,
+                                          norm='bn',
                                           activation='relu',
                                           pad_type='zeros')
-        self.policy_pw_conv = Conv2dBlock(dim_policy, dim_policy, ks=1, st=1, activation='relu')
-        self.policy_final_conv = Conv2dBlock(dim_policy,
+        self.policy_pw_conv = Conv2dBlock(dim_policy,
+                                          dim_policy // 2,
+                                          ks=1,
+                                          st=1,
+                                          norm='bn',
+                                          activation='relu')
+        self.policy_final_conv = Conv2dBlock(dim_policy // 2,
                                              1,
                                              ks=1,
                                              st=1,
@@ -339,8 +346,10 @@ class PatNetv1(nn.Module):
                                              bias=False)
 
         # value net
-        self.value_linear1 = LinearBlock(dim_value, dim_value, activation='relu')
-        self.value_linear2 = LinearBlock(dim_value, dim_value, activation='relu')
+        self.value_linear = nn.Sequential(
+            LinearBlock(dim_value, dim_value, norm='bn', activation='lrelu/16'),
+            LinearBlock(dim_value, dim_value, norm='bn', activation='lrelu/16'),
+        )
         self.value_final_linear = LinearBlock(dim_value, 3, activation='none')
 
     def forward(self, data):
@@ -357,8 +366,7 @@ class PatNetv1(nn.Module):
         # value head
         value = feature[:, dim_policy:]
         value = torch.mean(value, dim=(2, 3))
-        value = self.value_linear1(value)
-        value = self.value_linear2(value)
+        value = self.value_linear(value)
         value = self.value_final_linear(value)
 
         return value, policy
@@ -489,7 +497,6 @@ class PatNNUEv1(nn.Module):
         # value head
         value = feature[:, dim_policy:]
         value = torch.sum(value, dim=(2, 3))
-        #value = torch.tanh(value)  # resize value feature to range [-1, 1]
         value = self.value_linear(value)
         value = self.value_final_linear(value)
 
@@ -499,3 +506,59 @@ class PatNNUEv1(nn.Module):
     def name(self):
         p, v = self.model_size
         return f"patnnuev1_{p}p{v}v"
+
+
+@MODELS.register('patnnuev2')
+class PatNNUEv2(nn.Module):
+    def __init__(self, dim_policy=4, dim_value=4) -> None:
+        super().__init__()
+        self.model_size = (dim_policy, dim_value)
+        dim_in = dim_policy + dim_value
+
+        self.embedding = PatternCodeEmbedding(dim_in)
+
+        # policy net
+        self.policy_dw_conv = Conv2dBlock(dim_policy,
+                                          dim_policy,
+                                          ks=3,
+                                          st=1,
+                                          padding=1,
+                                          groups=dim_policy,
+                                          norm='bn',
+                                          activation='relu',
+                                          pad_type='zeros')
+        self.policy_final_conv = Conv2dBlock(dim_policy,
+                                             1,
+                                             ks=1,
+                                             st=1,
+                                             activation='none',
+                                             bias=False)
+
+        # value net
+        self.value_linear = nn.Sequential(
+            LinearBlock(dim_in, dim_in, norm='bn', activation='lrelu/16'),
+            LinearBlock(dim_in, dim_in, norm='bn', activation='lrelu/16'),
+        )
+        self.value_final_linear = LinearBlock(dim_in, 3, activation='none')
+
+    def forward(self, data):
+        dim_policy, _ = self.model_size
+
+        feature = self.embedding(data)
+
+        # policy head
+        policy = feature[:, :dim_policy]
+        policy = self.policy_dw_conv(policy)
+        policy = self.policy_final_conv(policy)
+
+        # value head
+        value = torch.sum(feature, dim=(2, 3))
+        value = self.value_linear(value)
+        value = self.value_final_linear(value)
+
+        return value, policy
+
+    @property
+    def name(self):
+        p, v = self.model_size
+        return f"patnnuev2_{p}p{v}v"
