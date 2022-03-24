@@ -84,7 +84,7 @@ def visualize_entry(fixed_side_input,
     if stm_input is not None:
         texts += [f'stm={stm_input[0].item()}({"white" if stm_input[0] > 0 else "black"})']
     if value_target is not None:
-        texts += [f'vt={value_target[0].cpu().numpy()}']
+        texts += [f'vt={value_target[0].cpu().numpy()}(B/W/D)']
     if texts:
         ax.text(0, -0.5, ' '.join(texts))
 

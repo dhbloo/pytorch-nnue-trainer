@@ -72,12 +72,9 @@ class Board():
             board_input = self.board
 
         return {
-            'board_size':
-            (torch.FloatTensor(self.board.shape[1]), torch.FloatTensor(self.board.shape[2])),
-            'board_input':
-            torch.from_numpy(board_input),
-            'stm_input':
-            torch.FloatTensor([-1 if self.side_to_move == 0 else 1])
+            'board_size': torch.tensor(self.board.shape, dtype=torch.int8),
+            'board_input': torch.from_numpy(board_input),
+            'stm_input': torch.FloatTensor([-1 if self.side_to_move == 0 else 1])
         }
 
     def __str__(self):
@@ -120,6 +117,7 @@ def next_move(board, model, data):
 
     movelist = torch.argsort(policy, descending=True)
     for move in movelist:
+        move = move.cpu().item()
         move_x, move_y = move % board.width, move // board.width
         if board.is_legal(move_x, move_y):
             bestmove = move
@@ -166,6 +164,8 @@ def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_he
             move = input_move()
             if move is None:
                 data = board.get_data()
+                for key in data.keys():
+                    data[key] = data[key].to(accelerator.device)
                 winrate, drawrate, move = next_move(board, model, data)
                 print(f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, " +
                       f"bestmove: {chr(move[0] + ord('A'))}{move[1] + 1}")
