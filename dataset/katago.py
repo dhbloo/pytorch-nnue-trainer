@@ -152,6 +152,11 @@ class ProcessedKatagoNumpyDataset(Dataset):
         # Read all npz files to data dict
         for filename in self.file_list:
             data = np.load(filename)
+
+            # Skip other board size file
+            if data["bf"].shape[2:] not in self.boardsizes:
+                continue
+
             for k, tensor in data.items():
                 if k in self.data_dict:
                     self.data_dict[k].append(tensor)
@@ -161,7 +166,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         for k, tensor_list in self.data_dict.items():
             if len(tensor_list) > 1:
                 self.data_dict[k] = np.concatenate(tensor_list, axis=0)
-            else:
+            elif len(tensor_list) > 0:
                 self.data_dict[k] = tensor_list[0]
             length_list.append(len(self.data_dict[k]))
 
@@ -173,7 +178,6 @@ class ProcessedKatagoNumpyDataset(Dataset):
         # Get board size
         self.boardsize = self.data_dict["bf"].shape[2:]
         assert len(self.boardsize) == 2
-        assert self.boardsize in self.boardsizes
 
         if self.apply_symmetry:
             self.symmetries = Symmetry.available_symmetries(self.boardsize)
@@ -213,3 +217,57 @@ class ProcessedKatagoNumpyDataset(Dataset):
             data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
 
         return data
+
+
+@DATASETS.register('iterative_processed_katago_numpy')
+class IterativeProcessedKatagoNumpyDataset(IterableDataset):
+    FILE_EXTS = ['.npz']
+
+    def __init__(self,
+                 file_list,
+                 boardsizes,
+                 fixed_side_input,
+                 apply_symmetry=False,
+                 shuffle=False,
+                 sample_rate=1.0,
+                 max_worker_per_file=2,
+                 **kwargs):
+        super().__init__()
+        self.file_list = file_list
+        self.boardsizes = boardsizes
+        self.fixed_side_input = fixed_side_input
+        self.apply_symmetry = apply_symmetry
+        self.shuffle = shuffle
+        self.sample_rate = sample_rate
+        self.max_worker_per_file = max_worker_per_file
+
+    @property
+    def is_fixed_side_input(self):
+        return self.fixed_side_input
+
+    @property
+    def is_internal_shuffleable(self):
+        return True
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_num = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
+        worker_per_file = min(worker_num, self.max_worker_per_file)
+        assert worker_num % worker_per_file == 0
+
+        for file_index in make_subset_range(len(self.file_list),
+                                            partition_num=worker_num // worker_per_file,
+                                            partition_idx=worker_id // worker_per_file,
+                                            shuffle=self.shuffle):
+            filename = self.file_list[file_index]
+            dataset = ProcessedKatagoNumpyDataset(file_list=[filename],
+                                                  boardsizes=self.boardsizes,
+                                                  fixed_side_input=self.fixed_side_input,
+                                                  apply_symmetry=self.apply_symmetry)
+            for index in make_subset_range(len(dataset),
+                                           partition_num=worker_per_file,
+                                           partition_idx=worker_id % worker_per_file,
+                                           shuffle=self.shuffle,
+                                           sample_rate=self.sample_rate):
+                yield dataset[index]
