@@ -4,6 +4,7 @@ import struct
 
 N = 14
 
+
 def combine_number(n, m):
     r = 1
     for i in range(n, m + n):
@@ -12,6 +13,7 @@ def combine_number(n, m):
         r //= i
     return r
 
+
 def show_values(f, name, num_values, num_per_line):
     print(name.center(80, '-'))
     for i in range(num_values):
@@ -19,19 +21,17 @@ def show_values(f, name, num_values, num_per_line):
         print(f'{v:5} ', end='\n' if (i + 1) % num_per_line == 0 else '')
     print()
 
+
 def show_model():
-    parser = argparse.ArgumentParser(
-        description="Show model values")
-    parser.add_argument('model',
-                        type=str,
-                        help="Model path")
+    parser = argparse.ArgumentParser(description="Show model values")
+    parser.add_argument('model', type=str, help="Model path")
     args = parser.parse_args()
 
     PCODE_NB = combine_number(N, 4)
-    THREAT_NB = 2 ** 11
+    THREAT_NB = 2**11
 
     with lz4.frame.open(args.model, 'rb') as f:
-        f.read(8) # Discard scaling factor
+        f.read(8)  # Discard scaling factor
 
         show_values(f, 'eval freestyle', PCODE_NB, N)
         show_values(f, 'eval standard', PCODE_NB, N)
