@@ -94,7 +94,7 @@ class KatagoNumpyDataset(IterableDataset):
         data['board_size'] = np.array(data['board_size'], dtype=np.int8)
 
         # Flip side when stm is white
-        if self.fixed_side_input and data['stm_input'] == 1:
+        if self.fixed_side_input and data['stm_input'] > 0:
             data['board_input'] = np.flip(data['board_input'], axis=0).copy()
             value_target = data['value_target']
             value_target[0], value_target[1] = value_target[1], value_target[0]
@@ -142,21 +142,39 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self.fixed_side_input = fixed_side_input
         self.apply_symmetry = apply_symmetry
 
-        self.tensor_lists = {
+        self.data_dict = {
             "bf": [],
             "gf": [],
             "vt": [],
             "pt": [],
         }
+
+        # Read all npz files to data dict
         for filename in self.file_list:
             data = np.load(filename)
             for k, tensor in data.items():
-                self.tensor_lists[k].append(tensor)
-        for k, tensor_list in self.tensor_lists.items():
-            self.tensor_lists[k] = np.concatenate(tensor_list, axis=0)
+                if k in self.data_dict:
+                    self.data_dict[k].append(tensor)
 
-        print(self.tensor_lists["bf"].shape)
-        self.boardsize = self.tensor_lists["bf"].shape[1:3]
+        # Concatenate tensors across files
+        length_list = []
+        for k, tensor_list in self.data_dict.items():
+            if len(tensor_list) > 1:
+                self.data_dict[k] = np.concatenate(tensor_list, axis=0)
+            else:
+                self.data_dict[k] = tensor_list[0]
+            length_list.append(len(self.data_dict[k]))
+
+        # Get length of dataset and assert length are equal for all keys
+        self.length = length_list[0]
+        assert length_list.count(self.length) == len(length_list), \
+               "Unequal length of data in npz file"
+
+        # Get board size
+        self.boardsize = self.data_dict["bf"].shape[2:]
+        assert len(self.boardsize) == 2
+        assert self.boardsize in self.boardsizes
+
         if self.apply_symmetry:
             self.symmetries = Symmetry.available_symmetries(self.boardsize)
         else:
@@ -167,7 +185,31 @@ class ProcessedKatagoNumpyDataset(Dataset):
         return self.fixed_side_input
 
     def __len__(self):
-        return len(self.tensor_lists) * len(self.symmetries)
+        return self.length * len(self.symmetries)
 
     def __getitem__(self, index):
-        raise NotImplementedError()
+        if self.apply_symmetry:
+            sym_index = index // self.length
+            index = index % self.length
+
+        data = {
+            'board_size': np.array(self.boardsize, dtype=np.int8),
+            'board_input': self.data_dict['bf'][index].astype(np.int8),
+            'stm_input': self.data_dict['gf'][index].astype(np.float32),
+            'value_target': self.data_dict['vt'][index].astype(np.float32),
+            'policy_target': self.data_dict['pt'][index].astype(np.float32),
+        }
+
+        # Flip side when stm is white
+        if self.fixed_side_input and data['stm_input'] > 0:
+            data['board_input'] = np.flip(data['board_input'], axis=0).copy()
+            value_target = data['value_target']
+            value_target[0], value_target[1] = value_target[1], value_target[0]
+
+        if self.apply_symmetry:
+            symmetries = Symmetry.available_symmetries(self.boardsize)
+            picked_symmetry = symmetries[sym_index]
+            data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
+            data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
+
+        return data
