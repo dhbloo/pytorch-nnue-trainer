@@ -125,7 +125,7 @@ class Mix6Net(nn.Module):
                  dim_policy=16,
                  dim_value=32,
                  map_max=30,
-                 input_type='basic'):
+                 input_type='basic-nostm'):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max

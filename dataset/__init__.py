@@ -2,7 +2,7 @@ from utils.file_utils import make_file_list
 from utils.misc_utils import Register, import_submodules
 
 DATASETS = Register('dataset')
-import_submodules(__name__)
+import_submodules(__name__, recursive=False)
 
 
 def build_dataset(dataset_type,

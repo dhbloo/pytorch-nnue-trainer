@@ -2,9 +2,11 @@ import torch
 import configargparse
 import yaml
 import os
+import lz4.frame
 
 from dataset import build_dataset
 from model import build_model
+from model.serialization import build_serializer
 from utils.training_utils import build_data_loader
 
 
@@ -15,6 +17,10 @@ def parse_args_and_init():
     parser.add('-p', '--checkpoint', required=True, help="Model checkpoint file to test")
     parser.add('-o', '--output', required=True, help="Output filename")
     parser.add('--export_type', required=True, help="Export type")
+    parser.add('--export_args',
+               type=yaml.safe_load,
+               default={},
+               help="Extra export/serialization arguments")
     parser.add('--model_type', required=True, help="Model type")
     parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add('-d', '--datas', nargs='+', help="Test dataset file or directory paths")
@@ -111,7 +117,34 @@ def export_onnx(output, model, **kwargs):
                               0: 'batch_size'
                           },
                       })
-    print(f"Onnx model has been written to {output}")
+    print(f"Onnx model has been written to {output}.")
+
+
+def export_serialization(output, output_type, model_type, model, export_args, **kwargs):
+    serializer = build_serializer(model_type, **export_args)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model.to(device)
+
+    def open_output(output):
+        file_mode = 'w' + ('b' if serializer.is_binary else 't')
+        if output_type == 'raw':
+            return open(output, file_mode)
+        elif output_type == 'lz4':
+            return lz4.frame.open(
+                output,
+                file_mode,
+                compression_level=lz4.frame.COMPRESSIONLEVEL_MINHC,
+                content_checksum=True,
+            )
+        else:
+            assert 0, f"Unsupported serialization output {output_type}"
+
+    with open_output(output) as f:
+        with torch.no_grad():
+            serializer.serialize(f, model, device)
+
+    type = 'binary' if serializer.is_binary else 'text'
+    print(f"Serialized {type} model has been written to {output}")
 
 
 def export(checkpoint, output, export_type, model_type, model_args, **kwargs):
@@ -130,6 +163,10 @@ def export(checkpoint, output, export_type, model_type, model_args, **kwargs):
         export_jit(output, model, **kwargs)
     elif export_type == "onnx":
         export_onnx(output, model, **kwargs)
+    elif export_type == "serialization":
+        export_serialization(output, 'raw', model_type, model, **kwargs)
+    elif export_type == "serialization-lz4":
+        export_serialization(output, 'lz4', model_type, model, **kwargs)
     else:
         assert 0, f"Unsupported export: {export_type}"
 
