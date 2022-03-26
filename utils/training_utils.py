@@ -82,18 +82,14 @@ def build_data_loader(dataset,
         # Warp non shuffleable dataset with ShuffleDataset
         if not dataset.is_internal_shuffleable:
             dataset = ShuffleDataset(dataset, shuffle_buffer_size)
-        dataloader = DataLoader(dataset,
-                                batch_size,
-                                drop_last=drop_last,
-                                persistent_workers=True,
-                                **kwargs)
-    else:
-        dataloader = DataLoader(dataset,
-                                batch_size,
-                                shuffle=shuffle,
-                                drop_last=drop_last,
-                                persistent_workers=True,
-                                **kwargs)
+        shuffle = False
+
+    dataloader = DataLoader(dataset,
+                            batch_size,
+                            shuffle=shuffle,
+                            drop_last=drop_last,
+                            persistent_workers=True,
+                            **kwargs)
     return dataloader
 
 
