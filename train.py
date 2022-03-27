@@ -29,6 +29,7 @@ def parse_args_and_init():
                help="Training dataset file or directory paths")
     parser.add('-v', '--val_datas', nargs='+', help="Validation dataset file or directory paths")
     parser.add('-r', '--rundir', required=True, help="Run directory")
+    parser.add('--load_from', help="Load pretrained weights from file")
     parser.add('--use_cpu', action='store_true', help="Use cpu only")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
@@ -125,7 +126,7 @@ def calc_loss(loss_type, value, policy, data):
     }
 
 
-def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
+def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
                   dataloader_args, model_type, model_args, optim_type, optim_args,
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
                   batch_size, num_worker, learning_rate, weight_decay, no_shuffle, log_interval,
@@ -176,6 +177,15 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     else:
         model.apply(weights_init(init_type))
         epoch, it = 0, 0
+        if load_from is not None:
+            state_dicts = torch.load(load_from, map_location=accelerator.device)
+            missing_keys, unexpected_keys = model.load_state_dict(state_dicts['model'],
+                                                                  strict=False)
+            if len(unexpected_keys) > 0:
+                accelerator.print(f"unexpected keys in state_dict: {', '.join(unexpected_keys)}")
+            if len(missing_keys) > 0:
+                accelerator.print(f"missing keys in state_dict: {', '.join(missing_keys)}")
+            accelerator.print(f'Loaded from pretrained: {load_from}')
 
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
@@ -193,6 +203,7 @@ def training_loop(rundir, use_cpu, train_datas, val_datas, dataset_type, dataset
     last_time = time.time()
     stop_training = False
     avg_loss_dict = {}
+    model.train()
     while not stop_training:
         epoch += 1
         for data in train_loader:
