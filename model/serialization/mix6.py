@@ -181,14 +181,14 @@ class Mix6NetSerializer(BaseSerializer):
         # policy layer 2: policy pw conv
         pw_conv_weight = model.policy_linear.conv.weight.cpu().numpy()[0, :, 0, 0]
         pw_conv_weight_max = np.abs(pw_conv_weight).max()
-        pw_conv_scale = min(32767 / (pw_conv_weight_max * 2**15), 0.5)
+        pw_conv_scale = min(32767 / (pw_conv_weight_max * 2**15), 0.25)
         scale *= pw_conv_scale
         bound = (np.abs(pw_conv_weight) * bound_perchannel).sum() * pw_conv_scale
         pw_conv_max = pw_conv_weight_max * pw_conv_scale * 2**15
         print(f"policy pw conv: weight_max = {pw_conv_weight_max}" +
               f", max = {pw_conv_max}, scale = {scale}, bound = {bound}")
         assert pw_conv_max < 32768, "policy pw conv overflow!"
-        assert bound < 32768, "policy overflow!"
+        assert bound < 32768, f"policy overflow! ({bound})"
 
         pw_conv_weight = pw_conv_weight * pw_conv_scale * 2**15
 
@@ -203,8 +203,6 @@ class Mix6NetSerializer(BaseSerializer):
         return conv_weight, conv_bias, pw_conv_weight, neg_slope, pos_slope
 
     def _export_value(self, model: Mix6Net, scale):
-        _, PC, _ = model.model_size
-
         # value layer 0: global mean
         scale_before_mlp = 1 / scale / self.board_size**2
 

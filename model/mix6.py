@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from torch.quantization import QuantStub, DeQuantStub
 
 from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock
@@ -189,3 +190,76 @@ class Mix6Net(nn.Module):
         m, p, v = self.model_size
         return f"mix6_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
                                                          if self.map_max != 0 else "")
+
+
+@MODELS.register('mix6v2')
+class Mix6Netv2(nn.Module):
+    def __init__(self, dim_middle=128, dim_policy=32, dim_value=32, input_type='basic'):
+        super().__init__()
+        self.model_size = (dim_middle, dim_policy, dim_value)
+        self.input_type = input_type
+        dim_out = dim_policy + dim_value
+
+        self.input_plane = build_input_plane(input_type)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
+        self.mapping_activation = nn.PReLU(dim_out)
+        self.mapping_bias = Parameter(torch.zeros(dim_out), True)
+
+        # policy nets
+        self.policy_conv = Conv2dBlock(dim_policy,
+                                       dim_policy,
+                                       ks=3,
+                                       st=1,
+                                       padding=1,
+                                       groups=dim_policy,
+                                       activation='lrelu/16')
+        self.policy_linear = Conv2dBlock(dim_policy,
+                                         1,
+                                         ks=1,
+                                         st=1,
+                                         padding=0,
+                                         activation='lrelu/16',
+                                         bias=False)
+
+        # value nets
+        self.value_activation = nn.PReLU(dim_out)
+        self.value_linear1 = LinearBlock(dim_out, dim_value)
+        self.value_linear2 = LinearBlock(dim_value, dim_value)
+        self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
+
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
+    def forward(self, data):
+        _, dim_policy, _ = self.model_size
+
+        input_plane = self.input_plane(data)
+        feature = self.mapping(input_plane)
+        # feature = torch.tanh(feature)  # resize feature to range [-1, 1]
+        feature = self.quant(feature)
+
+        # sum feature across four directions
+        feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W]
+        feature = self.mapping_activation(feature)
+        feature = feature + self.mapping_bias.view(1, -1, 1, 1)
+
+        # policy head
+        policy = feature[:, :dim_policy]
+        policy = self.policy_conv(policy)
+        policy = self.policy_linear(policy)
+        policy = self.dequant(policy)
+
+        # value head
+        value = self.dequant(feature)
+        value = torch.mean(feature, dim=(2, 3))
+        value = self.value_activation(value)
+        value = self.value_linear1(value)
+        value = self.value_linear2(value)
+        value = self.value_linear_final(value)
+
+        return value, policy
+
+    @property
+    def name(self):
+        m, p, v = self.model_size
+        return f"mix6v2_{self.input_type}_{m}m{p}p{v}v"
