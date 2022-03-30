@@ -159,6 +159,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
             for k, tensor in data.items():
                 if k in self.data_dict:
+                    assert len(tensor) > 0, f"Empty tensor {k} in file {filename}"
                     self.data_dict[k].append(tensor)
 
         # Concatenate tensors across files
@@ -172,6 +173,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
         # Get length of dataset and assert length are equal for all keys
         self.length = length_list[0]
+        assert self.length > 0, "No valid data entry in dataset"
         assert length_list.count(self.length) == len(length_list), \
                "Unequal length of data in npz file"
 

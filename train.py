@@ -22,11 +22,7 @@ def parse_args_and_init():
     parser = configargparse.ArgParser(description="Trainer",
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
-    parser.add('-d',
-               '--train_datas',
-               nargs='+',
-               required=True,
-               help="Training dataset file or directory paths")
+    parser.add('-d', '--train_datas', nargs='+', help="Training dataset file or directory paths")
     parser.add('-v', '--val_datas', nargs='+', help="Validation dataset file or directory paths")
     parser.add('-r', '--rundir', required=True, help="Run directory")
     parser.add('--load_from', help="Load pretrained weights from file")
@@ -135,7 +131,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     log_filename = os.path.join(rundir, 'training_log.json')
 
     # use accelerator
-    accelerator = Accelerator(cpu=use_cpu)
+    accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
     # load train and validation dataset
     train_dataset = build_dataset(dataset_type,

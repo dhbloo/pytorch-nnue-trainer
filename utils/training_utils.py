@@ -77,12 +77,18 @@ def build_data_loader(dataset,
                       shuffle=False,
                       shuffle_buffer_size=10000,
                       drop_last=True,
+                      batch_by_boardsize=False,
                       **kwargs):
     if shuffle and isinstance(dataset, IterableDataset):
         # Warp non shuffleable dataset with ShuffleDataset
         if not dataset.is_internal_shuffleable:
             dataset = ShuffleDataset(dataset, shuffle_buffer_size)
         shuffle = False
+
+    if batch_by_boardsize:
+        assert isinstance(dataset, IterableDataset), \
+            "batch_by_boardsize must be used with IterableDataset"
+        dataset = BatchByBoardSizeDataset(dataset, batch_size)
 
     dataloader = DataLoader(dataset,
                             batch_size,
@@ -157,5 +163,34 @@ class ShuffleDataset(IterableDataset):
                     break
             while len(shufbuf) > 0:
                 yield shufbuf.pop()
+        except GeneratorExit:
+            pass
+
+
+class BatchByBoardSizeDataset(IterableDataset):
+    def __init__(self, dataset, batch_size):
+        super().__init__()
+        self.dataset = dataset
+        self.batch_size = batch_size
+
+    def __iter__(self):
+        boardsize_to_databuf = {}
+        try:
+            dataset_iter = iter(self.dataset)
+            while True:
+                try:
+                    data = next(dataset_iter)
+                    board_size = tuple(data['board_size'])
+                    if board_size not in boardsize_to_databuf:
+                        boardsize_to_databuf[board_size] = []
+                    databuf = boardsize_to_databuf[board_size]
+                    databuf.append(data)
+
+                    assert len(databuf) <= self.batch_size
+                    if len(databuf) == self.batch_size:
+                        while len(databuf) > 0:
+                            yield databuf.pop()
+                except StopIteration:
+                    break  # discard last incomplete batch for all board size
         except GeneratorExit:
             pass
