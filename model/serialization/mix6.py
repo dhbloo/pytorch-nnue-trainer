@@ -134,7 +134,7 @@ class Mix6NetSerializer(BaseSerializer):
         bound = ceil(feature_map_max * scale)
         print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}" +
               f", feature_max = {feature_map_max}, scale = {scale}, bound = {bound}")
-        assert bound < 32768, "feature map overflow!"
+        assert bound < 32767, "feature map overflow!"
 
         return feature_map * scale, usage_flags, scale, bound
 
@@ -151,7 +151,7 @@ class Mix6NetSerializer(BaseSerializer):
         bound_perchannel = bound * (np.abs(slope) + 1) + np.abs(bias) * scale
         print(f"map leakyrelu: slope_max = {slope_max}, bias_max = {bias_max}" +
               f", max = {act_max}, scale = {scale}, bound = {bound_perchannel.max()}")
-        assert act_max < 32768, "map activation overflow!"
+        assert act_max < 32767, "map activation overflow!"
 
         slope_sub1div8 = (slope - 1) / 8
         return slope_sub1div8 * 2**15, bias * scale, scale, bound_perchannel
@@ -167,13 +167,13 @@ class Mix6NetSerializer(BaseSerializer):
         bound_perchannel = np.abs(conv_weight).sum(
             (1, 2, 3)) * bound_perchannel[:PC] + np.abs(conv_bias) * scale
         conv_max = max(conv_weight_max * 2**15, conv_bias_max * scale)
-        conv_scale = min(32767 / conv_max, 32767 / bound_perchannel.max())
+        conv_scale = min(32766 / conv_max, 32766 / bound_perchannel.max())
         scale *= conv_scale
         bound_perchannel *= conv_scale
         conv_max = max(conv_weight_max * conv_scale * 2**15, conv_bias_max * scale)
         print(f"policy conv: weight_max = {conv_weight_max}, bias_max = {conv_bias_max}" +
               f", max = {conv_max}, scale = {scale}, bound = {bound_perchannel.max()}")
-        assert conv_max < 32768, "policy conv overflow!"
+        assert conv_max < 32767, "policy conv overflow!"
 
         conv_weight = (conv_weight * conv_scale * 2**15).squeeze(1).transpose((1, 2, 0))
         conv_bias = conv_bias * scale
@@ -181,14 +181,14 @@ class Mix6NetSerializer(BaseSerializer):
         # policy layer 2: policy pw conv
         pw_conv_weight = model.policy_linear.conv.weight.cpu().numpy()[0, :, 0, 0]
         pw_conv_weight_max = np.abs(pw_conv_weight).max()
-        pw_conv_scale = min(32767 / (pw_conv_weight_max * 2**15), 0.25)
+        pw_conv_scale = min(32766 / (pw_conv_weight_max * 2**15), 0.25)
         scale *= pw_conv_scale
         bound = (np.abs(pw_conv_weight) * bound_perchannel).sum() * pw_conv_scale
         pw_conv_max = pw_conv_weight_max * pw_conv_scale * 2**15
         print(f"policy pw conv: weight_max = {pw_conv_weight_max}" +
               f", max = {pw_conv_max}, scale = {scale}, bound = {bound}")
-        assert pw_conv_max < 32768, "policy pw conv overflow!"
-        assert bound < 32768, f"policy overflow! ({bound})"
+        assert pw_conv_max < 32767, "policy pw conv overflow!"
+        assert bound < 32767, f"policy overflow! ({bound})"
 
         pw_conv_weight = pw_conv_weight * pw_conv_scale * 2**15
 
