@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+
+from model.blocks import LinearBlock
 from . import MODELS
 
 
@@ -40,10 +42,10 @@ class LinearModel(nn.Module):
         policy_map = torch.masked_fill(policy_map, non_empty_mask, 0)  # [B, 2, H, W]
 
         # combine two side's value and policy
-        value = torch.sum(value_map, dim=(2, 3))  # [B, 2, 1 or 2]
+        value = torch.sum(value_map, dim=(2, 3))  # [B, 2, 2] or [B, 2]
         if self.has_draw_value:
-            win = value[:, 0, 0] - value[:, 1, 0]  # [B]
-            loss = -win  # [B]
+            win = value[:, 0, 0]  # [B]
+            loss = value[:, 1, 0]  # [B]
             draw = value[:, 0, 1] + value[:, 1, 1]  # [B]
             value = torch.stack((win, loss, draw), dim=1)  # [B, 3]
         else:
@@ -84,10 +86,11 @@ class LinearModel(nn.Module):
 
 @MODELS.register('linear_threat')
 class LinearThreatModel(LinearModel):
-    def __init__(self, p4_dim=14, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, p4_dim=14, has_draw_value=True, **kwargs):
+        super().__init__(has_draw_value=has_draw_value, **kwargs)
         self.p4_dim = p4_dim
-        self.threat_table = nn.Embedding(num_embeddings=2048, embedding_dim=1)
+        self.threat_table = nn.Embedding(num_embeddings=2048,
+                                         embedding_dim=2 if has_draw_value else 1)
 
     def forward(self, data):
         value, policy = super().forward(data)
@@ -122,8 +125,14 @@ class LinearThreatModel(LinearModel):
                     | 0b100000000 & -oppo_four.int() \
                     | 0b1000000000 & -oppo_threeplus.int() \
                     | 0b10000000000 & -oppo_three.int()
-        threat_value = self.threat_table(threat_mask)  # [B, 1]
-        value = value[:, 0:1] + threat_value  # [B, 1 or 3]
+        threat_value = self.threat_table(threat_mask)  # [B, 1 or 2]
+        if self.has_draw_value:
+            win = threat_value[:, 0]
+            loss = threat_value[:, 1]
+            draw = torch.zeros_like(win)
+            value = value + torch.stack((win, loss, draw), dim=1)  # [B, 3]
+        else:
+            value = value[:, 0:1] + threat_value  # [B, 1]
 
         return value, policy
 
@@ -133,3 +142,44 @@ class LinearThreatModel(LinearModel):
         if self.two_side: flags += '-twoside'
         if self.fixed_side_input: flags += '-fixed'
         return f"linear_threat_{flags}"
+
+
+@MODELS.register('linear_p4countmlp')
+class LinearP4CountMLPModel(LinearModel):
+    def __init__(self, p4_dim=14, has_draw_value=True, **kwargs):
+        super().__init__(has_draw_value=has_draw_value, **kwargs)
+        self.p4_dim = p4_dim
+        self.linear1 = LinearBlock(16, 16, norm='bn', activation='relu')
+        self.linear2 = LinearBlock(16, 16, norm='bn', activation='relu')
+        self.linear3 = LinearBlock(16, 2 if has_draw_value else 1, norm='bn', activation='relu')
+
+    def forward(self, data):
+        value, policy = super().forward(data)
+
+        assert torch.all(self.p4_dim == data['sparse_feature_dim'][:, 8:10])
+        p4_sparse_input = data['sparse_feature_input'][:, [8, 9]].int()  # [B, 2, H, W]
+
+        p4count = torch.zeros(len(p4_sparse_input), 2, self.p4_dim)  # [B, 2, p4_dim]
+        for p4 in range(1, self.p4_dim):
+            p4count[:, :, p4] = torch.count_nonzero(p4_sparse_input == p4, dim=(2, 3))
+
+        p4count_input = p4count[:, :, 6:].flatten(start_dim=1)  # # [B, 16]
+        value_p4c = self.linear1(p4count_input)
+        value_p4c = self.linear2(value_p4c)
+        value_p4c = self.linear3(value_p4c)  # [B, 1 or 2]
+        if self.has_draw_value:
+            win = value_p4c[:, 0]
+            loss = value_p4c[:, 1]
+            draw = torch.zeros_like(win)
+            value = value + torch.stack((win, loss, draw), dim=1)  # [B, 3]
+        else:
+            value = value[:, 0:1] + value_p4c  # [B, 1]
+
+        return value, policy
+
+    @property
+    def name(self):
+        flags = 'draw' if self.has_draw_value else 'nodraw'
+        if self.two_side: flags += '-twoside'
+        if self.fixed_side_input: flags += '-fixed'
+        return f"linear_p4countmlp_{flags}"
