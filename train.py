@@ -102,7 +102,10 @@ def calc_loss(loss_type, value, policy, data):
         if value.ndim == 1:
             value_loss = F.mse_loss(torch.sigmoid(value), value_target)
         else:
-            assert 0, "MSE value loss must be used with '-nodraw' model"
+            value = torch.softmax(value, dim=1)  # [B, 3]
+            winrate = (value[:, 0] - value[:, 1] + 1) / 2
+            winrate_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2
+            value_loss = F.mse_loss(winrate, winrate_target)
     else:
         assert 0, f"Unsupported value loss: {value_loss_type}"
 
