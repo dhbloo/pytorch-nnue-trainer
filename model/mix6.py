@@ -194,7 +194,12 @@ class Mix6Net(nn.Module):
 
 @MODELS.register('mix6v2')
 class Mix6Netv2(nn.Module):
-    def __init__(self, dim_middle=128, dim_policy=32, dim_value=32, input_type='basic'):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_policy=32,
+                 dim_value=32,
+                 input_type='basic',
+                 quantization=True):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.input_type = input_type
@@ -203,61 +208,100 @@ class Mix6Netv2(nn.Module):
         self.input_plane = build_input_plane(input_type)
         self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
         self.mapping_activation = nn.PReLU(dim_out)
-        self.mapping_bias = Parameter(torch.zeros(dim_out), True)
 
         # policy nets
-        self.policy_conv = Conv2dBlock(dim_policy,
-                                       dim_policy,
-                                       ks=3,
-                                       st=1,
-                                       padding=1,
-                                       groups=dim_policy,
-                                       activation='lrelu/16')
-        self.policy_linear = Conv2dBlock(dim_policy,
-                                         1,
-                                         ks=1,
-                                         st=1,
-                                         padding=0,
-                                         activation='lrelu/16',
-                                         bias=False)
+        self.policy_dw_conv = Conv2dBlock(dim_policy,
+                                          dim_policy,
+                                          ks=3,
+                                          st=1,
+                                          padding=1,
+                                          groups=dim_policy,
+                                          activation='lrelu/16')
+        self.policy_pw_conv = Conv2dBlock(dim_policy,
+                                          1,
+                                          ks=1,
+                                          st=1,
+                                          padding=0,
+                                          activation='lrelu/16',
+                                          bias=False)
 
         # value nets
-        self.value_activation = nn.PReLU(dim_out)
-        self.value_linear1 = LinearBlock(dim_out, dim_value)
-        self.value_linear2 = LinearBlock(dim_value, dim_value)
+        self.value_activation = nn.PReLU(dim_value)
+        self.value_linear1 = LinearBlock(dim_value, dim_value, activation='relu')
+        self.value_linear2 = LinearBlock(dim_value, dim_value, activation='relu')
         self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
 
-        self.quant = QuantStub()
-        self.dequant = DeQuantStub()
+        # quantization constants
+        self.quantization = quantization
+        self.scaling_factor = 64
+        self.scaling_factor_after_mean = 4 * 3600 / 256  # 56.25
+        self.maxf_i8 = 127 / self.scaling_factor  # 1.98438
+        self.maxf_i8_after_mean = 127 / self.scaling_factor_after_mean  # 2.25778
 
     def forward(self, data):
         _, dim_policy, _ = self.model_size
 
         input_plane = self.input_plane(data)
         feature = self.mapping(input_plane)
-        # feature = torch.tanh(feature)  # resize feature to range [-1, 1]
-        feature = self.quant(feature)
+        feature = torch.tanh(feature) * self.maxf_i8  # scale to range [-maxf_i8, maxf_i8]
 
         # sum feature across four directions
-        feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W]
-        feature = self.mapping_activation(feature)
-        feature = feature + self.mapping_bias.view(1, -1, 1, 1)
+        feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W], range [-maxf_i8*4, maxf_i8*4]
+        feature = self.mapping_activation(feature)  # range [-maxf_i8*4, maxf_i8*4]
+        feature = feature / 4  # range [-maxf_i8, maxf_i8]
 
         # policy head
-        policy = feature[:, :dim_policy]
-        policy = self.policy_conv(policy)
-        policy = self.policy_linear(policy)
-        policy = self.dequant(policy)
+        policy = feature[:, :dim_policy]  # range [-maxf_i8, maxf_i8]
+        policy = self.policy_dw_conv(policy)  # range [-maxf_i8*4, maxf_i8*4]
+        policy = policy / 4  # range [-maxf_i8, maxf_i8]
+        policy = self.policy_pw_conv(policy)  # range [-9*maxf_i8**2, 9*maxf_i8**2]
 
         # value head
-        value = self.dequant(feature)
-        value = torch.mean(feature, dim=(2, 3))
-        value = self.value_activation(value)
+        value = feature[:, dim_policy:]  # range [-maxf_i8, maxf_i8]
+        value = torch.mean(value, dim=(2, 3))  # range ~[-maxf_i8, maxf_i8]
+        value = self.value_activation(value)  # range ~[-maxf_i8, maxf_i8]
         value = self.value_linear1(value)
+        if self.quantization:
+            # ClippedReLU, range [0, maxf_i8_after_mean]
+            value = torch.clamp(value, max=self.maxf_i8_after_mean)
         value = self.value_linear2(value)
+        if self.quantization:
+            # ClippedReLU, range [0, maxf_i8_after_mean]
+            value = torch.clamp(value, max=self.maxf_i8_after_mean)
         value = self.value_linear_final(value)
 
         return value, policy
+
+    @property
+    def weight_clipping(self):
+        return [] if not self.quantization else [
+            {
+                'params': [
+                    self.mapping_activation.weight,
+                    self.value_activation.weight,
+                ],
+                'min_weight': -1.0,
+                'max_weight': 1.0
+            },
+            {
+                'params': [
+                    self.policy_dw_conv.conv.weight,
+                    self.policy_pw_conv.conv.weight,
+                    self.value_linear1.fc.weight,
+                    self.value_linear2.fc.weight,
+                    self.value_linear_final.fc.weight,
+                ],
+                'min_weight':
+                -self.maxf_i8,
+                'max_weight':
+                self.maxf_i8
+            },
+            {
+                'params': [self.policy_dw_conv.conv.bias],
+                'min_weight': -16383 / self.scaling_factor**2,
+                'max_weight': 16383 / self.scaling_factor**2
+            },
+        ]
 
     @property
     def name(self):

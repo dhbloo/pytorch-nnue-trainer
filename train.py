@@ -13,7 +13,7 @@ import os
 from dataset import build_dataset
 from model import build_model
 from utils.training_utils import build_lr_scheduler, cross_entropy_with_softlabel, \
-    build_optimizer, weights_init, build_data_loader
+    build_optimizer, weights_init, build_data_loader, weight_clipping
 from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
 from utils.file_utils import find_latest_model_file
 
@@ -218,6 +218,10 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             accelerator.backward(loss)
             optimizer.step()
             lr_scheduler.step()
+
+            # apply weight clipping if needed
+            if hasattr(model, 'weight_clipping'):
+                weight_clipping(model.weight_clipping)
 
             # update running average loss
             for key, value in loss_dict.items():
