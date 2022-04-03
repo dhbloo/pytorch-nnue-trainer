@@ -1,10 +1,11 @@
 import numpy as np
-from torch.utils.data.dataset import IterableDataset
-from enum import Enum
 import lz4.frame
 import ctypes
 import random
-from utils.data_utils import Move, Rule, Symmetry
+import torch.utils.data
+from enum import Enum
+from torch.utils.data.dataset import IterableDataset
+from utils.data_utils import Move, Rule, Symmetry, make_subset_range
 from . import DATASETS
 
 
@@ -71,6 +72,7 @@ class PackedBinaryDataset(IterableDataset):
                  apply_symmetry=False,
                  shuffle=False,
                  sample_rate=1.0,
+                 max_worker_per_file=2,
                  **kwargs):
         super().__init__()
         self.file_list = file_list
@@ -80,6 +82,7 @@ class PackedBinaryDataset(IterableDataset):
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
+        self.max_worker_per_file = max_worker_per_file
 
     @property
     def is_fixed_side_input(self):
@@ -148,12 +151,17 @@ class PackedBinaryDataset(IterableDataset):
         }
 
     def __iter__(self):
-        # randomly shuffle file list
-        file_list = [fn for fn in self.file_list]
-        if self.shuffle:
-            random.shuffle(file_list)
+        worker_info = torch.utils.data.get_worker_info()
+        worker_num = worker_info.num_workers if worker_info else 1
+        worker_id = worker_info.id if worker_info else 0
+        worker_per_file = min(worker_num, self.max_worker_per_file)
+        assert worker_num % worker_per_file == 0
 
-        for filename in file_list:
+        for file_index in make_subset_range(len(self.file_list),
+                                            partition_num=worker_num // worker_per_file,
+                                            partition_idx=worker_id // worker_per_file,
+                                            shuffle=self.shuffle):
+            filename = self.file_list[file_index]
             with self._open_binary_file(filename) as f:
                 while f.peek() != b'':
                     data = self._prepare_data_from_entry(*read_entry(f))
