@@ -166,7 +166,8 @@ class Mix6NetSerializer(BaseSerializer):
         bound_perchannel = bound * (np.abs(slope) + 1) + np.abs(bias) * scale
         print(f"map leakyrelu: slope_max = {slope_max}, bias_max = {bias_max}" +
               f", max = {act_max}, scale = {scale}, bound = {bound_perchannel.max()}")
-        assert act_max < 32767, "map activation overflow!"
+        assert act_max < 32767, "map leakyrelu overflow!"
+        assert bound_perchannel.max() < 32767, "map activation overflow!"
 
         slope_sub1div8 = (slope - 1) / 8
         return slope_sub1div8 * 2**15, bias * scale, scale, bound_perchannel
@@ -189,6 +190,7 @@ class Mix6NetSerializer(BaseSerializer):
         print(f"policy conv: weight_max = {conv_weight_max}, bias_max = {conv_bias_max}" +
               f", max = {conv_max}, scale = {scale}, bound = {bound_perchannel.max()}")
         assert conv_max < 32767, "policy conv overflow!"
+        assert bound_perchannel.max() < 32767, "policy overflow!"
 
         conv_weight = (conv_weight * conv_scale * 2**15).squeeze(1).transpose((1, 2, 0))
         conv_bias = conv_bias * scale
