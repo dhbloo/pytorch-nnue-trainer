@@ -3,6 +3,7 @@ import configargparse
 import yaml
 import os
 import lz4.frame
+import zlib
 
 from dataset import build_dataset
 from model import build_model
@@ -140,6 +141,26 @@ def export_serialization(output, output_type, model_type, model, export_args, **
             assert 0, f"Unsupported serialization output {output_type}"
 
     with open_output(output) as f:
+        # serialize header for binary weight format
+        if serializer.is_binary:
+            MAGIC = zlib.crc32(b'gomoku network weight version 1')  # 0xacd8cc6a
+            arch_hash = serializer.arch_hash(model) & 0xffffffff
+            rule_mask = serializer.rule_mask(model) & 0xffffffff
+            boardsize_mask = serializer.boardsize_mask(model) & 0xffffffff
+            description = serializer.description(model)
+            encoded_description = description.encode('utf-8')
+
+            f.write(MAGIC.to_bytes(4, byteorder='little', signed=False))
+            f.write(arch_hash.to_bytes(4, byteorder='little', signed=False))
+            f.write(rule_mask.to_bytes(4, byteorder='little', signed=False))
+            f.write(boardsize_mask.to_bytes(4, byteorder='little', signed=False))
+            f.write(len(encoded_description).to_bytes(4, byteorder='little', signed=False))
+            f.write(encoded_description)
+
+            print(f'write header: magic = {hex(MAGIC)}, arch_hash = {hex(arch_hash)}, ' +
+                  f'rule_mask = {hex(rule_mask)}, boardsize_mask = {hex(boardsize_mask)}, ' +
+                  f'description = "{description}"')
+
         with torch.no_grad():
             serializer.serialize(f, model, device)
 

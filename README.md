@@ -90,4 +90,16 @@ python visualize_dataset.py --dataset_type packed_binary <path to data file>
 
 ## Serialized Weight Format
 
-In order to improve the ease of managing weights for different rules and board size configuration, binary serialized network weights are serialized with a standardized header, which contains information about the weights, including architecture id, applicable rules and board sizes, name, description and checksum. 
+In order to improve the ease of managing weights for different rules and board size configuration, binary serialized network weights are serialized with a standardized header, which contains information about the weights, including architecture id, applicable rules, board sizes, default settings and description. Binary weights data of the network is appended after the header.
+
+```C
+struct Header {
+    uint32_t magic;				// 0xacd8cc6a = crc32("gomoku network weight version 1")
+    uint32_t arch_hash;			// architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
+    uint32_t rule_mask;			// applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
+    uint32_t boardsize_mask;	// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
+    uint32_t desc_len;			// length of desc string (=0 for no description)
+    char description[desc_len];	// weight description (encoded in utf-8)
+}
+```
+

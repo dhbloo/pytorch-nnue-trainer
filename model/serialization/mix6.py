@@ -1,7 +1,9 @@
 import torch
 import numpy as np
 import io
+from zlib import crc32
 from math import ceil
+from utils.misc_utils import ascii_hist
 from . import BaseSerializer, SERIALIZERS
 from ..mix6 import Mix6Net
 
@@ -56,17 +58,30 @@ class Mix6NetSerializer(BaseSerializer):
         float _mlp_b3_padding[5];
     };
     """
-    def __init__(self, board_size=15, feature_map_bound=4500, text_output=False):
-        super().__init__()
+    def __init__(self,
+                 rule='freestyle',
+                 board_size=None,
+                 feature_map_bound=4500,
+                 text_output=False,
+                 **kwargs):
+        super().__init__(rules=[rule],
+                         boardsizes=list(range(5, 23)) if board_size is None else [board_size],
+                         **kwargs)
         self.line_length = 11
-        self.board_size = board_size
         self.text_output = text_output
         self.feature_map_bound = feature_map_bound
         self.map_table_export_batch_size = 4096
 
     @property
-    def is_binary(self):
+    def is_binary(self) -> bool:
         return not self.text_output
+
+    def arch_hash(self, model: Mix6Net) -> int:
+        hash = crc32(b'mix6net')
+        _, dim_policy, dim_value = model.model_size
+        hash ^= crc32(model.input_type.encode('utf-8'))
+        hash ^= (dim_policy << 16) | dim_value
+        return hash
 
     def _export_map_table(self, model: Mix6Net, device, line):
         """
@@ -204,7 +219,7 @@ class Mix6NetSerializer(BaseSerializer):
 
     def _export_value(self, model: Mix6Net, scale):
         # value layer 0: global mean
-        scale_before_mlp = 1 / scale / self.board_size**2
+        scale_before_mlp = 1 / scale  # Note: divide board_size**2 in engine
 
         # value layer 1: activation after mean
         lr_slope = model.value_activation.neg_slope.cpu().numpy()
@@ -221,6 +236,15 @@ class Mix6NetSerializer(BaseSerializer):
         # value layer 4: linear mlp final
         linear_final_weight = model.value_linear_final.fc.weight.cpu().numpy().T
         linear_final_bias = model.value_linear_final.fc.bias.cpu().numpy()
+
+        print(f"value: scale_before_mlp = {scale_before_mlp}")
+        ascii_hist("value: lr_slope_sub1", lr_slope_sub1)
+        ascii_hist("value: linear1_weight", linear1_weight)
+        ascii_hist("value: linear1_bias", linear1_bias)
+        ascii_hist("value: linear2_weight", linear2_weight)
+        ascii_hist("value: linear2_bias", linear2_bias)
+        ascii_hist("value: linear_final_weight", linear_final_weight)
+        ascii_hist("value: linear_final_bias", linear_final_bias)
 
         return (
             scale_before_mlp,
