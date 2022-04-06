@@ -130,11 +130,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
                   batch_size, num_worker, learning_rate, weight_decay, no_shuffle, log_interval,
                   show_interval, save_interval, val_interval, avg_loss_interval, **kwargs):
-    tb_logger = SummaryWriter(os.path.join(rundir, "log"))
-    log_filename = os.path.join(rundir, 'training_log.json')
-
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
+
+    if accelerator.is_local_main_process:
+        tb_logger = SummaryWriter(os.path.join(rundir, "log"))
+        log_filename = os.path.join(rundir, 'training_log.json')
 
     # load train and validation dataset
     train_dataset = build_dataset(dataset_type,

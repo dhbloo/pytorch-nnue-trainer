@@ -199,7 +199,8 @@ class Mix6Netv2(nn.Module):
                  dim_policy=32,
                  dim_value=32,
                  input_type='basic',
-                 quantization=True):
+                 quantization=True,
+                 scale_feature=4):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.input_type = input_type
@@ -231,44 +232,53 @@ class Mix6Netv2(nn.Module):
         self.value_linear2 = LinearBlock(dim_value, dim_value, activation='relu')
         self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
 
+        # adaptive scales
+        self.policy_output_scale = Parameter(torch.ones(1), True)
+        self.value_output_scale = Parameter(torch.ones(1), True)
+
         # quantization constants
         self.quantization = quantization
-        self.scaling_factor = 64
-        self.scaling_factor_after_mean = 4 * 3600 / 256  # 56.25
-        self.maxf_i8 = 127 / self.scaling_factor  # 1.98438
-        self.maxf_i8_after_mean = 127 / self.scaling_factor_after_mean  # 2.25778
+        self.scale_weight = 64
+        self.scale_feature = scale_feature
+        self.scale_feature_after_mean = self.scale_feature / 16 * 3600 / 256
+        self.maxf_i8_w = 127 / self.scale_weight  # 1.98438
+        self.maxf_i8_f = 127 / self.scale_feature
+        self.maxf_i8_f_after_mean = 127 / self.scale_feature_after_mean
 
     def forward(self, data):
         _, dim_policy, _ = self.model_size
 
         input_plane = self.input_plane(data)
         feature = self.mapping(input_plane)
-        feature = torch.tanh(feature) * self.maxf_i8  # scale to range [-maxf_i8, maxf_i8]
+        # rescale to range [-maxf_i8_f, maxf_i8_f]
+        feature = torch.tanh(feature / self.maxf_i8_f) * self.maxf_i8_f
 
         # sum feature across four directions
-        feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W], range [-maxf_i8*4, maxf_i8*4]
-        feature = self.mapping_activation(feature)  # range [-maxf_i8*4, maxf_i8*4]
-        feature = feature / 4  # range [-maxf_i8, maxf_i8]
+        feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W], range [-maxf_i8_f*4, maxf_i8_f*4]
+        feature = self.mapping_activation(feature)  # range [-maxf_i8_f*4, maxf_i8_f*4]
+        feature = feature / 4  # range [-maxf_i8_f, maxf_i8_f]
 
         # policy head
-        policy = feature[:, :dim_policy]  # range [-maxf_i8, maxf_i8]
-        policy = self.policy_dw_conv(policy)  # range [-maxf_i8*4, maxf_i8*4]
-        policy = policy / 4  # range [-maxf_i8, maxf_i8]
-        policy = self.policy_pw_conv(policy)  # range [-9*maxf_i8**2, 9*maxf_i8**2]
+        policy = feature[:, :dim_policy]  # range [-maxf_i8_f, maxf_i8_f]
+        policy = self.policy_dw_conv(policy)  # range [-maxf_i8_f*4, maxf_i8_f*4]
+        policy = policy / 4  # range [-maxf_i8_f, maxf_i8_f]
+        policy = self.policy_pw_conv(policy)  # range [-9*maxf_i8_f**2, 9*maxf_i8_f**2]
+        policy = policy * self.policy_output_scale
 
         # value head
-        value = feature[:, dim_policy:]  # range [-maxf_i8, maxf_i8]
-        value = torch.mean(value, dim=(2, 3))  # range ~[-maxf_i8, maxf_i8]
-        value = self.value_activation(value)  # range ~[-maxf_i8, maxf_i8]
+        value = feature[:, dim_policy:]  # range [-maxf_i8_f, maxf_i8_f]
+        value = torch.mean(value, dim=(2, 3))  # range [-maxf_i8_f, maxf_i8_f]
+        value = self.value_activation(value)  # range [-maxf_i8_f, maxf_i8_f]
         value = self.value_linear1(value)
         if self.quantization:
-            # ClippedReLU, range [0, maxf_i8_after_mean]
-            value = torch.clamp(value, max=self.maxf_i8_after_mean)
+            # ClippedReLU, range [0, maxf_i8_f_after_mean]
+            value = torch.clamp(value, max=self.maxf_i8_f_after_mean)
         value = self.value_linear2(value)
         if self.quantization:
-            # ClippedReLU, range [0, maxf_i8_after_mean]
-            value = torch.clamp(value, max=self.maxf_i8_after_mean)
+            # ClippedReLU, range [0, maxf_i8_f_after_mean]
+            value = torch.clamp(value, max=self.maxf_i8_f_after_mean)
         value = self.value_linear_final(value)
+        value = value * self.value_output_scale
 
         return value, policy
 
@@ -276,12 +286,14 @@ class Mix6Netv2(nn.Module):
     def weight_clipping(self):
         return [] if not self.quantization else [
             {
-                'params': [
-                    self.mapping_activation.weight,
-                    self.value_activation.weight,
-                ],
-                'min_weight': -1.0,
-                'max_weight': 1.0
+                'params': [self.mapping_activation.weight],
+                'min_weight': -64 / 64,
+                'max_weight': 64 / 64
+            },
+            {
+                'params': [self.value_activation.weight],
+                'min_weight': -127 / 128,
+                'max_weight': 127 / 128
             },
             {
                 'params': [
@@ -292,14 +304,14 @@ class Mix6Netv2(nn.Module):
                     self.value_linear_final.fc.weight,
                 ],
                 'min_weight':
-                -self.maxf_i8,
+                -self.maxf_i8_w,
                 'max_weight':
-                self.maxf_i8
+                self.maxf_i8_w
             },
             {
                 'params': [self.policy_dw_conv.conv.bias],
-                'min_weight': -16383 / self.scaling_factor**2,
-                'max_weight': 16383 / self.scaling_factor**2
+                'min_weight': -16383 / (self.scale_weight * self.scale_feature),
+                'max_weight': 16383 / (self.scale_weight * self.scale_feature)
             },
         ]
 
