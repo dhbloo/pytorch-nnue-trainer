@@ -52,6 +52,7 @@ def parse_args_and_init():
     parser.add('--batch_size', type=int, default=128, help="Batch size")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
     parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
+    parser.add('--clip_grad_norm', type=float, help="Gradient clipping max norm")
     parser.add('--no_shuffle', action='store_true', help="Do not shuffle dataset")
     parser.add('--seed', type=int, default=42, help="Random seed")
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
@@ -128,8 +129,9 @@ def calc_loss(loss_type, value, policy, data):
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
                   dataloader_args, model_type, model_args, optim_type, optim_args,
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
-                  batch_size, num_worker, learning_rate, weight_decay, no_shuffle, log_interval,
-                  show_interval, save_interval, val_interval, avg_loss_interval, **kwargs):
+                  batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
+                  log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
+                  **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -217,6 +219,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             value, policy = model(data)
             loss, loss_dict = calc_loss(loss_type, value, policy, data)
             accelerator.backward(loss)
+
+            # apply gradient clipping if needed
+            if clip_grad_norm is not None:
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+
             optimizer.step()
             lr_scheduler.step()
 
