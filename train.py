@@ -228,8 +228,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             lr_scheduler.step()
 
             # apply weight clipping if needed
-            if hasattr(model, 'weight_clipping'):
-                weight_clipping(model.weight_clipping)
+            if hasattr(accelerator.unwrap_model(model), 'weight_clipping'):
+                weight_clipping(accelerator.unwrap_model(model).weight_clipping)
 
             # update running average loss
             loss_dict = accelerator.gather(loss_dict)
