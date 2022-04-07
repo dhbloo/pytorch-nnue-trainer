@@ -119,9 +119,9 @@ def calc_loss(loss_type, value, policy, data):
 
     total_loss = value_loss + policy_loss
     return total_loss, {
-        'total_loss': total_loss.item(),
-        'value_loss': value_loss.item(),
-        'policy_loss': policy_loss.item()
+        'total_loss': total_loss.detach(),
+        'value_loss': value_loss.detach(),
+        'policy_loss': policy_loss.detach(),
     }
 
 
@@ -225,7 +225,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 weight_clipping(model.weight_clipping)
 
             # update running average loss
+            loss_dict = accelerator.gather(loss_dict)
             for key, value in loss_dict.items():
+                value = torch.mean(value, dim=0).item()
                 if not key in avg_loss_dict:
                     avg_loss_dict[key] = deque(maxlen=avg_loss_interval)
                 avg_loss_dict[key].append(value)
@@ -286,12 +288,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
 
-                # convert losses floats to tensor
-                for k, loss in val_loss_dict.items():
-                    val_loss_dict[k] = torch.FloatTensor([loss]).to(accelerator.device)
+                # gather all loss dict across processes
                 val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches
                                                                      ]).to(accelerator.device)
-                # gather all loss dict across processes
                 all_val_loss_dict = accelerator.gather(val_loss_dict)
 
                 if accelerator.is_local_main_process:
