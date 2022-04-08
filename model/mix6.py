@@ -260,9 +260,8 @@ class Mix6Netv2(nn.Module):
 
         # policy head
         policy = feature[:, :dim_policy]  # range [-maxf_i8_f, maxf_i8_f]
-        policy = self.policy_dw_conv(policy)  # range [-maxf_i8_f*4, maxf_i8_f*4]
-        policy = policy / 4  # range [-maxf_i8_f, maxf_i8_f]
-        policy = self.policy_pw_conv(policy)  # range [-9*maxf_i8_f**2, 9*maxf_i8_f**2]
+        policy = self.policy_dw_conv(policy)
+        policy = self.policy_pw_conv(policy)
         policy = policy * self.policy_output_scale
 
         # value head
@@ -307,11 +306,6 @@ class Mix6Netv2(nn.Module):
                 -self.maxf_i8_w,
                 'max_weight':
                 self.maxf_i8_w
-            },
-            {
-                'params': [self.policy_dw_conv.conv.bias],
-                'min_weight': -16383 / (self.scale_weight * self.scale_feature),
-                'max_weight': 16383 / (self.scale_weight * self.scale_feature)
             },
         ]
 
