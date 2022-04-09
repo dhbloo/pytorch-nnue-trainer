@@ -61,12 +61,14 @@ class Mix6NetSerializer(BaseSerializer):
     def __init__(self,
                  rule='freestyle',
                  board_size=None,
+                 side_to_move=None,
                  feature_map_bound=4500,
                  text_output=False,
                  **kwargs):
         super().__init__(rules=[rule],
                          boardsizes=list(range(5, 23)) if board_size is None else [board_size],
                          **kwargs)
+        self.side_to_move = side_to_move
         self.line_length = 11
         self.text_output = text_output
         self.feature_map_bound = feature_map_bound
@@ -83,7 +85,7 @@ class Mix6NetSerializer(BaseSerializer):
         hash ^= (dim_policy << 16) | dim_value
         return hash
 
-    def _export_map_table(self, model: Mix6Net, device, line):
+    def _export_map_table(self, model: Mix6Net, device, line, stm=None):
         """
         Export line -> feature mapping table.
 
@@ -92,7 +94,13 @@ class Mix6NetSerializer(BaseSerializer):
         """
         N, L = line.shape
         b, w = line == 1, line == 2
-        line = np.stack((b, w), axis=0)[np.newaxis]  # [B=1, C=2, N, L]
+
+        if stm is not None:
+            s = np.ones_like(line) * stm
+            line = (b, w, s)
+        else:
+            line = (b, w)
+        line = np.stack(line, axis=0)[np.newaxis]  # [B=1, C=2, N, L]
         line = torch.tensor(line, dtype=torch.float32, device=device)
 
         batch_size = self.map_table_export_batch_size
@@ -112,11 +120,11 @@ class Mix6NetSerializer(BaseSerializer):
         map_table = np.concatenate(map_table, axis=1)  # [C=PC+VC, N, L]
         return map_table
 
-    def _export_feature_map(self, model: Mix6Net, device):
+    def _export_feature_map(self, model: Mix6Net, device, stm=None):
         L = self.line_length
         _, PC, VC = model.model_size
         lines = generate_base3_permutation(L)  # [177147, 11]
-        map_table = self._export_map_table(model, device, lines)  # [C=PC+VC, 177147, 11]
+        map_table = self._export_map_table(model, device, lines, stm)  # [C=PC+VC, 177147, 11]
 
         feature_map = np.zeros((4 * 3**L, PC + VC), dtype=np.float32)  # [708588, 48]
         usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
@@ -137,7 +145,7 @@ class Mix6NetSerializer(BaseSerializer):
         for l in range(1, (L + 1) // 2):
             for r in range(1, (L + 1) // 2):
                 lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines)
+                map_table = self._export_map_table(model, device, lines, stm)
                 idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
                 idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
                 for i in range(idx.shape[0]):
@@ -260,7 +268,8 @@ class Mix6NetSerializer(BaseSerializer):
         )
 
     def serialize(self, out: io.IOBase, model: Mix6Net, device):
-        feature_map, usage_flags, scale, bound = self._export_feature_map(model, device)
+        feature_map, usage_flags, scale, bound = \
+            self._export_feature_map(model, device, stm=self.side_to_move)
         map_lr_slope_sub1div8, map_lr_bias, scale, bound_perchannel = \
             self._export_mapping_activation(model, scale, bound)
         policy_conv_weight, policy_conv_bias, \
@@ -495,7 +504,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         for l in range(1, (L + 1) // 2):
             for r in range(1, (L + 1) // 2):
                 lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines)
+                map_table = self._export_map_table(model, device, lines, stm)
                 idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
                 idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
                 for i in range(idx.shape[0]):
@@ -556,7 +565,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         assert pw_conv_weight_quant_max <= 127, "policy pw conv weight overflow!"
 
         policy_output_scale = model.policy_output_scale.item()
-        policy_scale = policy_output_scale / (model.scale_weight * model.scale_feature / 8)
+        policy_scale = policy_output_scale / model.scale_feature
         print(f"policy output: float_scale = {policy_output_scale}, scale = {policy_scale}")
 
         return dw_conv_weight_quant, dw_conv_bias_quant, pw_conv_weight_quant, policy_scale
