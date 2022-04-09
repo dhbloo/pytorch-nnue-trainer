@@ -154,3 +154,5 @@ cython_debug/
 # Training runs
 run_dirs
 run_dirs/**
+data
+data/**
