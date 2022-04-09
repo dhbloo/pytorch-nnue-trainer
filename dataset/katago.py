@@ -135,7 +135,13 @@ class KatagoNumpyDataset(IterableDataset):
 class ProcessedKatagoNumpyDataset(Dataset):
     FILE_EXTS = ['.npz']
 
-    def __init__(self, file_list, boardsizes, fixed_side_input, apply_symmetry=False, **kwargs):
+    def __init__(self,
+                 file_list,
+                 boardsizes,
+                 fixed_side_input,
+                 apply_symmetry=False,
+                 filter_stm=None,
+                 **kwargs):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
@@ -181,6 +187,9 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self.boardsize = self.data_dict["bf"].shape[2:]
         assert len(self.boardsize) == 2
 
+        if filter_stm is not None:
+            self._filter_data_by_side_to_move(filter_stm)
+
         if self.apply_symmetry:
             self.symmetries = Symmetry.available_symmetries(self.boardsize)
         else:
@@ -189,6 +198,15 @@ class ProcessedKatagoNumpyDataset(Dataset):
     @property
     def is_fixed_side_input(self):
         return self.fixed_side_input
+
+    def _filter_data_by_side_to_move(self, side_to_move):
+        stm_inputs = self.data_dict['gf'][:, 0]
+        selected_indices = np.nonzero(stm_inputs == side_to_move)[0]
+
+        for k in self.data_dict.keys():
+            self.data_dict[k] = self.data_dict[k][selected_indices, :]
+
+        self.length = len(next(iter(self.data_dict.values())))
 
     def __len__(self):
         return self.length * len(self.symmetries)
@@ -242,6 +260,7 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.max_worker_per_file = max_worker_per_file
+        self.kwargs = kwargs
 
     @property
     def is_fixed_side_input(self):
@@ -266,7 +285,8 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
             dataset = ProcessedKatagoNumpyDataset(file_list=[filename],
                                                   boardsizes=self.boardsizes,
                                                   fixed_side_input=self.fixed_side_input,
-                                                  apply_symmetry=self.apply_symmetry)
+                                                  apply_symmetry=self.apply_symmetry,
+                                                  **self.kwargs)
             for index in make_subset_range(len(dataset),
                                            partition_num=worker_per_file,
                                            partition_idx=worker_id % worker_per_file,
