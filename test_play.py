@@ -101,7 +101,7 @@ def next_move(board, model, data):
         if isinstance(data[k], torch.Tensor):
             data[k] = torch.unsqueeze(data[k], dim=0)
 
-    value, policy = model(data)
+    value, policy, *retvals = model(data)
 
     # remove batch dimension
     value = value.squeeze(0)

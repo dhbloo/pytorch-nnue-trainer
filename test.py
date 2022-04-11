@@ -56,7 +56,7 @@ def top_k_accuracy(policy, policy_target, k):
     return move_correct_count / k / len(topkmoves)
 
 
-def calc_metric(value, policy, data):
+def calc_metric(data, value, policy):
     value_target = data['value_target']
     policy_target = data['policy_target']
 
@@ -152,8 +152,8 @@ def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args
     with torch.no_grad():
         model.eval()
         for data in tqdm(test_loader, disable=not accelerator.is_local_main_process):
-            value, policy = model(data)
-            metrics = calc_metric(value, policy, data)
+            value, policy, *retvals = model(data)
+            metrics = calc_metric(data, value, policy)
             add_dict_to(metric_dict, metrics)
             num_batches += 1
 

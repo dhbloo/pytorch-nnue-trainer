@@ -79,11 +79,12 @@ def export_onnx(output, model, **kwargs):
             self.model = model
 
         def forward(self, board_size, board_input, stm_input):
-            return self.model({
+            value, policy = self.model({
                 'board_size': board_size,
                 'board_input': board_input,
                 'stm_input': stm_input,
             })
+            return value, policy
 
     model = ONNXModelWrapper(model)
     model.eval()

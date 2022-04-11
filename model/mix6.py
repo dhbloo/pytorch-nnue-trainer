@@ -261,6 +261,9 @@ class Mix6Netv2(nn.Module):
         # policy head
         policy = feature[:, :dim_policy]  # range [-maxf_i8_f, maxf_i8_f]
         policy = self.policy_dw_conv(policy)
+        if self.quantization:
+            # Clipped LeakyReLU, range [-maxf_i8_f, maxf_i8_f]
+            policy = torch.clamp(policy, min=-self.maxf_i8_f, max=self.maxf_i8_f)
         policy = self.policy_pw_conv(policy)
         policy = policy * self.policy_output_scale
 

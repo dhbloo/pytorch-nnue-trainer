@@ -58,7 +58,7 @@ def parse_args_and_init():
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
     parser.add('--save_interval', type=int, default=10000, help="Num iterations to save snapshot")
-    parser.add('--val_interval', type=int, default=20000, help="Num iterations to do validation")
+    parser.add('--val_interval', type=int, default=25000, help="Num iterations to do validation")
     parser.add('--avg_loss_interval',
                type=int,
                default=2500,
@@ -77,7 +77,7 @@ def parse_args_and_init():
     return args
 
 
-def calc_loss(loss_type, value, policy, data):
+def calc_loss(loss_type, data, value, policy):
     value_loss_type, policy_loss_type = loss_type.split('+')
     value_target = data['value_target']
     policy_target = data['policy_target']
@@ -216,8 +216,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
             # model update
             optimizer.zero_grad()
-            value, policy = model(data)
-            loss, loss_dict = calc_loss(loss_type, value, policy, data)
+            value, policy, *retvals = model(data)
+            loss, loss_dict = calc_loss(loss_type, data, value, policy)
             accelerator.backward(loss)
 
             # apply gradient clipping if needed
@@ -290,8 +290,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
                 with torch.no_grad():
                     for val_data in val_loader:
-                        value, policy = model(val_data)
-                        _, val_losses = calc_loss(loss_type, value, policy, val_data)
+                        value, policy, *retvals = model(val_data)
+                        _, val_losses = calc_loss(loss_type, val_data, value, policy)
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
 
@@ -325,6 +325,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                           f" total: {val_loss_dict['total_loss']:.4f}," +
                           f" value: {val_loss_dict['value_loss']:.4f}," +
                           f" policy: {val_loss_dict['policy_loss']:.4f}")
+
+                    # substract validation time from training time
+                    last_time += val_elasped
 
 
 if __name__ == "__main__":
