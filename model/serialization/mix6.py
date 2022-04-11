@@ -436,9 +436,10 @@ class Mix6Netv2Serializer(BaseSerializer):
         return not self.text_output
 
     def arch_hash(self, model: Mix6Netv2) -> int:
-        hash = crc32(b'mix6netv2')
+        assert model.input_type == 'basic' or model.input_type == 'basic-nostm'
         _, dim_policy, dim_value = model.model_size
-        hash ^= crc32(model.input_type.encode('utf-8'))
+        hash = crc32(b'mix6netv2')
+        hash ^= crc32(b'basic')
         hash ^= (dim_policy << 16) | dim_value
         hash ^= hash << 7
         hash += hash >> 3
@@ -533,12 +534,11 @@ class Mix6Netv2Serializer(BaseSerializer):
         return weight_quant
 
     def _export_policy(self, model: Mix6Netv2):
-        _, PC, _ = model.model_size
         # policy layer 1: policy dw conv
         dw_conv_weight = model.policy_dw_conv.conv.weight.cpu().numpy()
         dw_conv_bias = model.policy_dw_conv.conv.bias.cpu().numpy()
         dw_conv_weight_quant = dw_conv_weight * model.scale_weight
-        dw_conv_bias_quant = dw_conv_bias * model.scale_weight * model.scale_feature
+        dw_conv_bias_quant = dw_conv_bias * (model.scale_weight * model.scale_feature / 16)
 
         # transpose weight to [9][dim_policy]
         dw_conv_weight_quant = dw_conv_weight_quant.squeeze(1).transpose((1, 2, 0))
@@ -552,7 +552,7 @@ class Mix6Netv2Serializer(BaseSerializer):
             f"weight_quant_max = {dw_conv_weight_quant_max}, bias_quant_max = {dw_conv_bias_quant_max}"
         )
         assert dw_conv_weight_quant_max <= 127, "policy dw conv weight overflow!"
-        assert dw_conv_bias_quant_max <= 16383, "policy dw conv bias overflow!"
+        assert dw_conv_bias_quant_max <= 20000, "policy dw conv bias overflow!"
 
         # policy layer 2: policy pw conv
         pw_conv_weight = model.policy_pw_conv.conv.weight.cpu().numpy()[0, :, 0, 0]
@@ -590,7 +590,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         linear1_weight_quant_max = np.abs(linear1_weight_quant).max()
         linear1_bias_quant_max = np.abs(linear1_bias_quant).max()
         assert linear1_weight_quant_max <= 127, "value linear1 weight overflow!"
-        assert linear1_bias_quant_max < 2**31, "value linear1 bias overflow!"
+        assert linear1_bias_quant_max <= 2**30, "value linear1 bias overflow!"
 
         # value layer 2: linear mlp 02
         linear2_weight = model.value_linear2.fc.weight.cpu().numpy()
@@ -603,7 +603,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         linear2_weight_quant_max = np.abs(linear2_weight_quant).max()
         linear2_bias_quant_max = np.abs(linear2_bias_quant).max()
         assert linear2_weight_quant_max <= 127, "value linear2 weight overflow!"
-        assert linear2_bias_quant_max < 2**31, "value linear2 bias overflow!"
+        assert linear2_bias_quant_max <= 2**30, "value linear2 bias overflow!"
 
         # value layer 3: linear mlp final
         linear3_weight = model.value_linear_final.fc.weight.cpu().numpy()

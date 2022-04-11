@@ -227,7 +227,7 @@ class Mix6Netv2(nn.Module):
                                           bias=False)
 
         # value nets
-        self.value_activation = nn.PReLU(dim_value)
+        self.value_activation = nn.ReLU(inplace=True)
         self.value_linear1 = LinearBlock(dim_value, dim_value, activation='relu')
         self.value_linear2 = LinearBlock(dim_value, dim_value, activation='relu')
         self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
@@ -269,8 +269,9 @@ class Mix6Netv2(nn.Module):
 
         # value head
         value = feature[:, dim_policy:]  # range [-maxf_i8_f, maxf_i8_f]
-        value = torch.mean(value, dim=(2, 3))  # range [-maxf_i8_f, maxf_i8_f]
-        value = self.value_activation(value)  # range [-maxf_i8_f, maxf_i8_f]
+        value = torch.mean(value,
+                           dim=(2, 3))  # range [-maxf_i8_f_after_mean, maxf_i8_f_after_mean]
+        value = self.value_activation(value)  # range [0, maxf_i8_f_after_mean]
         value = self.value_linear1(value)
         if self.quantization:
             # ClippedReLU, range [0, maxf_i8_f_after_mean]
