@@ -289,22 +289,17 @@ class Mix6Netv2(nn.Module):
     def weight_clipping(self):
         return [] if not self.quantization else [
             {
-                'params': [self.mapping_activation.weight],
+                'params': ['mapping_activation.weight'],
                 'min_weight': -64 / 64,
                 'max_weight': 64 / 64
             },
             {
-                'params': [self.value_activation.weight],
-                'min_weight': -127 / 128,
-                'max_weight': 127 / 128
-            },
-            {
                 'params': [
-                    self.policy_dw_conv.conv.weight,
-                    self.policy_pw_conv.conv.weight,
-                    self.value_linear1.fc.weight,
-                    self.value_linear2.fc.weight,
-                    self.value_linear_final.fc.weight,
+                    'policy_dw_conv.conv.weight',
+                    'policy_pw_conv.conv.weight',
+                    'value_linear1.fc.weight',
+                    'value_linear2.fc.weight',
+                    'value_linear_final.fc.weight',
                 ],
                 'min_weight':
                 -self.maxf_i8_w,

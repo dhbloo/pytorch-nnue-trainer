@@ -99,12 +99,20 @@ def build_data_loader(dataset,
     return dataloader
 
 
-def weight_clipping(parameters):
-    for group in parameters:
-        for p in group['params']:
+def weight_clipping(named_parameters, clip_parameters):
+    clip_param_dict = {}
+    for group in clip_parameters:
+        for param_name in group['params']:
+            clip_param_dict[param_name] = {
+                'min_weight': group['min_weight'],
+                'max_weight': group['max_weight'],
+            }
+
+    for name, p in named_parameters:
+        if name in clip_param_dict:
             p_data_fp32 = p.data
-            min_weight = group['min_weight']
-            max_weight = group['max_weight']
+            min_weight = clip_param_dict[name]['min_weight']
+            max_weight = clip_param_dict[name]['max_weight']
             p_data_fp32.clamp_(min_weight, max_weight)
             p.data.copy_(p_data_fp32)
 
