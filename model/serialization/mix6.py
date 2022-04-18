@@ -408,16 +408,13 @@ class Mix6Netv2Serializer(BaseSerializer):
         // 4  Policy pointwise conv
         int8_t policy_pw_conv_weight[PolicyDim];
 
-        // 5  Value PReLU
-        int16_t value_prelu_weight[ValueDim];
-
-        // 6  Value MLP (layer 1,2,3)
+        // 5  Value MLP (layer 1,2,3)
         int8_t  value_linear1_weight[ValueDim][ValueDim];  // shape=(out channel, in channel)
         int32_t value_linear1_bias[ValueDim];
         int8_t  value_linear2_weight[ValueDim][ValueDim];
         int32_t value_linear2_bias[ValueDim];
-        int8_t  value_linear3_weight[3+1][ValueDim];  // add one for padding
-        int32_t value_linear3_bias[3+1];              // add one for padding
+        int8_t  value_linear3_weight[3 + 1][ValueDim];  // add one for padding
+        int32_t value_linear3_bias[3 + 1];              // add one for padding
 
         float policy_output_scale;
         float value_output_scale;
@@ -572,12 +569,6 @@ class Mix6Netv2Serializer(BaseSerializer):
 
     def _export_value(self, model: Mix6Netv2):
         # value layer 0: activation after mean
-        prelu_weight = model.value_activation.weight.cpu().numpy()
-        prelu_weight_quant = prelu_weight * 128
-
-        ascii_hist("value prelu weight", prelu_weight)
-        prelu_weight_quant_max = np.abs(prelu_weight_quant).max()
-        assert prelu_weight_quant_max <= 127, "value prelu weight overflow!"
 
         # value layer 1: linear mlp 01
         linear1_weight = model.value_linear1.fc.weight.cpu().numpy()
@@ -630,7 +621,6 @@ class Mix6Netv2Serializer(BaseSerializer):
         print(f"value output: float_scale = {value_output_scale}, scale = {value_scale}")
 
         return (
-            prelu_weight_quant,
             linear1_weight_quant,
             linear1_bias_quant,
             linear2_weight_quant,
@@ -651,9 +641,8 @@ class Mix6Netv2Serializer(BaseSerializer):
         map_prelu_weight = self._export_mapping_activation(model)
         policy_dw_conv_weight, policy_dw_conv_bias, policy_pw_conv_weight, \
             policy_output_scale = self._export_policy(model)
-        value_prelu_weight, linear1_weight, linear1_bias, \
-        linear2_weight, linear2_bias, linear3_weight, \
-        linear3_bias, value_output_scale = self._export_value(model)
+        linear1_weight, linear1_bias, linear2_weight, linear2_bias, \
+        linear3_weight, linear3_bias, value_output_scale = self._export_value(model)
 
         if self.text_output:
             print('num_mappings', file=out)
@@ -681,10 +670,6 @@ class Mix6Netv2Serializer(BaseSerializer):
 
             print('policy_pw_conv_weight', file=out)
             policy_pw_conv_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-
-            print('value_prelu_weight', file=out)
-            value_prelu_weight.astype('i2').tofile(out, sep=' ')
             print(file=out)
 
             print('linear1_weight', file=out)
@@ -731,9 +716,6 @@ class Mix6Netv2Serializer(BaseSerializer):
 
             # int8_t policy_pw_conv_weight[PolicyDim]
             o.write(policy_pw_conv_weight.astype('<i1').tobytes())  # (PC,)
-
-            # int16_t value_prelu_weight[ValueDim]
-            o.write(value_prelu_weight.astype('<i2').tobytes())  # (VC,)
 
             # int8_t  value_linear1_weight[ValueDim][ValueDim]  // shape=(out channel, in channel)
             # int32_t value_linear1_bias[ValueDim]
