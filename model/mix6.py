@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
-from torch.quantization import QuantStub, DeQuantStub
+from torch.quantization import QuantStub, DeQuantStub, get_default_qat_qconfig
 
 from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock
@@ -245,6 +245,9 @@ class Mix6Netv2(nn.Module):
         self.maxf_i8_f = 127 / self.scale_feature
         self.maxf_i8_f_after_mean = 127 / self.scale_feature_after_mean
 
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
+
     def forward(self, data):
         _, dim_policy, _ = self.model_size
 
@@ -252,6 +255,9 @@ class Mix6Netv2(nn.Module):
         feature = self.mapping(input_plane)
         # rescale to range [-maxf_i8_f, maxf_i8_f]
         feature = torch.tanh(feature / self.maxf_i8_f) * self.maxf_i8_f
+
+        # start quantization
+        feature = self.quant(feature)
 
         # sum feature across four directions
         feature = torch.sum(feature, dim=1)  # [B, PC+VC, H, W], range [-maxf_i8_f*4, maxf_i8_f*4]
@@ -265,6 +271,7 @@ class Mix6Netv2(nn.Module):
             # Clipped LeakyReLU, range [-maxf_i8_f, maxf_i8_f]
             policy = torch.clamp(policy, min=-self.maxf_i8_f, max=self.maxf_i8_f)
         policy = self.policy_pw_conv(policy)
+        policy = self.dequant(policy)  # end of quantization
         policy = policy * self.policy_output_scale
 
         # value head
@@ -281,9 +288,18 @@ class Mix6Netv2(nn.Module):
             # ClippedReLU, range [0, maxf_i8_f_after_mean]
             value = torch.clamp(value, max=self.maxf_i8_f_after_mean)
         value = self.value_linear_final(value)
+        value = self.dequant(value)  # end of quantization
         value = value * self.value_output_scale
 
         return value, policy
+
+    def setup_qat(self, backend : str):
+        # self.policy_dw_conv.fuse()
+        # self.policy_pw_conv.fuse()
+        self.value_linear1.fuse()
+        self.value_linear2.fuse()
+        # self.value_linear_final.fuse()
+        self.qconfig = get_default_qat_qconfig(backend)
 
     @property
     def weight_clipping(self):

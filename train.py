@@ -27,6 +27,7 @@ def parse_args_and_init():
     parser.add('-r', '--rundir', required=True, help="Run directory")
     parser.add('--load_from', help="Load pretrained weights from file")
     parser.add('--use_cpu', action='store_true', help="Use cpu only")
+    parser.add('--qat', action='store_true', help="Enable quantization-aware training")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
     parser.add('--dataloader_args',
@@ -126,18 +127,15 @@ def calc_loss(loss_type, data, value, policy):
     }
 
 
-def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  dataloader_args, model_type, model_args, optim_type, optim_args,
+def training_loop(rundir, load_from, use_cpu, qat, train_datas, val_datas, dataset_type,
+                  dataset_args, dataloader_args, model_type, model_args, optim_type, optim_args,
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
                   batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
                   log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
                   **kwargs):
     # use accelerator
+    use_cpu = use_cpu or qat  # qat must run on CPU
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
-
-    if accelerator.is_local_main_process:
-        tb_logger = SummaryWriter(os.path.join(rundir, "log"))
-        log_filename = os.path.join(rundir, 'training_log.json')
 
     # load train and validation dataset
     train_dataset = build_dataset(dataset_type,
@@ -189,6 +187,18 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 accelerator.print(f"missing keys in state_dict: {', '.join(missing_keys)}")
             accelerator.print(f'Loaded from pretrained: {load_from}')
 
+    # prepare quantization settings
+    if qat:
+        backend = 'fbgemm'
+        torch.backends.quantized.engine = backend
+        model.train()
+        if hasattr(model, 'setup_qat'):
+            model.setup_qat(backend)
+        else:
+            model.qconfig = torch.quantization.get_default_qat_qconfig(backend)
+        torch.quantization.prepare_qat(model, inplace=True)
+        accelerator.print(f"Prepared model for quantization-aware training with backend {backend}")
+
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
@@ -199,6 +209,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                                       lr_scheduler_type,
                                       last_it=it - 1,
                                       **lr_scheduler_args)
+
+    # start logger
+    if accelerator.is_local_main_process:
+        tb_logger = SummaryWriter(os.path.join(rundir, "log"))
+        log_filename = os.path.join(rundir, 'training_log.json')
 
     accelerator.print(f'Start training from iteration {it}, epoch {epoch}')
     last_it = it
@@ -290,12 +305,14 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 val_loss_dict = {}
                 num_val_batches = 0
 
+                model.eval()
                 with torch.no_grad():
                     for val_data in val_loader:
                         value, policy, *retvals = model(val_data)
                         _, val_losses = calc_loss(loss_type, val_data, value, policy)
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
+                model.train()
 
                 # gather all loss dict across processes
                 val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches

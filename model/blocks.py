@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from torch.quantization import fuse_modules
 
 
 def build_activation_layer(activation):
@@ -68,6 +69,16 @@ class LinearBlock(nn.Module):
             out = self.activation(out)
         return out
 
+    def fuse(self, inplace=True):
+        """Fuse modules for quantization."""
+        modules_to_fuse = ['fc']
+        if self.norm:
+            modules_to_fuse.append('norm')
+        if self.activation:
+            modules_to_fuse.append('activation')
+
+        return fuse_modules(self, modules_to_fuse, inplace=inplace)
+
 
 class Conv2dBlock(nn.Module):
     def __init__(self,
@@ -132,6 +143,17 @@ class Conv2dBlock(nn.Module):
             if self.activation:
                 x = self.activation(x)
         return x
+
+    def fuse(self, inplace=True):
+        """Fuse modules for quantization."""
+        assert not self.activation_first, "fuse does not support activation_first"
+        modules_to_fuse = ['conv']
+        if self.norm:
+            modules_to_fuse.append('norm')
+        if self.activation:
+            modules_to_fuse.append('activation')
+
+        return fuse_modules(self, modules_to_fuse, inplace=inplace)
 
 
 class ResBlock(nn.Module):
