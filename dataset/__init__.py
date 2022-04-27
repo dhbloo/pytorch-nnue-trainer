@@ -1,6 +1,7 @@
-from torch.utils.data.dataset import IterableDataset
+from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.file_utils import make_file_list
 from utils.misc_utils import Register, import_submodules
+from .pipeline import warp_dataset_with_pipeline
 
 DATASETS = Register('dataset')
 import_submodules(__name__, recursive=False)
@@ -61,6 +62,7 @@ def build_dataset(dataset_type,
                   boardsize=None,
                   fixed_side_input=False,
                   shuffle=False,
+                  pipeline_args=None,
                   **kwargs):
     assert dataset_type in DATASETS
     dataset_cls = DATASETS[dataset_type]
@@ -77,9 +79,14 @@ def build_dataset(dataset_type,
         else:
             boardsizes = [(s, s) for s in range(11, 21)]
 
-    return dataset_cls(file_list=file_list,
-                       rules=rules,
-                       boardsizes=boardsizes,
-                       fixed_side_input=fixed_side_input,
-                       shuffle=shuffle,
-                       **kwargs)
+    dataset = dataset_cls(file_list=file_list,
+                          rules=rules,
+                          boardsizes=boardsizes,
+                          fixed_side_input=fixed_side_input,
+                          shuffle=shuffle,
+                          **kwargs)
+
+    if pipeline_args is not None:
+        dataset = warp_dataset_with_pipeline(dataset, pipeline_args)
+
+    return dataset

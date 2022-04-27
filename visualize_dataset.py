@@ -6,20 +6,6 @@ import configargparse
 import yaml
 
 
-def process_bin(index, result, ply, boardsize, rule, move, position):
-    print('-' * 50)
-    print(f'index: {index}')
-    print(f'result: {result}')
-    print(f'ply: {ply}')
-    print(f'boardsize: {boardsize}')
-    print(f'rule: {rule}')
-    print(f'move: {move}')
-    print(f'position: {"".join([str(m) for m in position])}')
-
-    # Add process logic here......
-    pass
-
-
 def visualize_entry(fixed_side_input,
                     board_size,
                     board_input,
@@ -101,7 +87,7 @@ def visualize_dataset(dataset):
         if 'position_string' in data:
             optional_texts += [f"pos={data['position_string'][0]}"]
         print(f"Data Entry[{index}]: bs={(bs[0].item(), bs[1].item())} {' '.join(optional_texts)}")
-        visualize_entry(dataset.fixed_side_input, **data)
+        visualize_entry(dataset.is_fixed_side_input, **data)
 
 
 if __name__ == "__main__":
@@ -110,11 +96,16 @@ if __name__ == "__main__":
     parser.add('data_paths', nargs='+', help="Dataset file or directory paths")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--data_pipelines',
+               type=yaml.safe_load,
+               default=None,
+               help="Data-pipeline type and arguments")
     parser.add('--shuffle', action='store_true', help="Shuffle dataset")
     args = parser.parse_args()
 
     dataset = build_dataset(args.dataset_type,
                             args.data_paths,
                             shuffle=args.shuffle,
+                            pipeline_args=args.data_pipelines,
                             **args.dataset_args)
     visualize_dataset(dataset)

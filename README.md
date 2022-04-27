@@ -6,7 +6,19 @@
 
 + 64-bit Python 3.8 and Pytorch 1.10 or later.
 + Accelerate 0.6.2 or later.
-+ Other python libraries: `configargparse tqdm tensorboardX matplotlib `.
++ Other python libraries: `configargparse tqdm tensorboardX matplotlib pybind11 `.
+
+### Setup
+
+After install all required packages in specified in requirements, it is needed to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup c++ compiling environment. Then do the following commands.
+
++ Line Encoding:
+
+  ```bash
+  cd dataset/pipeline/line_encoding_cpp
+  python setup.py build
+  python setup.py install
+  ```
 
 ### Train a network
 

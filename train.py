@@ -33,6 +33,10 @@ def parse_args_and_init():
                type=yaml.safe_load,
                default={},
                help="Extra dataloader arguments")
+    parser.add('--data_pipelines',
+               type=yaml.safe_load,
+               default=None,
+               help="Data-pipeline type and arguments")
     parser.add('--num_worker',
                type=int,
                default=min(8, os.cpu_count()),
@@ -127,7 +131,7 @@ def calc_loss(loss_type, data, value, policy):
 
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  dataloader_args, model_type, model_args, optim_type, optim_args,
+                  dataloader_args, data_pipelines, model_type, model_args, optim_type, optim_args,
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
                   batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
                   log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
@@ -143,6 +147,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     train_dataset = build_dataset(dataset_type,
                                   train_datas,
                                   shuffle=not no_shuffle,
+                                  pipeline_args=data_pipelines,
                                   **dataset_args)
     train_loader = build_data_loader(train_dataset,
                                      batch_size,
@@ -150,7 +155,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                                      shuffle=not no_shuffle,
                                      **dataloader_args)
     if val_datas:
-        val_dataset = build_dataset(dataset_type, val_datas, shuffle=False, **dataset_args)
+        val_dataset = build_dataset(dataset_type,
+                                    val_datas,
+                                    shuffle=False,
+                                    pipeline_args=data_pipelines,
+                                    **dataset_args)
         val_loader = build_data_loader(val_dataset,
                                        batch_size,
                                        num_workers=num_worker,

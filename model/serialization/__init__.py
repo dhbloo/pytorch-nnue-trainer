@@ -5,6 +5,7 @@ from datetime import datetime
 
 
 class BaseSerializer(ABC):
+    """The base class for all model serializer."""
     def __init__(self, rules=['freestyle'], boardsizes=[15], description=None) -> None:
         super().__init__()
         self._rules = rules
