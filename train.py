@@ -184,10 +184,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         model.load_state_dict(state_dicts['model'])
         optimizer.load_state_dict(state_dicts['optimizer'])
         accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
-        epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
+        it = state_dicts.get('iteration', 0)
+        epoch = state_dicts.get('epoch', 0)
+        rows = state_dicts.get('rows', 0)
     else:
         model.apply(weights_init(init_type))
-        epoch, it = 0, 0
+        it, epoch, rows = 0, 0, 0
         if load_from is not None:
             state_dicts = torch.load(load_from, map_location=accelerator.device)
             missing_keys, unexpected_keys = model.load_state_dict(state_dicts['model'],
@@ -219,6 +221,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         epoch += 1
         for data in train_loader:
             it += 1
+            rows += batch_size
             if it > iterations:
                 stop_training = True
                 break
@@ -257,6 +260,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({
                         'it': it,
+                        'epoch': epoch,
+                        'rows': rows,
                         'train_loss': loss_dict,
                         'lr': lr_scheduler.get_last_lr()[0],
                     })
@@ -270,6 +275,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 log_value_dict(
                     tb_logger, 'running_stat', {
                         'epoch': epoch,
+                        'rows': rows,
                         'elasped_seconds': elasped,
                         'it/s': speed,
                         'entry/s': speed * batch_size,
@@ -289,6 +295,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                     {
                         "iteration": it,
                         "epoch": epoch,
+                        "rows": rows,
                         "model": accelerator.get_state_dict(model),
                         "optimizer": optimizer.state_dict(),
                     }, snapshot_filename)
