@@ -123,17 +123,15 @@ private:
         int left = 0, right = 0;
         for (int i = half + 1; i < length; i++)
         {
-            if (line[i] != WALL)
-                left++;
-            else
+            if (line[i] == WALL)
                 break;
+            left++;
         }
         for (int i = half - 1; i >= 0; i--)
         {
-            if (line[i] != WALL)
-                right++;
-            else
+            if (line[i] == WALL)
                 break;
+            right++;
         }
 
         uint32_t code = get_boarder_encoding(left, right);
@@ -156,17 +154,17 @@ private:
     }
 
     /// Get an empty line encoding with the given boarder distance.
-    /// @param left The distance to the left boarder, in range [1, length/2].
-    /// @param right The distance to the right boarder, in range [1, length/2].
+    /// @param left The distance to the left boarder, in range [0, length/2].
+    /// @param right The distance to the right boarder, in range [0, length/2].
     uint32_t get_boarder_encoding(int left, int right) const
     {
         const int half = length / 2;
-        assert(1 <= left && left <= half);
-        assert(1 <= right && right <= half);
+        assert(0 <= left && left <= half);
+        assert(0 <= right && right <= half);
 
         if (left == half && right == left)
             return 0;
-        else if (left < half)
+        else if (right == half) // (left < half)
         {
             uint32_t code = 2 * Pow3[length];
             int left_dist = half - left;
@@ -174,22 +172,23 @@ private:
                 code += 1 * Pow3[length - i];
             return code;
         }
-        else // (right < half)
+        else // (right < half && left <= half)
         {
             uint32_t code = 1 * Pow3[length];
             int left_dist = half - left;
             int right_dist = half - right;
-            int min_dist = std::min(left_dist, right_dist);
+            int right_twos = std::min(left_dist, right_dist);
+            int left_twos = std::min(left_dist, right_dist - 1);
 
-            for (int i = 0; i < min_dist; i++)
+            for (int i = 0; i < right_twos; i++)
                 code += 2 * Pow3[i];
-            for (int i = 1; i < right_dist; i++)
-                code += 2 * Pow3[length - i];
+            for (int i = 0; i < left_twos; i++)
+                code += 2 * Pow3[length - 1 - i];
 
-            for (int i = min_dist; i < right_dist - 1; i++)
+            for (int i = right_twos; i < right_dist - 1; i++)
                 code += 1 * Pow3[i];
-            for (int i = right_dist; i < left_dist; i++)
-                code += 1 * Pow3[length - i];
+            for (int i = left_twos; i < left_dist - 1; i++)
+                code += 1 * Pow3[length - 1 - i];
 
             return code;
         }

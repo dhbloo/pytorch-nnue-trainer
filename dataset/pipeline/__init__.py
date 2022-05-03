@@ -43,9 +43,10 @@ class DatasetPipelineWrapper(Dataset):
 
 
 class IterativePipelineWarpper(IterableDataset):
-    def __init__(self, dataset) -> None:
+    def __init__(self, dataset, pipelines) -> None:
         super().__init__()
         self.dataset = dataset
+        self.pipelines = pipelines
 
     @property
     def is_fixed_side_input(self):
@@ -79,9 +80,9 @@ def build_data_pipeline(pipeline_args) -> List[BasePipeline]:
 
 
 def warp_dataset_with_pipeline(dataset, pipeline_args):
-    if isinstance(dataset, Dataset):
-        return DatasetPipelineWrapper(dataset, build_data_pipeline(pipeline_args))
-    elif isinstance(dataset, IterableDataset):
+    if isinstance(dataset, IterableDataset):
         return IterativePipelineWarpper(dataset, build_data_pipeline(pipeline_args))
+    elif isinstance(dataset, Dataset):
+        return DatasetPipelineWrapper(dataset, build_data_pipeline(pipeline_args))
     else:
         assert 0, "Unsupported dataset type"

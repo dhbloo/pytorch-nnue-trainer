@@ -75,8 +75,8 @@ class LineNNUEv1(nn.Module):
         self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
 
     def forward(self, data):
-        _, dim_policy, _ = self.model_size
-        assert data['line_encoding_total_num'] == self.line_encoding_total_num
+        dim_policy, _ = self.model_size
+        assert torch.all(data['line_encoding_total_num'] == self.line_encoding_total_num)
 
         feature_index = data['line_encoding']  # [B, 4, H, W]
         feature = self.mapping(feature_index)  # [B, 4, H, W, PC+VC]
