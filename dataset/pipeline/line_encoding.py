@@ -1,11 +1,12 @@
 import numpy as np
-from line_encoding_cpp import transform_board_to_line_encoding, get_total_num_encoding
 from . import BasePipeline, PIPELINES
 
 
 @PIPELINES.register('line_encoding')
 class LineEncodingPipeline(BasePipeline):
     def __init__(self, line_length=11) -> None:
+        from line_encoding_cpp import get_total_num_encoding
+        
         super().__init__()
         assert line_length % 2 == 1, 'Length must be a odd number'
         assert line_length < 20, 'Max supported line length is 19'
@@ -13,6 +14,8 @@ class LineEncodingPipeline(BasePipeline):
         self.line_encoding_total_num = get_total_num_encoding(self.line_length)
 
     def process(self, data):
+        from line_encoding_cpp import transform_board_to_line_encoding
+
         board_input = data['board_input']  # [2, H, W]
         _, H, W = board_input.shape
 
