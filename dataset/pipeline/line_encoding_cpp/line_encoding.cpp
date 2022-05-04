@@ -43,6 +43,12 @@ public:
         return length;
     }
 
+    /// Get the total number of keys.
+    size_t total_num_key() const
+    {
+        return encodings.size();
+    }
+
     /// The maximum possible encoding that might occur.
     uint32_t max_encoding() const
     {
@@ -232,7 +238,8 @@ int get_total_num_encoding(int line_length)
 void transform_board_to_line_encoding(
     py::array_t<int8_t, py::array::c_style | py::array::forcecast> board_input,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encoding_output,
-    int line_length)
+    int line_length,
+    bool raw_code = false)
 {
     constexpr int MAX_BOARD_SIZE = 32;
 
@@ -247,6 +254,8 @@ void transform_board_to_line_encoding(
         throw std::invalid_argument("line_encoding shape incorrect, must be [4,H,W]");
     if (H > MAX_BOARD_SIZE || W > MAX_BOARD_SIZE)
         throw std::invalid_argument("board size must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
+    if (raw_code && line_length > 15)
+        throw std::invalid_argument("the maximum line length for raw code is 15");
 
     const auto &encoding_table = get_line_encoding_table(line_length);
 
@@ -282,16 +291,33 @@ void transform_board_to_line_encoding(
             uint64_t key2 = right_shift(bit_key2[x + y], 2 * (x - half));
             uint64_t key3 = right_shift(bit_key3[MAX_BOARD_SIZE - 1 - x + y], 2 * (x - half));
 
-            line_encoding(0, y, x) = encoding_table[key0];
-            line_encoding(1, y, x) = encoding_table[key1];
-            line_encoding(2, y, x) = encoding_table[key2];
-            line_encoding(3, y, x) = encoding_table[key3];
+            if (raw_code)
+            {
+                uint64_t mask = encoding_table.total_num_key() - 1;
+                line_encoding(0, y, x) = uint32_t(key0 & mask);
+                line_encoding(1, y, x) = uint32_t(key1 & mask);
+                line_encoding(2, y, x) = uint32_t(key2 & mask);
+                line_encoding(3, y, x) = uint32_t(key3 & mask);
+            }
+            else
+            {
+                line_encoding(0, y, x) = encoding_table[key0];
+                line_encoding(1, y, x) = encoding_table[key1];
+                line_encoding(2, y, x) = encoding_table[key2];
+                line_encoding(3, y, x) = encoding_table[key3];
+            }
         }
 }
+
+using namespace py::literals;
 
 PYBIND11_MODULE(line_encoding_cpp, m)
 {
     m.doc() = "Transform board input to line encoding";
-    m.def("get_total_num_encoding", &get_total_num_encoding);
-    m.def("transform_board_to_line_encoding", &transform_board_to_line_encoding);
+    m.def("get_total_num_encoding", &get_total_num_encoding, "line_length"_a);
+    m.def("transform_board_to_line_encoding", &transform_board_to_line_encoding,
+          "board_input"_a,
+          "line_encoding_output"_a,
+          "line_length"_a,
+          "raw_code"_a = false);
 }
