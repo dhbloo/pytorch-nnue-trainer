@@ -49,7 +49,9 @@ class LineNNUEv1(nn.Module):
         self.line_encoding_total_num = get_total_num_line_encoding(line_length)
         dim_embed = dim_policy + dim_value
 
-        self.mapping = nn.Embedding(self.line_encoding_total_num, dim_embed)
+        self.mapping = nn.Embedding(self.line_encoding_total_num,
+                                    dim_embed,
+                                    scale_grad_by_freq=True)
         self.mapping_activation = ChannelWiseLeakyReLU(dim_embed, bound=6)
 
         # policy nets
