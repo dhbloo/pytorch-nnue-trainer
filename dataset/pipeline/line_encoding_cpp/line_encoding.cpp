@@ -232,9 +232,31 @@ int get_total_num_encoding(int line_length)
     return LineEncodingTable::max_encoding(line_length) + 1;
 }
 
+/// Get the usage flags of each line encoding
+/// @param usage_flags_output usage flags output numpy array, must be initialized to zero.
+void get_encoding_usage_flag(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> usage_flags_output,
+    int line_length)
+{
+    auto usage_flags = usage_flags_output.mutable_unchecked<1>();
+    const auto &encoding_table = get_line_encoding_table(line_length);
+    if (encoding_table.total_num_encoding() != usage_flags.shape(0))
+        throw std::invalid_argument("invalid usage_flags shape");
+
+    const int half = line_length / 2;
+    for (size_t key = 0; key < encoding_table.total_num_key(); key++)
+    {
+        uint64_t center_cell_bits = (key >> (2 * half)) & 0b11;
+        if (center_cell_bits != 0b00)
+            usage_flags[encoding_table[key]] = 1;
+    }
+}
+
 /// Transform a board input numpy array to 4 direction line encoding output numpy array
 /// @param board_input Board numpy array of shape [2, H, W].
 /// @param line_encoding_output Line encoding numpy array of shape [4, H, W].
+/// @param line_length The length of line to encode.
+/// @param raw_code Whether to output raw bit code instead of line encoding.
 void transform_board_to_line_encoding(
     py::array_t<int8_t, py::array::c_style | py::array::forcecast> board_input,
     py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encoding_output,
@@ -315,6 +337,9 @@ PYBIND11_MODULE(line_encoding_cpp, m)
 {
     m.doc() = "Transform board input to line encoding";
     m.def("get_total_num_encoding", &get_total_num_encoding, "line_length"_a);
+    m.def("get_encoding_usage_flag", &get_encoding_usage_flag,
+          "usage_flags_output"_a,
+          "line_length"_a);
     m.def("transform_board_to_line_encoding", &transform_board_to_line_encoding,
           "board_input"_a,
           "line_encoding_output"_a,

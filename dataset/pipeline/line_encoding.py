@@ -35,3 +35,14 @@ class LineEncodingPipeline(BasePipeline):
         data['line_encoding'] = line_encoding
         data['line_encoding_total_num'] = self.line_encoding_total_num
         return data
+
+
+def get_encoding_usage_flags(line_length):
+    """Get encoding usage flags of a encoding map."""
+    from line_encoding_cpp import get_total_num_encoding, get_encoding_usage_flag
+
+    total_num_encoding = get_total_num_encoding(line_length)
+    usage_flags = np.zeros(total_num_encoding, dtype=np.int8)
+    get_encoding_usage_flag(usage_flags, line_length)
+
+    return usage_flags
