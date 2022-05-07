@@ -240,7 +240,7 @@ void get_encoding_usage_flag(
 {
     auto usage_flags = usage_flags_output.mutable_unchecked<1>();
     const auto &encoding_table = get_line_encoding_table(line_length);
-    if (encoding_table.total_num_encoding() != usage_flags.shape(0))
+    if (encoding_table.total_num_encoding() != (size_t)usage_flags.shape(0))
         throw std::invalid_argument("invalid usage_flags shape");
 
     const int half = line_length / 2;
