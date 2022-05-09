@@ -4,7 +4,7 @@ from . import BasePipeline, PIPELINES
 
 @PIPELINES.register('forbidden_point')
 class ForbiddenPointPipeline(BasePipeline):
-    def __init__(self, fixed_side_input=False) -> None:
+    def __init__(self, fixed_side_input) -> None:
         super().__init__()
         self.fixed_side_input = fixed_side_input
 

@@ -13,8 +13,10 @@ def visualize_entry(fixed_side_input,
                     policy_target=None,
                     value_target=None,
                     last_move=None,
+                    forbidden_point=None,
                     **kwargs):
     H, W = board_size[0]
+    markersize = 300 / max(H, W)
 
     if not fixed_side_input and stm_input == 1:
         board_input = torch.flip(board_input, dims=(1, ))
@@ -39,8 +41,6 @@ def visualize_entry(fixed_side_input,
     ax.set_xlim(-1, W)
     ax.set_ylim(-1, H)
 
-    markersize = 300 / max(H, W)
-
     # draw stones and policy
     for y in range(H):
         for x in range(W):
@@ -63,8 +63,21 @@ def visualize_entry(fixed_side_input,
                     markeredgecolor=(0, 0, 0),
                     markeredgewidth=edgewidth)
 
+    # highlight last move if exists
     if last_move is not None:
         ax.plot(*last_move, '+', markersize=markersize / 2, markeredgecolor='g', markeredgewidth=2)
+
+    # plot forbidden points if exists
+    if forbidden_point is not None:
+        for y in range(H):
+            for x in range(W):
+                if forbidden_point[0, y, x] != 0:
+                    ax.plot(x,
+                            y,
+                            'x',
+                            markersize=markersize / 2,
+                            markeredgecolor='r',
+                            markeredgewidth=3)
 
     texts = []
     if stm_input is not None:

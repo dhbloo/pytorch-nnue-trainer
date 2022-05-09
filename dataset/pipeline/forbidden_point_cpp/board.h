@@ -53,7 +53,7 @@ public:
 
     bool isValid(Pos pos) const { return pos < MaxBoardCellCount; }
     bool isEmpty(Pos pos) const { return get(pos) == EMPTY; }
-    bool get(Pos pos) const
+    Color get(Pos pos) const
     {
         assert(isValid(pos));
         return board[pos];

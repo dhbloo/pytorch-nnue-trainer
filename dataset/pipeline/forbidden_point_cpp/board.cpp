@@ -10,7 +10,7 @@ Board::Board(int width, int height) : boardWidth(width), boardHeight(height)
 {
     for (Pos pos = 0; pos < MaxBoardCellCount; pos++)
     {
-        int x = CoordX(x), y = CoordY(y);
+        int x = CoordX(pos), y = CoordY(pos);
         board[pos] = x >= 0 && x < boardWidth && y >= 0 && y < boardHeight ? EMPTY : WALL;
     }
 }
