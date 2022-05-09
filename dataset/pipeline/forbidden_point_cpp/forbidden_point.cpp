@@ -41,7 +41,7 @@ void transform_board_to_forbidden_point(
 
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
-            forbidden_point(y, x) = fp_board.isForbidden(MakePos(x, y));
+            forbidden_point(y, x) = fp_board.isForbidden(MakePos(x, y)) != FORBIDDEN_NONE;
 }
 
 using namespace py::literals;
