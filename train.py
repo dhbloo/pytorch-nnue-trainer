@@ -33,6 +33,10 @@ def parse_args_and_init():
                type=yaml.safe_load,
                default={},
                help="Extra dataloader arguments")
+    parser.add('--data_pipelines',
+               type=yaml.safe_load,
+               default=None,
+               help="Data-pipeline type and arguments")
     parser.add('--num_worker',
                type=int,
                default=min(8, os.cpu_count()),
@@ -48,6 +52,7 @@ def parse_args_and_init():
                help="Extra LR scheduler arguments")
     parser.add('--init_type', default='kaiming', help='Initialization type')
     parser.add('--loss_type', default='CE+CE', help='Loss type')
+    parser.add('--loss_args', type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add('--iterations', type=int, default=1000000, help="Num iterations")
     parser.add('--batch_size', type=int, default=128, help="Batch size")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
@@ -77,7 +82,7 @@ def parse_args_and_init():
     return args
 
 
-def calc_loss(loss_type, data, value, policy):
+def calc_loss(loss_type, data, value, policy, ignore_forbidden_point_policy=False):
     value_loss_type, policy_loss_type = loss_type.split('+')
     value_target = data['value_target']
     policy_target = data['policy_target']
@@ -111,10 +116,25 @@ def calc_loss(loss_type, data, value, policy):
         assert 0, f"Unsupported value loss: {value_loss_type}"
 
     # policy loss
+
+    # check if there is loss weight for policy at each empty cells
+    if ignore_forbidden_point_policy:
+        forbidden_point = torch.flatten(data['forbidden_point'], start_dim=1)  # [B, H*W]
+        policy_loss_weight = 1.0 - forbidden_point.float()  # [B, H*W]
+    else:
+        policy_loss_weight = None
+
     if policy_loss_type == 'CE':
-        policy_loss = cross_entropy_with_softlabel(policy, policy_target, adjust=True)
+        policy_loss = cross_entropy_with_softlabel(policy,
+                                                   policy_target,
+                                                   adjust=True,
+                                                   weight=policy_loss_weight)
     elif policy_loss_type == 'MSE':
-        policy_loss = F.mse_loss(torch.softmax(policy, dim=1), policy_target)
+        policy = torch.softmax(policy, dim=1)
+        policy_loss = F.mse_loss(policy, policy_target, size_average='none')
+        if policy_loss_weight is not None:
+            policy_loss = policy_loss * policy_loss_weight
+        policy_loss = torch.mean(policy_loss)
     else:
         assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
@@ -127,11 +147,11 @@ def calc_loss(loss_type, data, value, policy):
 
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  dataloader_args, model_type, model_args, optim_type, optim_args,
-                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, iterations,
-                  batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
-                  log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
-                  **kwargs):
+                  dataloader_args, data_pipelines, model_type, model_args, optim_type, optim_args,
+                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args,
+                  iterations, batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm,
+                  no_shuffle, log_interval, show_interval, save_interval, val_interval,
+                  avg_loss_interval, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -143,6 +163,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     train_dataset = build_dataset(dataset_type,
                                   train_datas,
                                   shuffle=not no_shuffle,
+                                  pipeline_args=data_pipelines,
                                   **dataset_args)
     train_loader = build_data_loader(train_dataset,
                                      batch_size,
@@ -150,7 +171,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                                      shuffle=not no_shuffle,
                                      **dataloader_args)
     if val_datas:
-        val_dataset = build_dataset(dataset_type, val_datas, shuffle=False, **dataset_args)
+        val_dataset = build_dataset(dataset_type,
+                                    val_datas,
+                                    shuffle=False,
+                                    pipeline_args=data_pipelines,
+                                    **dataset_args)
         val_loader = build_data_loader(val_dataset,
                                        batch_size,
                                        num_workers=num_worker,
@@ -175,10 +200,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         model.load_state_dict(state_dicts['model'])
         optimizer.load_state_dict(state_dicts['optimizer'])
         accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
-        epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
+        it = state_dicts.get('iteration', 0)
+        epoch = state_dicts.get('epoch', 0)
+        rows = state_dicts.get('rows', 0)
     else:
         model.apply(weights_init(init_type))
-        epoch, it = 0, 0
+        it, epoch, rows = 0, 0, 0
         if load_from is not None:
             state_dicts = torch.load(load_from, map_location=accelerator.device)
             missing_keys, unexpected_keys = model.load_state_dict(state_dicts['model'],
@@ -210,6 +237,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         epoch += 1
         for data in train_loader:
             it += 1
+            rows += batch_size
             if it > iterations:
                 stop_training = True
                 break
@@ -217,7 +245,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             # model update
             optimizer.zero_grad()
             value, policy, *retvals = model(data)
-            loss, loss_dict = calc_loss(loss_type, data, value, policy)
+            loss, loss_dict = calc_loss(loss_type, data, value, policy, **loss_args)
             accelerator.backward(loss)
 
             # apply gradient clipping if needed
@@ -248,6 +276,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({
                         'it': it,
+                        'epoch': epoch,
+                        'rows': rows,
                         'train_loss': loss_dict,
                         'lr': lr_scheduler.get_last_lr()[0],
                     })
@@ -261,6 +291,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 log_value_dict(
                     tb_logger, 'running_stat', {
                         'epoch': epoch,
+                        'rows': rows,
                         'elasped_seconds': elasped,
                         'it/s': speed,
                         'entry/s': speed * batch_size,
@@ -280,6 +311,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                     {
                         "iteration": it,
                         "epoch": epoch,
+                        "rows": rows,
                         "model": accelerator.get_state_dict(model),
                         "optimizer": optimizer.state_dict(),
                     }, snapshot_filename)
@@ -293,7 +325,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 with torch.no_grad():
                     for val_data in val_loader:
                         value, policy, *retvals = model(val_data)
-                        _, val_losses = calc_loss(loss_type, val_data, value, policy)
+                        _, val_losses = calc_loss(loss_type, val_data, value, policy, **loss_args)
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
 

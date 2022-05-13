@@ -6,20 +6,6 @@ import configargparse
 import yaml
 
 
-def process_bin(index, result, ply, boardsize, rule, move, position):
-    print('-' * 50)
-    print(f'index: {index}')
-    print(f'result: {result}')
-    print(f'ply: {ply}')
-    print(f'boardsize: {boardsize}')
-    print(f'rule: {rule}')
-    print(f'move: {move}')
-    print(f'position: {"".join([str(m) for m in position])}')
-
-    # Add process logic here......
-    pass
-
-
 def visualize_entry(fixed_side_input,
                     board_size,
                     board_input,
@@ -27,8 +13,10 @@ def visualize_entry(fixed_side_input,
                     policy_target=None,
                     value_target=None,
                     last_move=None,
+                    forbidden_point=None,
                     **kwargs):
     H, W = board_size[0]
+    markersize = 300 / max(H, W)
 
     if not fixed_side_input and stm_input == 1:
         board_input = torch.flip(board_input, dims=(1, ))
@@ -53,8 +41,6 @@ def visualize_entry(fixed_side_input,
     ax.set_xlim(-1, W)
     ax.set_ylim(-1, H)
 
-    markersize = 300 / max(H, W)
-
     # draw stones and policy
     for y in range(H):
         for x in range(W):
@@ -77,8 +63,21 @@ def visualize_entry(fixed_side_input,
                     markeredgecolor=(0, 0, 0),
                     markeredgewidth=edgewidth)
 
+    # highlight last move if exists
     if last_move is not None:
         ax.plot(*last_move, '+', markersize=markersize / 2, markeredgecolor='g', markeredgewidth=2)
+
+    # plot forbidden points if exists
+    if forbidden_point is not None:
+        for y in range(H):
+            for x in range(W):
+                if forbidden_point[0, y, x] != 0:
+                    ax.plot(x,
+                            y,
+                            'x',
+                            markersize=markersize / 2,
+                            markeredgecolor='r',
+                            markeredgewidth=3)
 
     texts = []
     if stm_input is not None:
@@ -101,7 +100,7 @@ def visualize_dataset(dataset):
         if 'position_string' in data:
             optional_texts += [f"pos={data['position_string'][0]}"]
         print(f"Data Entry[{index}]: bs={(bs[0].item(), bs[1].item())} {' '.join(optional_texts)}")
-        visualize_entry(dataset.fixed_side_input, **data)
+        visualize_entry(dataset.is_fixed_side_input, **data)
 
 
 if __name__ == "__main__":
@@ -110,11 +109,16 @@ if __name__ == "__main__":
     parser.add('data_paths', nargs='+', help="Dataset file or directory paths")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--data_pipelines',
+               type=yaml.safe_load,
+               default=None,
+               help="Data-pipeline type and arguments")
     parser.add('--shuffle', action='store_true', help="Shuffle dataset")
     args = parser.parse_args()
 
     dataset = build_dataset(args.dataset_type,
                             args.data_paths,
                             shuffle=args.shuffle,
+                            pipeline_args=args.data_pipelines,
                             **args.dataset_args)
     visualize_dataset(dataset)
