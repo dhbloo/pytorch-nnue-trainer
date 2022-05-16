@@ -75,6 +75,10 @@ def parse_args_and_init():
                help="Knowledge distillation extra model arguments")
     parser.add('--kd_checkpoint', help="Knowledge distillation model checkpoint")
     parser.add('--kd_T', type=float, default=1.0, help="Knowledge distillation temperature")
+    parser.add('--kd_alpha',
+               type=float,
+               default=1.0,
+               help="Distillation loss ratio in [0,1] (1 for distillation loss only)")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -94,6 +98,7 @@ def calc_loss(loss_type,
               results,
               kd_results=None,
               kd_T=None,
+              kd_alpha=None,
               ignore_forbidden_point_policy=False):
     value_loss_type, policy_loss_type = loss_type.split('+')
 
@@ -116,6 +121,10 @@ def calc_loss(loss_type,
         # apply softmax to value and policy target according to temparature
         value_target = torch.softmax(value_target / kd_T, dim=1)
         policy_target = torch.softmax(policy_target / kd_T, dim=1)
+
+        # scale prediction value and policy according to temparature
+        value = value / kd_T
+        policy = policy / kd_T
 
     # convert value_target if value has no draw info
     if value.size(1) == 1:
@@ -173,15 +182,15 @@ def calc_loss(loss_type,
 
     if kd_results is not None:
         # also get a true loss from real data
-        with torch.no_grad():
-            _, real_loss_dict = calc_loss(
-                loss_type,
-                data,
-                results,
-                ignore_forbidden_point_policy=ignore_forbidden_point_policy,
-            )
+        real_loss, real_loss_dict = calc_loss(
+            loss_type,
+            data,
+            results,
+            ignore_forbidden_point_policy=ignore_forbidden_point_policy,
+        )
 
         # merge real loss and knowledge distillation loss
+        total_loss = kd_alpha * total_loss + (1 - kd_alpha) * real_loss
         kd_loss_dict = {'kd_' + k: v for k, v in loss_dict.items()}
         loss_dict = real_loss_dict
         loss_dict.update(kd_loss_dict)
@@ -194,7 +203,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args,
                   iterations, batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm,
                   no_shuffle, log_interval, show_interval, save_interval, val_interval,
-                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, **kwargs):
+                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha,
+                  **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -270,13 +280,15 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         kd_state_dicts = torch.load(kd_checkpoint, map_location=accelerator.device)
         kd_model.load_state_dict(kd_state_dicts['model'])
         accelerator.print(f'Loaded teacher model {kd_model.name} from: {kd_checkpoint}')
-        
+
         kd_model = accelerator.prepare_model(kd_model)
         kd_model.eval()
 
         # add kd_T into loss_args dict
         assert kd_T is not None, f"kd_T must be set when knowledge distillation is enabled"
+        assert kd_alpha is not None and (0 <= kd_alpha <= 1), f"kd_alpha must be in [0,1]"
         loss_args['kd_T'] = kd_T
+        loss_args['kd_alpha'] = kd_alpha
     else:
         kd_model = None
 
@@ -387,6 +399,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
                 with torch.no_grad():
                     for val_data in val_loader:
+                        # evaulate teacher model for knowledge distillation
+                        kd_results = kd_model(val_data) if kd_model is not None else None
+                        # model evaluation
                         results = model(val_data)
                         _, val_losses = calc_loss(loss_type, val_data, results, kd_results,
                                                   **loss_args)
