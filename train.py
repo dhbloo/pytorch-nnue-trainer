@@ -68,6 +68,13 @@ def parse_args_and_init():
                type=int,
                default=2500,
                help="Num iterations to average loss")
+    parser.add('--kd_model_type', help="Knowledge distillation model type")
+    parser.add('--kd_model_args',
+               type=yaml.safe_load,
+               default={},
+               help="Knowledge distillation extra model arguments")
+    parser.add('--kd_checkpoint', help="Knowledge distillation model checkpoint")
+    parser.add('--kd_T', type=float, default=1.0, help="Knowledge distillation temperature")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -82,14 +89,33 @@ def parse_args_and_init():
     return args
 
 
-def calc_loss(loss_type, data, value, policy, ignore_forbidden_point_policy=False):
+def calc_loss(loss_type,
+              data,
+              results,
+              kd_results=None,
+              kd_T=None,
+              ignore_forbidden_point_policy=False):
     value_loss_type, policy_loss_type = loss_type.split('+')
-    value_target = data['value_target']
-    policy_target = data['policy_target']
+
+    # get predicted value and policy from model results
+    value, policy, *retvals = results
+
+    if kd_results is not None:
+        # get value and policy target from teacher model
+        value_target, policy_target, *kd_retvals = kd_results
+    else:
+        # get value and poliay target from data
+        value_target = data['value_target']
+        policy_target = data['policy_target']
 
     # reshape policy
     policy_target = torch.flatten(policy_target, start_dim=1)
     policy = torch.flatten(policy, start_dim=1)
+
+    if kd_results is not None:
+        # apply softmax to value and policy target according to temparature
+        value_target = torch.softmax(value_target / kd_T, dim=1)
+        policy_target = torch.softmax(policy_target / kd_T, dim=1)
 
     # convert value_target if value has no draw info
     if value.size(1) == 1:
@@ -139,11 +165,28 @@ def calc_loss(loss_type, data, value, policy, ignore_forbidden_point_policy=Fals
         assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
     total_loss = value_loss + policy_loss
-    return total_loss, {
+    loss_dict = {
         'total_loss': total_loss.detach(),
         'value_loss': value_loss.detach(),
         'policy_loss': policy_loss.detach(),
     }
+
+    if kd_results is not None:
+        # also get a true loss from real data
+        with torch.no_grad():
+            _, real_loss_dict = calc_loss(
+                loss_type,
+                data,
+                results,
+                ignore_forbidden_point_policy=ignore_forbidden_point_policy,
+            )
+
+        # merge real loss and knowledge distillation loss
+        kd_loss_dict = {'kd_' + k: v for k, v in loss_dict.items()}
+        loss_dict = real_loss_dict
+        loss_dict.update(kd_loss_dict)
+
+    return total_loss, loss_dict
 
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
@@ -151,7 +194,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args,
                   iterations, batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm,
                   no_shuffle, log_interval, show_interval, save_interval, val_interval,
-                  avg_loss_interval, **kwargs):
+                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -221,6 +264,22 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     if val_loader is not None:
         val_loader = accelerator.prepare_data_loader(val_loader)
 
+    # build teacher model if knowledge distillation model is on
+    if kd_model_type is not None:
+        kd_model = build_model(kd_model_type, **kd_model_args)
+        kd_state_dicts = torch.load(kd_checkpoint, map_location=accelerator.device)
+        kd_model.load_state_dict(kd_state_dicts['model'])
+        accelerator.print(f'Loaded teacher model {kd_model.name} from: {kd_checkpoint}')
+        
+        kd_model = accelerator.prepare_model(kd_model)
+        kd_model.eval()
+
+        # add kd_T into loss_args dict
+        assert kd_T is not None, f"kd_T must be set when knowledge distillation is enabled"
+        loss_args['kd_T'] = kd_T
+    else:
+        kd_model = None
+
     # build lr scheduler
     lr_scheduler = build_lr_scheduler(optimizer,
                                       lr_scheduler_type,
@@ -242,10 +301,14 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 stop_training = True
                 break
 
+            # evaulate teacher model for knowledge distillation
+            with torch.no_grad():
+                kd_results = kd_model(data) if kd_model is not None else None
+
             # model update
             optimizer.zero_grad()
-            value, policy, *retvals = model(data)
-            loss, loss_dict = calc_loss(loss_type, data, value, policy, **loss_args)
+            results = model(data)
+            loss, loss_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
             accelerator.backward(loss)
 
             # apply gradient clipping if needed
@@ -324,8 +387,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
                 with torch.no_grad():
                     for val_data in val_loader:
-                        value, policy, *retvals = model(val_data)
-                        _, val_losses = calc_loss(loss_type, val_data, value, policy, **loss_args)
+                        results = model(val_data)
+                        _, val_losses = calc_loss(loss_type, val_data, results, kd_results,
+                                                  **loss_args)
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
 
