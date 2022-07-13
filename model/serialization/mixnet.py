@@ -5,7 +5,7 @@ from zlib import crc32
 from math import ceil
 from utils.misc_utils import ascii_hist
 from . import BaseSerializer, SERIALIZERS
-from ..mix6 import Mix6Net, Mix6Netv2
+from ..mixnet import Mix6Net, Mix6QNet
 
 
 def generate_base3_permutation(length):
@@ -387,10 +387,10 @@ class Mix6NetSerializer(BaseSerializer):
             o.write(np.zeros(5, dtype='<f4').tobytes())  # padding: (5,)
 
 
-@SERIALIZERS.register('mix6v2')
-class Mix6Netv2Serializer(BaseSerializer):
+@SERIALIZERS.register('mix6q')
+class Mix6NetQSerializer(BaseSerializer):
     """
-    Mix6Netv2 binary serializer.
+    Mix6QNet binary serializer.
 
     The corresponding C-language struct layout: 
     struct Mix6Weight {
@@ -432,10 +432,10 @@ class Mix6Netv2Serializer(BaseSerializer):
     def is_binary(self) -> bool:
         return not self.text_output
 
-    def arch_hash(self, model: Mix6Netv2) -> int:
+    def arch_hash(self, model: Mix6QNet) -> int:
         assert model.input_type == 'basic' or model.input_type == 'basic-nostm'
         _, dim_policy, dim_value = model.model_size
-        hash = crc32(b'mix6netv2')
+        hash = crc32(b'Mix6QNet')
         hash ^= crc32(b'basic')
         hash ^= (dim_policy << 16) | dim_value
         hash ^= hash << 7
@@ -443,7 +443,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         hash ^= model.scale_weight
         return hash
 
-    def _export_map_table(self, model: Mix6Netv2, device, line, stm=None):
+    def _export_map_table(self, model: Mix6QNet, device, line, stm=None):
         """
         Export line -> feature mapping table.
 
@@ -477,7 +477,7 @@ class Mix6Netv2Serializer(BaseSerializer):
         map_table = np.concatenate(map_table, axis=1)  # [C=PC+VC, N, L]
         return map_table
 
-    def _export_feature_map(self, model: Mix6Netv2, device, stm=None):
+    def _export_feature_map(self, model: Mix6QNet, device, stm=None):
         L = self.line_length
         _, PC, VC = model.model_size
         lines = generate_base3_permutation(L)  # [177147, 11]
@@ -518,7 +518,7 @@ class Mix6Netv2Serializer(BaseSerializer):
 
         return feature_map_quant, usage_flags
 
-    def _export_mapping_activation(self, model: Mix6Netv2):
+    def _export_mapping_activation(self, model: Mix6QNet):
         weight = model.mapping_activation.weight.cpu().numpy()
         weight_quant = weight * 64
 
@@ -530,7 +530,7 @@ class Mix6Netv2Serializer(BaseSerializer):
 
         return weight_quant
 
-    def _export_policy(self, model: Mix6Netv2):
+    def _export_policy(self, model: Mix6QNet):
         # policy layer 1: policy dw conv
         dw_conv_weight = model.policy_dw_conv.conv.weight.cpu().numpy()
         dw_conv_bias = model.policy_dw_conv.conv.bias.cpu().numpy()
@@ -567,7 +567,7 @@ class Mix6Netv2Serializer(BaseSerializer):
 
         return dw_conv_weight_quant, dw_conv_bias_quant, pw_conv_weight_quant, policy_scale
 
-    def _export_value(self, model: Mix6Netv2):
+    def _export_value(self, model: Mix6QNet):
         # value layer 0: activation after mean
 
         # value layer 1: linear mlp 01

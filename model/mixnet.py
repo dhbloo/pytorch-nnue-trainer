@@ -192,8 +192,8 @@ class Mix6Net(nn.Module):
                                                          if self.map_max != 0 else "")
 
 
-@MODELS.register('mix6v2')
-class Mix6Netv2(nn.Module):
+@MODELS.register('mix6q')
+class Mix6QNet(nn.Module):
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -311,4 +311,75 @@ class Mix6Netv2(nn.Module):
     @property
     def name(self):
         m, p, v = self.model_size
-        return f"mix6v2_{self.input_type}_{m}m{p}p{v}v"
+        return f"mix6q_{self.input_type}_{m}m{p}p{v}v"
+
+
+@MODELS.register('mix7')
+class Mix7Net(nn.Module):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_policy=32,
+                 dim_value=32,
+                 map_max=30,
+                 input_type='basic-nostm'):
+        super().__init__()
+        self.model_size = (dim_middle, dim_policy, dim_value)
+        self.map_max = map_max
+        self.input_type = input_type
+        dim_out = dim_policy + dim_value
+
+        self.input_plane = build_input_plane(input_type)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
+        self.mapping_activation = nn.PReLU(dim_out)
+
+        # feature depth-wise conv
+        self.feature_dwconv = Conv2dBlock(dim_out, dim_out, ks=3, st=1, padding=1, groups=dim_out)
+
+        # policy head (point-wise conv)
+        self.policy_pwconv = Conv2dBlock(dim_policy,
+                                         1,
+                                         ks=1,
+                                         st=1,
+                                         padding=0,
+                                         activation='none',
+                                         bias=False)
+        self.policy_activation = nn.PReLU(1)
+
+        # value head
+        self.value_activation = nn.PReLU(dim_value)
+        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
+                                          LinearBlock(dim_value, dim_value),
+                                          LinearBlock(dim_value, 3, activation='none'))
+
+    def forward(self, data):
+        _, dim_policy, _ = self.model_size
+
+        input_plane = self.input_plane(data)
+        feature = self.mapping(input_plane)
+        # resize feature to range [-map_max, map_max]
+        if self.map_max != 0:
+            feature = self.map_max * torch.tanh(feature / self.map_max)
+        # average feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, PC+VC, H, W]
+        feature = self.mapping_activation(feature)
+
+        # feature conv
+        feature = self.feature_dwconv(feature)  # [B, PC+VC, H, W]
+
+        # policy head
+        policy = feature[:, :dim_policy]
+        policy = self.policy_pwconv(policy)
+        policy = self.policy_activation(policy)
+
+        # value head
+        value = torch.mean(feature[:, dim_policy:], dim=(2, 3))
+        value = self.value_activation(value)
+        value = self.value_linear(value)
+
+        return value, policy
+
+    @property
+    def name(self):
+        m, p, v = self.model_size
+        return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
+                                                         if self.map_max != 0 else "")

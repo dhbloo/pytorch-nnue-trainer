@@ -31,7 +31,7 @@ accelerate config
 All configs about training can be directly specified from command line, for example:
 
 ```bash
-accelerate launch train.py -r runs/01 --dataset_type katago_numpy --model_type mix6v2 --model_args "{dim_middle: 128, dim_policy: 32, dim_value: 32, input_type: basic}" -d ./data --batch_size 256 --iterations 1000000
+accelerate launch train.py -r runs/01 --dataset_type katago_numpy --model_type mix6 --model_args "{dim_middle: 128, dim_policy: 32, dim_value: 32, input_type: basic}" -d ./data --batch_size 256 --iterations 1000000
 ```
 
 Config can also be specified in a yaml file, which can be passed into command line:
