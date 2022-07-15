@@ -321,12 +321,14 @@ class Mix7Net(nn.Module):
                  dim_policy=32,
                  dim_value=32,
                  map_max=30,
-                 input_type='basic-nostm'):
+                 input_type='basic-nostm',
+                 reuse_feature=False):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
         self.input_type = input_type
-        dim_out = dim_policy + dim_value
+        self.reuse_feature = reuse_feature
+        dim_out = max(dim_policy, dim_value) if reuse_feature else dim_policy + dim_value
 
         self.input_plane = build_input_plane(input_type)
         self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
@@ -352,7 +354,7 @@ class Mix7Net(nn.Module):
                                           LinearBlock(dim_value, 3, activation='none'))
 
     def forward(self, data):
-        _, dim_policy, _ = self.model_size
+        _, dim_policy, dim_value = self.model_size
 
         input_plane = self.input_plane(data)
         feature = self.mapping(input_plane)
@@ -372,7 +374,8 @@ class Mix7Net(nn.Module):
         policy = self.policy_activation(policy)
 
         # value head
-        value = torch.mean(feature[:, dim_policy:], dim=(2, 3))
+        value = feature[:, :dim_value] if self.reuse_feature else feature[:, dim_policy:]
+        value = torch.mean(value, dim=(2, 3))
         value = self.value_activation(value)
         value = self.value_linear(value)
 
