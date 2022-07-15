@@ -22,6 +22,15 @@ def show_values(f, name, num_values, num_per_line):
     print()
 
 
+def show_policy(f, name, num_values, num_per_line):
+    print(name.center(80, '-'))
+    for i in range(num_values):
+        pb, = struct.unpack('<h', f.read(2))
+        pw, = struct.unpack('<h', f.read(2))
+        print(f'[{pb:4},{pw:4}]   ', end='\n' if (i + 1) % num_per_line == 0 else '')
+    print()
+
+
 def show_model():
     parser = argparse.ArgumentParser(description="Show model values")
     parser.add_argument('model', type=str, help="Model path")
@@ -40,7 +49,13 @@ def show_model():
 
         show_values(f, 'threat freestyle', THREAT_NB, 16)
         show_values(f, 'threat standard', THREAT_NB, 16)
-        show_values(f, 'threat renju', THREAT_NB, 16)
+        show_values(f, 'threat renju black', THREAT_NB, 16)
+        show_values(f, 'threat renju white', THREAT_NB, 16)
+
+        show_policy(f, 'policy score freestyle', PCODE_NB, N // 2)
+        show_policy(f, 'policy score standard', PCODE_NB, N // 2)
+        show_policy(f, 'policy score renju black', PCODE_NB, N // 2)
+        show_policy(f, 'policy score renju white', PCODE_NB, N // 2)
 
 
 if __name__ == '__main__':
