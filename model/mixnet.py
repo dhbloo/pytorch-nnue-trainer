@@ -322,7 +322,8 @@ class Mix7Net(nn.Module):
                  dim_value=32,
                  map_max=30,
                  input_type='basic-nostm',
-                 reuse_feature=False):
+                 reuse_feature=False,
+                 dwconv_kernel_size=3):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
@@ -335,7 +336,12 @@ class Mix7Net(nn.Module):
         self.mapping_activation = nn.PReLU(dim_out)
 
         # feature depth-wise conv
-        self.feature_dwconv = Conv2dBlock(dim_out, dim_out, ks=3, st=1, padding=1, groups=dim_out)
+        self.feature_dwconv = Conv2dBlock(dim_out,
+                                          dim_out,
+                                          ks=dwconv_kernel_size,
+                                          st=1,
+                                          padding=dwconv_kernel_size // 2,
+                                          groups=dim_out)
 
         # policy head (point-wise conv)
         self.policy_pwconv = Conv2dBlock(dim_policy,
