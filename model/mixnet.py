@@ -119,6 +119,31 @@ class ChannelWiseLeakyReLU(nn.Module):
         return x
 
 
+class RotatedConv2d3x3(nn.Module):
+    def __init__(self, dim_in, dim_out) -> None:
+        super().__init__()
+        self.weight = Parameter(torch.empty((9, dim_out, dim_in)))
+        self.bias = Parameter(torch.zeros((dim_out, )))
+        nn.init.kaiming_normal_(self.weight)
+
+    def forward(self, x):
+        w = self.weight
+        _, dim_out, dim_in = w.shape
+        zero = torch.zeros((dim_out, dim_in), dtype=w.dtype, device=w.device)
+        weight7x7 = [
+            zero, zero, zero, zero, w[0], zero, zero, \
+            zero, zero, w[1], zero, zero, zero, zero, \
+            w[2], zero, zero, zero, zero, w[3], zero, \
+            zero, zero, zero, w[4], zero, zero, zero, \
+            zero, w[5], zero, zero, zero, zero, w[6], \
+            zero, zero, zero, zero, w[7], zero, zero, \
+            zero, zero, w[8], zero, zero, zero, zero,
+        ]
+        weight7x7 = torch.stack(weight7x7, dim=2)
+        weight7x7 = weight7x7.reshape(dim_out, dim_in, 7, 7)
+        return torch.conv2d(x, weight7x7, self.bias, padding=7 // 2)
+
+
 @MODELS.register('mix6')
 class Mix6Net(nn.Module):
     def __init__(self,
@@ -193,7 +218,7 @@ class Mix6Net(nn.Module):
 
 
 @MODELS.register('mix6q')
-class Mix6QNet(nn.Module):
+class Mix6QNet(nn.Module):  # Q -> quant
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -392,3 +417,4 @@ class Mix7Net(nn.Module):
         m, p, v = self.model_size
         return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
                                                          if self.map_max != 0 else "")
+
