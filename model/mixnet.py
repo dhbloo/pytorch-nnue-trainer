@@ -119,6 +119,31 @@ class ChannelWiseLeakyReLU(nn.Module):
         return x
 
 
+class RotatedConv2d3x3(nn.Module):
+    def __init__(self, dim_in, dim_out) -> None:
+        super().__init__()
+        self.weight = Parameter(torch.empty((9, dim_out, dim_in)))
+        self.bias = Parameter(torch.zeros((dim_out, )))
+        nn.init.kaiming_normal_(self.weight)
+
+    def forward(self, x):
+        w = self.weight
+        _, dim_out, dim_in = w.shape
+        zero = torch.zeros((dim_out, dim_in), dtype=w.dtype, device=w.device)
+        weight7x7 = [
+            zero, zero, zero, zero, w[0], zero, zero, \
+            zero, zero, w[1], zero, zero, zero, zero, \
+            w[2], zero, zero, zero, zero, w[3], zero, \
+            zero, zero, zero, w[4], zero, zero, zero, \
+            zero, w[5], zero, zero, zero, zero, w[6], \
+            zero, zero, zero, zero, w[7], zero, zero, \
+            zero, zero, w[8], zero, zero, zero, zero,
+        ]
+        weight7x7 = torch.stack(weight7x7, dim=2)
+        weight7x7 = weight7x7.reshape(dim_out, dim_in, 7, 7)
+        return torch.conv2d(x, weight7x7, self.bias, padding=7 // 2)
+
+
 @MODELS.register('mix6')
 class Mix6Net(nn.Module):
     def __init__(self,
@@ -193,7 +218,7 @@ class Mix6Net(nn.Module):
 
 
 @MODELS.register('mix6q')
-class Mix6QNet(nn.Module):
+class Mix6QNet(nn.Module):  # Q -> quant
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -392,3 +417,77 @@ class Mix7Net(nn.Module):
         m, p, v = self.model_size
         return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
                                                          if self.map_max != 0 else "")
+
+
+@MODELS.register('mix7r')
+class Mix7RNet(nn.Module):  # R -> rotated conv
+    def __init__(self,
+                 dim_middle=128,
+                 dim_policy=32,
+                 dim_value=32,
+                 map_max=30,
+                 input_type='basic-nostm',
+                 reuse_feature=True):
+        super().__init__()
+        self.model_size = (dim_middle, dim_policy, dim_value)
+        self.map_max = map_max
+        self.input_type = input_type
+        self.reuse_feature = reuse_feature
+        dim_out = max(dim_policy, dim_value) if reuse_feature else dim_policy + dim_value
+
+        self.input_plane = build_input_plane(input_type)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
+        self.mapping_activation = nn.PReLU(dim_out)
+
+        # feature depth-wise conv
+        self.feature_dwconv = RotatedConv2d3x3(dim_out, dim_out)
+
+        # policy head (point-wise conv)
+        self.policy_pwconv = Conv2dBlock(dim_policy,
+                                         1,
+                                         ks=1,
+                                         st=1,
+                                         padding=0,
+                                         activation='none',
+                                         bias=False)
+        self.policy_activation = nn.PReLU(1)
+
+        # value head
+        self.value_activation = nn.PReLU(dim_value)
+        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
+                                          LinearBlock(dim_value, dim_value),
+                                          LinearBlock(dim_value, 3, activation='none'))
+
+    def forward(self, data):
+        _, dim_policy, dim_value = self.model_size
+
+        input_plane = self.input_plane(data)
+        feature = self.mapping(input_plane)
+        # resize feature to range [-map_max, map_max]
+        if self.map_max != 0:
+            feature = self.map_max * torch.tanh(feature / self.map_max)
+        # average feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, PC+VC, H, W]
+        feature = self.mapping_activation(feature)
+
+        # feature conv
+        feature = self.feature_dwconv(feature)  # [B, PC+VC, H, W]
+
+        # policy head
+        policy = feature[:, :dim_policy]
+        policy = self.policy_pwconv(policy)
+        policy = self.policy_activation(policy)
+
+        # value head
+        value = feature[:, :dim_value] if self.reuse_feature else feature[:, dim_policy:]
+        value = torch.mean(value, dim=(2, 3))
+        value = self.value_activation(value)
+        value = self.value_linear(value)
+
+        return value, policy
+
+    @property
+    def name(self):
+        m, p, v = self.model_size
+        return f"mix7r_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
+                                                          if self.map_max != 0 else "")
