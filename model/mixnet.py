@@ -354,6 +354,7 @@ class Mix7Net(nn.Module):
         self.map_max = map_max
         self.input_type = input_type
         self.reuse_feature = reuse_feature
+        self.dwconv_kernel_size = dwconv_kernel_size
         dim_out = max(dim_policy, dim_value) if reuse_feature else dim_policy + dim_value
 
         self.input_plane = build_input_plane(input_type)
@@ -419,30 +420,39 @@ class Mix7Net(nn.Module):
                                                          if self.map_max != 0 else "")
 
 
-@MODELS.register('mix7r')
-class Mix7RNet(nn.Module):  # R -> rotated conv
+@MODELS.register('mix8')
+class Mix8Net(nn.Module):
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
                  dim_value=32,
                  map_max=30,
                  input_type='basic-nostm',
-                 reuse_feature=True):
+                 dwconv_kernel_size=3,
+                 dwconv_divisor=1):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
         self.input_type = input_type
-        self.reuse_feature = reuse_feature
-        dim_out = max(dim_policy, dim_value) if reuse_feature else dim_policy + dim_value
+        self.dwconv_kernel_size = dwconv_kernel_size
+        self.dwconv_divisor = dwconv_divisor
+        dim_out = max(dim_policy, dim_value)
+        dim_out_mapping = dim_out // dwconv_divisor
 
         self.input_plane = build_input_plane(input_type)
-        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
-        self.mapping_activation = nn.PReLU(dim_out)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out_mapping)
+        self.mapping_activation = nn.PReLU(dim_out_mapping)
 
         # feature depth-wise conv
-        self.feature_dwconv = RotatedConv2d3x3(dim_out, dim_out)
+        self.feature_dwconv = Conv2dBlock(dim_out_mapping,
+                                          dim_out,
+                                          ks=dwconv_kernel_size,
+                                          st=1,
+                                          padding=dwconv_kernel_size // 2,
+                                          groups=dim_out)
 
         # policy head (point-wise conv)
+        self.policy_activation = nn.PReLU(dim_policy)
         self.policy_pwconv = Conv2dBlock(dim_policy,
                                          1,
                                          ks=1,
@@ -450,11 +460,10 @@ class Mix7RNet(nn.Module):  # R -> rotated conv
                                          padding=0,
                                          activation='none',
                                          bias=False)
-        self.policy_activation = nn.PReLU(1)
 
         # value head
-        self.value_activation = nn.PReLU(dim_value)
-        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
+        self.value_activation = nn.PReLU(dim_value * 2)
+        self.value_linear = nn.Sequential(LinearBlock(dim_value * 2, dim_value),
                                           LinearBlock(dim_value, dim_value),
                                           LinearBlock(dim_value, 3, activation='none'))
 
@@ -471,16 +480,19 @@ class Mix7RNet(nn.Module):  # R -> rotated conv
         feature = self.mapping_activation(feature)
 
         # feature conv
-        feature = self.feature_dwconv(feature)  # [B, PC+VC, H, W]
+        feat_after_dwconv = self.feature_dwconv(feature)  # [B, PC+VC, H, W]
 
         # policy head
-        policy = feature[:, :dim_policy]
-        policy = self.policy_pwconv(policy)
+        policy = feat_after_dwconv[:, :dim_policy]
         policy = self.policy_activation(policy)
+        policy = self.policy_pwconv(policy)
 
         # value head
-        value = feature[:, :dim_value] if self.reuse_feature else feature[:, dim_policy:]
-        value = torch.mean(value, dim=(2, 3))
+        value = feat_after_dwconv[:, :dim_value]
+        value_mean = torch.mean(value, dim=(2, 3))  # [B, VC]
+        value_cube = torch.mean(value * value * value, dim=(2, 3))  # [B, VC]
+        value = torch.cat((value_mean, value_cube), dim=1)  # [B, VC*2]
+
         value = self.value_activation(value)
         value = self.value_linear(value)
 
@@ -489,5 +501,5 @@ class Mix7RNet(nn.Module):  # R -> rotated conv
     @property
     def name(self):
         m, p, v = self.model_size
-        return f"mix7r_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
-                                                          if self.map_max != 0 else "")
+        return f"mix8_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
+                                                         if self.map_max != 0 else "")
