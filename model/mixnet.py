@@ -347,14 +347,12 @@ class Mix7Net(nn.Module):
                  dim_value=32,
                  map_max=30,
                  input_type='basic-nostm',
-                 reuse_feature=False,
                  dwconv_kernel_size=3):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
         self.input_type = input_type
-        self.reuse_feature = reuse_feature
-        dim_out = max(dim_policy, dim_value) if reuse_feature else dim_policy + dim_value
+        dim_out = max(dim_policy, dim_value)
 
         self.input_plane = build_input_plane(input_type)
         self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
@@ -379,7 +377,6 @@ class Mix7Net(nn.Module):
         self.policy_activation = nn.PReLU(1)
 
         # value head
-        self.value_activation = nn.PReLU(dim_value)
         self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
                                           LinearBlock(dim_value, dim_value),
                                           LinearBlock(dim_value, 3, activation='none'))
@@ -405,16 +402,24 @@ class Mix7Net(nn.Module):
         policy = self.policy_activation(policy)
 
         # value head
-        value = feature[:, :dim_value] if self.reuse_feature else feature[:, dim_policy:]
+        value = feature[:, :dim_value]
         value = torch.mean(value, dim=(2, 3))
-        value = self.value_activation(value)
         value = self.value_linear(value)
 
         return value, policy
+
+    @property
+    def weight_clipping(self):
+        # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
+        # In this range, prelu is the same as `max(x, ax)`.
+        return [{
+            'params': ['mapping_activation.weight'],
+            'min_weight': -1.0,
+            'max_weight': 1.0,
+        }]
 
     @property
     def name(self):
         m, p, v = self.model_size
         return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
                                                          if self.map_max != 0 else "")
-

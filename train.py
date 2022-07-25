@@ -317,6 +317,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             with torch.no_grad():
                 kd_results = kd_model(data) if kd_model is not None else None
 
+            # apply weight clipping if needed
+            if hasattr(accelerator.unwrap_model(model), 'weight_clipping'):
+                unwarpped_model = accelerator.unwrap_model(model)
+                clip_parameters = unwarpped_model.weight_clipping
+                weight_clipping(unwarpped_model.named_parameters(), clip_parameters)
+
             # model update
             optimizer.zero_grad()
             results = model(data)
@@ -329,12 +335,6 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
             optimizer.step()
             lr_scheduler.step()
-
-            # apply weight clipping if needed
-            if hasattr(accelerator.unwrap_model(model), 'weight_clipping'):
-                unwarpped_model = accelerator.unwrap_model(model)
-                clip_parameters = unwarpped_model.weight_clipping
-                weight_clipping(unwarpped_model.named_parameters(), clip_parameters)
 
             # update running average loss
             loss_dict = accelerator.gather(loss_dict)
