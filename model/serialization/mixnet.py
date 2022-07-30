@@ -777,6 +777,7 @@ class Mix7NetSerializer(BaseSerializer):
                  board_size=None,
                  text_output=False,
                  feature_map_bound=6000,
+                 feature_bound_scale=1.0,
                  **kwargs):
         super().__init__(rules=[rule],
                          boardsizes=list(range(5, 23)) if board_size is None else [board_size],
@@ -784,6 +785,7 @@ class Mix7NetSerializer(BaseSerializer):
         self.line_length = 11
         self.text_output = text_output
         self.feature_map_bound = feature_map_bound
+        self.feature_bound_scale = feature_bound_scale
         self.map_table_export_batch_size = 4096
 
     @property
@@ -869,11 +871,12 @@ class Mix7NetSerializer(BaseSerializer):
         feature_map_max = np.abs(feature_map).max()
         quant_scale = self.feature_map_bound / feature_map_max
         quant_bound = ceil(feature_map_max * quant_scale)
-        print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}" +
-              f", feature_max = {feature_map_max}, scale = {quant_scale}, bound = {quant_bound}")
-        assert quant_bound < 32767, "feature map overflow!"
+        print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}, " +
+              f"feature_max = {feature_map_max}, scale = {quant_scale}*4, bound = {quant_bound}*4")
+        assert quant_bound * 4 < 32767, "feature map overflow!"
 
-        return feature_map * quant_scale, usage_flags, quant_scale, quant_bound
+        # fuse mean operation into map by multiply 4
+        return feature_map * quant_scale, usage_flags, quant_scale * 4, quant_bound * 4
 
     def _export_mapping_activation(self, model: Mix7Net):
         weight = model.mapping_activation.weight.cpu().numpy()
@@ -891,11 +894,13 @@ class Mix7NetSerializer(BaseSerializer):
     def _export_feature_dwconv(self, model: Mix7Net, quant_scale, quant_bound):
         conv_weight = model.feature_dwconv.conv.weight.cpu().numpy()  # [max(PC,VC), 1, 3, 3]
         conv_bias = model.feature_dwconv.conv.bias.cpu().numpy()
+        ascii_hist("feature dwconv weight", conv_weight)
+        ascii_hist("feature dwconv bias", conv_bias)
 
         conv_weight_max = np.abs(conv_weight).max()
         conv_bias_max = np.abs(conv_bias).max()
-        quant_bound_perchannel = np.abs(conv_weight).sum((1, 2, 3)) * quant_bound \
-                               + np.abs(conv_bias) * quant_scale
+        quant_bound_perchannel = self.feature_bound_scale * np.abs(
+            np.abs(conv_weight).sum((1, 2, 3)) * quant_bound + conv_bias * quant_scale)
 
         conv_quant_max = max(conv_weight_max * 2**15, conv_bias_max * quant_scale)
         conv_quant_scale = min(32766 / conv_quant_max, 32766 / quant_bound_perchannel.max())
@@ -1073,4 +1078,3 @@ class Mix7NetSerializer(BaseSerializer):
 
             # char    __padding_to_32bytes[8];
             o.write(np.zeros(8, dtype='<i1').tobytes())
-

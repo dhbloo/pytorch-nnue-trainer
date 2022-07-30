@@ -409,6 +409,42 @@ class Mix7Net(nn.Module):
 
         return value, policy
 
+    def forward_debug_print(self, data):
+        _, dim_policy, dim_value = self.model_size
+
+        input_plane = self.input_plane(data)
+        feature = self.mapping(input_plane)
+        # resize feature to range [-map_max, map_max]
+        if self.map_max != 0:
+            feature = self.map_max * torch.tanh(feature / self.map_max)
+        print(f"features at (0,0): \n{feature[..., 0, 0]}")
+        # average feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, PC+VC, H, W]
+        print(f"feature mean at (0,0): \n{feature[..., 0, 0]}")
+        feature = self.mapping_activation(feature)
+        print(f"feature act at (0,0): \n{feature[..., 0, 0]}")
+
+        # feature conv
+        feature = self.feature_dwconv(feature)  # [B, PC+VC, H, W]
+        print(f"feature after dwconv at (0,0): \n{feature[..., 0, 0]}")
+
+        # policy head
+        policy = feature[:, :dim_policy]
+        print(f"policy feature input at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_pwconv(policy)
+        print(f"policy after pwconv at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_activation(policy)
+        print(f"policy act at (0,0): \n{policy[..., 0, 0]}")
+
+        # value head
+        value = feature[:, :dim_value]
+        print(f"value feature input at (0,0): \n{value[..., 0, 0]}")
+        value = torch.mean(value, dim=(2, 3))
+        print(f"value feature mean: \n{value}")
+        value = self.value_linear(value)
+
+        return value, policy
+
     @property
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
