@@ -5,7 +5,7 @@ from zlib import crc32
 from math import ceil
 from utils.misc_utils import ascii_hist
 from . import BaseSerializer, SERIALIZERS
-from ..mixnet import Mix6Net, Mix6QNet
+from ..mixnet import Mix6Net, Mix6QNet, Mix7Net
 
 
 def generate_base3_permutation(length):
@@ -436,11 +436,8 @@ class Mix6NetQSerializer(BaseSerializer):
         assert model.input_type == 'basic' or model.input_type == 'basic-nostm'
         _, dim_policy, dim_value = model.model_size
         hash = crc32(b'Mix6QNet')
-        hash ^= crc32(b'basic')
+        hash ^= crc32(model.scale_weight.to_bytes(4, 'little'))
         hash ^= (dim_policy << 16) | dim_value
-        hash ^= hash << 7
-        hash += hash >> 3
-        hash ^= model.scale_weight
         return hash
 
     def _export_map_table(self, model: Mix6QNet, device, line, stm=None):
@@ -630,7 +627,7 @@ class Mix6NetQSerializer(BaseSerializer):
             value_scale,
         )
 
-    def serialize(self, out: io.IOBase, model: Mix6Net, device):
+    def serialize(self, out: io.IOBase, model: Mix6QNet, device):
         mappings = []
         if model.input_type == 'basic':
             mappings.append(self._export_feature_map(model, device, stm=-1))  # Black
@@ -735,3 +732,345 @@ class Mix6NetQSerializer(BaseSerializer):
             # float policy_output_scale
             # float value_output_scale
             o.write(np.array([policy_output_scale, value_output_scale], dtype='<f4').tobytes())
+
+
+@SERIALIZERS.register('mix7')
+class Mix7NetSerializer(BaseSerializer):
+    """
+    Mix7Net binary serializer.
+
+    The corresponding C-language struct layout: 
+    struct Mix7Weight {
+        // 1  mapping layer
+        int16_t mapping[ShapeNum][FeatureDim];
+
+        // 2  PReLU after mapping
+        int16_t map_prelu_weight[FeatureDim];
+
+        // 3  Depthwise conv
+        int16_t dw_conv_weight[9][FeatureDim];
+        int16_t dw_conv_bias[FeatureDim];
+
+        // 4  Policy pointwise conv
+        int16_t policy_pw_conv_weight[PolicyDim];
+
+        // 7  Value MLP (layer 1,2,3)
+        float   value_l1_weight[ValueDim][ValueDim];  // shape=(in, out)
+        float   value_l1_bias[ValueDim];
+        float   value_l2_weight[ValueDim][ValueDim];
+        float   value_l2_bias[ValueDim];
+        float   value_l3_weight[ValueDim][3];
+        float   value_l3_bias[3];
+
+        // 5  Policy PReLU
+        float   policy_neg_weight;
+        float   policy_pos_weight;
+
+        // 6  Value sum scale
+        float   value_sum_scale;
+
+        char    __padding_to_32bytes[8];
+    };
+    """
+    def __init__(self,
+                 rule='freestyle',
+                 board_size=None,
+                 text_output=False,
+                 feature_map_bound=6000,
+                 **kwargs):
+        super().__init__(rules=[rule],
+                         boardsizes=list(range(5, 23)) if board_size is None else [board_size],
+                         **kwargs)
+        self.line_length = 11
+        self.text_output = text_output
+        self.feature_map_bound = feature_map_bound
+        self.map_table_export_batch_size = 4096
+
+    @property
+    def is_binary(self) -> bool:
+        return not self.text_output
+
+    def arch_hash(self, model: Mix7Net) -> int:
+        assert model.input_type == 'basic-nostm'
+        _, dim_policy, dim_value = model.model_size
+        hash = crc32(b'Mix7Net')
+        hash ^= crc32(model.input_type.encode('utf-8'))
+        hash ^= crc32(model.dwconv_kernel_size.to_bytes(4, 'little'))
+        hash ^= (dim_policy << 16) | dim_value
+        return hash
+
+    def _export_map_table(self, model: Mix7Net, device, line, stm=None):
+        """
+        Export line -> feature mapping table.
+
+        Args:
+            line: shape (N, Length)
+        """
+        N, L = line.shape
+        b, w = line == 1, line == 2
+
+        if stm is not None:
+            s = np.ones_like(line) * stm
+            line = (b, w, s)
+        else:
+            line = (b, w)
+        line = np.stack(line, axis=0)[np.newaxis]  # [B=1, C=2 or 3, N, L]
+        line = torch.tensor(line, dtype=torch.float32, device=device)
+
+        batch_size = self.map_table_export_batch_size
+
+        batch_num = 1 + (N - 1) // batch_size
+        map_table = []
+        for i in range(batch_num):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, N)
+
+            map = model.mapping(line[:, :, start:end])[0, 0]
+            if model.map_max != 0:
+                map = model.map_max * torch.tanh(map / model.map_max)
+
+            map_table.append(map.cpu().numpy())
+
+        map_table = np.concatenate(map_table, axis=1)  # [C=max(PC,VC), N, L]
+        return map_table
+
+    def _export_feature_map(self, model: Mix7Net, device, stm=None):
+        L = self.line_length
+        _, PC, VC = model.model_size
+        lines = generate_base3_permutation(L)  # [177147, 11]
+        map_table = self._export_map_table(model, device, lines, stm)  # [C=PC+VC, 177147, 11]
+
+        feature_map = np.zeros((4 * 3**L, max(PC, VC)), dtype=np.float32)  # [708588, 64]
+        usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
+        pow3 = 3**np.arange(L + 1, dtype=np.int64)[:, np.newaxis]  # [11, 1]
+
+        for r in range((L + 1) // 2):
+            idx = np.matmul(lines[:, r:], pow3[:L - r]) + pow3[L + 1 - r:].sum()
+            for i in range(idx.shape[0]):
+                feature_map[idx[i]] = map_table[:, i, L // 2 + r]
+                usage_flags[idx[i]] = True
+
+        for l in range(1, (L + 1) // 2):
+            idx = np.matmul(lines[:, :L - l], pow3[l:-1]) + 2 * pow3[-1] + pow3[:l - 1].sum()
+            for i in range(idx.shape[0]):
+                feature_map[idx[i]] = map_table[:, i, L // 2 - l]
+                usage_flags[idx[i]] = True
+
+        for l in range(1, (L + 1) // 2):
+            for r in range(1, (L + 1) // 2):
+                lines = generate_base3_permutation(L - l - r)
+                map_table = self._export_map_table(model, device, lines, stm)
+                idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
+                idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
+                for i in range(idx.shape[0]):
+                    feature_map[idx[i]] = map_table[:, i, L // 2 - l]
+                    usage_flags[idx[i]] = True
+
+        feature_map_max = np.abs(feature_map).max()
+        quant_scale = self.feature_map_bound / feature_map_max
+        quant_bound = ceil(feature_map_max * quant_scale)
+        print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}" +
+              f", feature_max = {feature_map_max}, scale = {quant_scale}, bound = {quant_bound}")
+        assert quant_bound < 32767, "feature map overflow!"
+
+        return feature_map * quant_scale, usage_flags, quant_scale, quant_bound
+
+    def _export_mapping_activation(self, model: Mix7Net):
+        weight = model.mapping_activation.weight.cpu().numpy()
+        weight_max = np.abs(weight).max()
+        weight_clipped = np.clip(weight, a_min=-1.0, a_max=1.0)
+        num_params_clipped = np.sum(weight != weight_clipped)
+        weight_quant = np.clip(weight_clipped * 2**15, a_min=-32768, a_max=32767)
+        weight_quant_max = np.abs(weight_quant).max()
+        ascii_hist("map prelu weight", weight)
+        print(f"map prelu: clipped {num_params_clipped}/{len(weight)}, " +
+              f"weight_max = {weight_max}, weight_quant_max = {weight_quant_max}")
+
+        return weight_quant
+
+    def _export_feature_dwconv(self, model: Mix7Net, quant_scale, quant_bound):
+        conv_weight = model.feature_dwconv.conv.weight.cpu().numpy()  # [max(PC,VC), 1, 3, 3]
+        conv_bias = model.feature_dwconv.conv.bias.cpu().numpy()
+
+        conv_weight_max = np.abs(conv_weight).max()
+        conv_bias_max = np.abs(conv_bias).max()
+        quant_bound_perchannel = np.abs(conv_weight).sum((1, 2, 3)) * quant_bound \
+                               + np.abs(conv_bias) * quant_scale
+
+        conv_quant_max = max(conv_weight_max * 2**15, conv_bias_max * quant_scale)
+        conv_quant_scale = min(32766 / conv_quant_max, 32766 / quant_bound_perchannel.max())
+        quant_scale *= conv_quant_scale
+        quant_bound_perchannel *= conv_quant_scale
+
+        conv_weight_quant = conv_weight * conv_quant_scale * 2**15
+        conv_bias_quant = conv_bias * quant_scale
+        conv_quant_max = max(np.abs(conv_weight_quant).max(), np.abs(conv_bias_quant).max())
+        print(f"feature dwconv: weight_max = {conv_weight_max}, bias_max = {conv_bias_max}" +
+              f", quant_max = {conv_quant_max}, scale = {quant_scale}" +
+              f", bound = {quant_bound_perchannel.max()}")
+        assert conv_quant_max < 32767, f"feature dwconv weight overflow! ({conv_quant_max})"
+        assert quant_bound_perchannel.max() < 32767, \
+            f"feature dwconv overflow! ({quant_bound_perchannel.max()})"
+
+        # transpose weight to [9][dim_feature]
+        conv_weight_quant = conv_weight_quant.squeeze(1).transpose((1, 2, 0))
+
+        return conv_weight_quant, conv_bias_quant, quant_scale, quant_bound_perchannel
+
+    def _export_policy(self, model: Mix7Net, quant_scale, quant_bound_perchannel):
+        _, PC, _ = model.model_size
+
+        # policy pw conv
+        pwconv_weight = model.policy_pwconv.conv.weight.cpu().numpy()[0, :, 0, 0]
+        pwconv_weight_max = np.abs(pwconv_weight).max()
+        quant_bound = (np.abs(pwconv_weight) * quant_bound_perchannel[:PC]).sum()
+        pwconv_quant_scale = min(32766 / (pwconv_weight_max * 2**15), 32766 / quant_bound)
+        quant_scale *= pwconv_quant_scale
+        quant_bound *= pwconv_quant_scale
+        pwconv_weight_quant = pwconv_weight * pwconv_quant_scale * 2**15
+
+        pwconv_weight_max = np.abs(pwconv_weight).max()
+        pwconv_weight_quant_max = np.abs(pwconv_weight_quant).max()
+        print(f"policy pwconv: weight_max = {pwconv_weight_max}, weight_quant_max = " +
+              f"{pwconv_weight_quant_max}, scale = {quant_scale}, bound = {quant_bound}")
+        assert pwconv_weight_quant_max < 32767, "policy pw conv weight overflow!"
+        assert quant_bound < 32767, f"policy pw conv overflow! ({quant_bound})"
+
+        # policy PReLU activation
+        policy_prelu_weight = model.policy_activation.weight.cpu().numpy().item()
+        policy_neg_weight = policy_prelu_weight / quant_scale
+        policy_pos_weight = 1 / quant_scale
+        print(f"policy prelu: weight = {policy_prelu_weight}, " +
+              f"neg_weight = {policy_neg_weight}, pos_weight = {policy_pos_weight}")
+
+        return pwconv_weight_quant, policy_neg_weight, policy_pos_weight
+
+    def _export_value(self, model: Mix7Net, quant_scale):
+        # value layer 0: global mean
+        value_sum_scale = 1 / quant_scale  # Note: divide board_size**2 in engine
+
+        # value layer 1: linear mlp 01
+        linear1_weight = model.value_linear[0].fc.weight.cpu().numpy().T
+        linear1_bias = model.value_linear[0].fc.bias.cpu().numpy()
+
+        # value layer 2: linear mlp 02
+        linear2_weight = model.value_linear[1].fc.weight.cpu().numpy().T
+        linear2_bias = model.value_linear[1].fc.bias.cpu().numpy()
+
+        # value layer 3: linear mlp final
+        linear3_weight = model.value_linear[2].fc.weight.cpu().numpy().T
+        linear3_bias = model.value_linear[2].fc.bias.cpu().numpy()
+
+        print(f"value: value_sum_scale = {value_sum_scale}")
+        ascii_hist("value: linear1 weight", linear1_weight)
+        ascii_hist("value: linear1 bias", linear1_bias)
+        ascii_hist("value: linear2 weight", linear2_weight)
+        ascii_hist("value: linear2 bias", linear2_bias)
+        ascii_hist("value: linear3 weight", linear3_weight)
+        ascii_hist("value: linear3 bias", linear3_bias)
+
+        return (value_sum_scale, linear1_weight, linear1_bias, linear2_weight, linear2_bias,
+                linear3_weight, linear3_bias)
+
+    def serialize(self, out: io.IOBase, model: Mix7Net, device):
+        feature_map, usage_flags, quant_scale, quant_bound = \
+            self._export_feature_map(model, device)
+        map_prelu_weight = self._export_mapping_activation(model)
+        feat_dwconv_weight, feat_dwconv_bias, quant_scale, quant_bound_perchannel = \
+            self._export_feature_dwconv(model, quant_scale, quant_bound)
+        policy_pwconv_weight, policy_neg_weight, policy_pos_weight = \
+            self._export_policy(model, quant_scale, quant_bound_perchannel)
+        value_sum_scale, linear1_weight, linear1_bias, linear2_weight, linear2_bias, \
+            linear3_weight, linear3_bias = self._export_value(model, quant_scale)
+
+        if self.text_output:
+            print('featuremap', file=out)
+            print(usage_flags.sum(), file=out)
+            for i, (f, used) in enumerate(zip(feature_map.astype('i2'), usage_flags)):
+                if used:
+                    print(i, end=' ', file=out)
+                    f.tofile(out, sep=' ')
+                    print(file=out)
+
+            print('map_prelu_weight', file=out)
+            map_prelu_weight.astype('i2').tofile(out, sep=' ')
+            print(file=out)
+
+            print('dw_conv_weight', file=out)
+            feat_dwconv_weight.astype('i2').tofile(out, sep=' ')
+            print(file=out)
+
+            print('dw_conv_bias', file=out)
+            feat_dwconv_bias.astype('i2').tofile(out, sep=' ')
+            print(file=out)
+
+            print('policy_pwconv_weight', file=out)
+            policy_pwconv_weight.astype('i2').tofile(out, sep=' ')
+            print(file=out)
+
+            print('value_l1_weight', file=out)
+            linear1_weight.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+            print('value_l1_bias', file=out)
+            linear1_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('value_l2_weight', file=out)
+            linear2_weight.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+            print('value_l2_bias', file=out)
+            linear2_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('value_l3_weight', file=out)
+            linear3_weight.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+            print('value_l3_bias', file=out)
+            linear3_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('policy_neg_weight', file=out)
+            print(policy_neg_weight, file=out)
+            print('policy_pos_weight', file=out)
+            print(policy_pos_weight, file=out)
+            print('value_sum_scale', file=out)
+            print(value_sum_scale, file=out)
+        else:
+            o: io.RawIOBase = out
+
+            # int16_t mapping[ShapeNum][FeatureDim];
+            o.write(feature_map.astype('<i2').tobytes())  # (708588, max(PC, VC))
+
+            # int16_t map_prelu_weight[FeatureDim];
+            o.write(map_prelu_weight.astype('<i2').tobytes())  # (max(PC, VC),)
+
+            # int16_t dw_conv_weight[9][FeatureDim];
+            # int16_t dw_conv_bias[FeatureDim];
+            o.write(feat_dwconv_weight.astype('<i2').tobytes())  # (3, 3, max(PC, VC))
+            o.write(feat_dwconv_bias.astype('<i2').tobytes())  # (max(PC, VC),)
+
+            # int16_t policy_pw_conv_weight[PolicyDim];
+            o.write(policy_pwconv_weight.astype('<i2').tobytes())  # (PC,)
+
+            # float   value_l1_weight[ValueDim][ValueDim];  // shape=(in, out)
+            # float   value_l1_bias[ValueDim];
+            o.write(linear1_weight.astype('<f4').tobytes())  # (VC, VC)
+            o.write(linear1_bias.astype('<f4').tobytes())  # (VC,)
+            # float   value_l2_weight[ValueDim][ValueDim];
+            # float   value_l2_bias[ValueDim];
+            o.write(linear2_weight.astype('<f4').tobytes())  # (VC, VC)
+            o.write(linear2_bias.astype('<f4').tobytes())  # (VC,)
+            # float   value_l3_weight[ValueDim][3];
+            # float   value_l3_bias[3];
+            o.write(linear3_weight.astype('<f4').tobytes())  # (VC, 3)
+            o.write(linear3_bias.astype('<f4').tobytes())  # (3,)
+
+            # float   policy_neg_weight;
+            # float   policy_pos_weight;
+            o.write(np.array([policy_neg_weight, policy_pos_weight], dtype='<f4').tobytes())
+            # float   value_sum_scale;
+            o.write(np.array([value_sum_scale], dtype='<f4').tobytes())
+
+            # char    __padding_to_32bytes[8];
+            o.write(np.zeros(8, dtype='<i1').tobytes())
+

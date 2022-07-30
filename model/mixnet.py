@@ -352,6 +352,7 @@ class Mix7Net(nn.Module):
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
         self.input_type = input_type
+        self.dwconv_kernel_size = dwconv_kernel_size
         dim_out = max(dim_policy, dim_value)
 
         self.input_plane = build_input_plane(input_type)
