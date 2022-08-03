@@ -767,9 +767,10 @@ class Mix7NetSerializer(BaseSerializer):
         float   policy_pos_weight;
 
         // 6  Value sum scale
-        float   value_sum_scale;
+        float   value_sum_scale_after_conv;
+        float   value_sum_scale_direct;
 
-        char    __padding_to_32bytes[8];
+        char    __padding_to_32bytes[4];
     };
     """
     def __init__(self,
@@ -798,7 +799,7 @@ class Mix7NetSerializer(BaseSerializer):
         hash = crc32(b'Mix7Net')
         hash ^= crc32(model.input_type.encode('utf-8'))
         hash ^= crc32(model.dwconv_kernel_size.to_bytes(4, 'little'))
-        hash ^= (dim_policy << 16) | dim_value
+        hash ^= (model.dim_dwconv << 24) | (dim_policy << 16) | dim_value
         return hash
 
     def _export_map_table(self, model: Mix7Net, device, line, stm=None):
@@ -950,9 +951,10 @@ class Mix7NetSerializer(BaseSerializer):
 
         return pwconv_weight_quant, policy_neg_weight, policy_pos_weight
 
-    def _export_value(self, model: Mix7Net, quant_scale):
+    def _export_value(self, model: Mix7Net, quant_scale_after_conv, quant_scale_direct):
         # value layer 0: global mean
-        value_sum_scale = 1 / quant_scale  # Note: divide board_size**2 in engine
+        scale_after_conv = 1 / quant_scale_after_conv  # Note: divide board_size**2 in engine
+        scale_direct = 1 / quant_scale_direct  # Note: divide board_size**2 in engine
 
         # value layer 1: linear mlp 01
         linear1_weight = model.value_linear[0].fc.weight.cpu().numpy().T
@@ -966,7 +968,7 @@ class Mix7NetSerializer(BaseSerializer):
         linear3_weight = model.value_linear[2].fc.weight.cpu().numpy().T
         linear3_bias = model.value_linear[2].fc.bias.cpu().numpy()
 
-        print(f"value: value_sum_scale = {value_sum_scale}")
+        print(f"value: scale_after_conv = {scale_after_conv}, scale_direct = {scale_direct}")
         ascii_hist("value: linear1 weight", linear1_weight)
         ascii_hist("value: linear1 bias", linear1_bias)
         ascii_hist("value: linear2 weight", linear2_weight)
@@ -974,19 +976,20 @@ class Mix7NetSerializer(BaseSerializer):
         ascii_hist("value: linear3 weight", linear3_weight)
         ascii_hist("value: linear3 bias", linear3_bias)
 
-        return (value_sum_scale, linear1_weight, linear1_bias, linear2_weight, linear2_bias,
-                linear3_weight, linear3_bias)
+        return (scale_after_conv, scale_direct, linear1_weight, linear1_bias, linear2_weight,
+                linear2_bias, linear3_weight, linear3_bias)
 
     def serialize(self, out: io.IOBase, model: Mix7Net, device):
-        feature_map, usage_flags, quant_scale, quant_bound = \
+        feature_map, usage_flags, quant_scale_direct, quant_bound = \
             self._export_feature_map(model, device)
         map_prelu_weight = self._export_mapping_activation(model)
-        feat_dwconv_weight, feat_dwconv_bias, quant_scale, quant_bound_perchannel = \
-            self._export_feature_dwconv(model, quant_scale, quant_bound)
+        feat_dwconv_weight, feat_dwconv_bias, quant_scale_after_conv, quant_bound_perchannel = \
+            self._export_feature_dwconv(model, quant_scale_direct, quant_bound)
         policy_pwconv_weight, policy_neg_weight, policy_pos_weight = \
-            self._export_policy(model, quant_scale, quant_bound_perchannel)
-        value_sum_scale, linear1_weight, linear1_bias, linear2_weight, linear2_bias, \
-            linear3_weight, linear3_bias = self._export_value(model, quant_scale)
+            self._export_policy(model, quant_scale_after_conv, quant_bound_perchannel)
+        scale_after_conv, scale_direct, linear1_weight, linear1_bias, \
+            linear2_weight, linear2_bias, linear3_weight, linear3_bias = \
+            self._export_value(model, quant_scale_after_conv, quant_scale_direct)
 
         if self.text_output:
             print('featuremap', file=out)
@@ -1038,8 +1041,10 @@ class Mix7NetSerializer(BaseSerializer):
             print(policy_neg_weight, file=out)
             print('policy_pos_weight', file=out)
             print(policy_pos_weight, file=out)
-            print('value_sum_scale', file=out)
-            print(value_sum_scale, file=out)
+            print('value_sum_scale_after_conv', file=out)
+            print(scale_after_conv, file=out)
+            print('value_sum_scale_direct', file=out)
+            print(scale_direct, file=out)
         else:
             o: io.RawIOBase = out
 
@@ -1073,8 +1078,9 @@ class Mix7NetSerializer(BaseSerializer):
             # float   policy_neg_weight;
             # float   policy_pos_weight;
             o.write(np.array([policy_neg_weight, policy_pos_weight], dtype='<f4').tobytes())
-            # float   value_sum_scale;
-            o.write(np.array([value_sum_scale], dtype='<f4').tobytes())
+            # float   value_sum_scale_after_conv;
+            # float   value_sum_scale_direct;
+            o.write(np.array([scale_after_conv, scale_direct], dtype='<f4').tobytes())
 
-            # char    __padding_to_32bytes[8];
-            o.write(np.zeros(8, dtype='<i1').tobytes())
+            # char    __padding_to_32bytes[4];
+            o.write(np.zeros(4, dtype='<i1').tobytes())
