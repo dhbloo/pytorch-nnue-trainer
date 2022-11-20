@@ -3,8 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock
-from .mixnet import ChannelWiseLeakyReLU
+from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU
 
 
 def build_embedding(type, feature_dim, board_size=15, pcode_dim=2380, **kwargs):

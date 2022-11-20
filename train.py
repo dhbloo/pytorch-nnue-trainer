@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import torch.nn.functional as F
 from accelerate import Accelerator
-from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import configargparse
 import yaml
@@ -64,10 +64,7 @@ def parse_args_and_init():
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
     parser.add('--save_interval', type=int, default=10000, help="Num iterations to save snapshot")
     parser.add('--val_interval', type=int, default=25000, help="Num iterations to do validation")
-    parser.add('--avg_loss_interval',
-               type=int,
-               default=2500,
-               help="Num iterations to average loss")
+    parser.add('--avg_loss_interval', type=int, default=2500, help="Num iterations to average loss")
     parser.add('--kd_model_type', help="Knowledge distillation model type")
     parser.add('--kd_model_args',
                type=yaml.safe_load,
@@ -200,11 +197,10 @@ def calc_loss(loss_type,
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
                   dataloader_args, data_pipelines, model_type, model_args, optim_type, optim_args,
-                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args,
-                  iterations, batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm,
-                  no_shuffle, log_interval, show_interval, save_interval, val_interval,
-                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha,
-                  **kwargs):
+                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args, iterations,
+                  batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
+                  log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
+                  kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 

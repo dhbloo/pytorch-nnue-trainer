@@ -1,11 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.parameter import Parameter
-from torch.quantization import QuantStub, DeQuantStub
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock
+from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, Conv1dLine4Block
 from .input import build_input_plane
 
 ###########################################################
@@ -18,10 +16,11 @@ def tuple_op(f, x):
 
 
 class DirectionalConvLayer(nn.Module):
+
     def __init__(self, dim_in, dim_out):
         super().__init__()
-        self.weight = Parameter(torch.empty((3, dim_out, dim_in)))
-        self.bias = Parameter(torch.zeros((dim_out, )))
+        self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
+        self.bias = nn.Parameter(torch.zeros((dim_out, )))
         nn.init.kaiming_normal_(self.weight)
 
     def _conv1d_direction(self, x, dir):
@@ -44,6 +43,7 @@ class DirectionalConvLayer(nn.Module):
 
 
 class DirectionalConvResBlock(nn.Module):
+
     def __init__(self, dim):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim, dim)
@@ -61,6 +61,7 @@ class DirectionalConvResBlock(nn.Module):
 
 
 class Conv0dResBlock(nn.Module):
+
     def __init__(self, dim):
         super().__init__()
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=1)
@@ -78,6 +79,7 @@ class Conv0dResBlock(nn.Module):
 
 
 class Mapping(nn.Module):
+
     def __init__(self, dim_in, dim_middle, dim_out):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim_in, dim_middle)
@@ -97,33 +99,12 @@ class Mapping(nn.Module):
         return x
 
 
-class ChannelWiseLeakyReLU(nn.Module):
-    def __init__(self, dim, bias=True, bound=0):
-        super().__init__()
-        self.neg_slope = Parameter(torch.ones(dim) * 0.5)
-        self.bias = Parameter(torch.zeros(dim)) if bias else None
-        self.bound = bound
-
-    def forward(self, x):
-        assert x.ndim >= 2
-        shape = [1, -1] + [1] * (x.ndim - 2)
-
-        slope = self.neg_slope.view(shape)
-        # limit slope to range [-bound, bound]
-        if self.bound != 0:
-            slope = torch.tanh(slope / self.bound) * self.bound
-
-        x += -torch.relu(-x) * (slope - 1)
-        if self.bias is not None:
-            x += self.bias.view(shape)
-        return x
-
-
 class RotatedConv2d3x3(nn.Module):
+
     def __init__(self, dim_in, dim_out) -> None:
         super().__init__()
-        self.weight = Parameter(torch.empty((9, dim_out, dim_in)))
-        self.bias = Parameter(torch.zeros((dim_out, )))
+        self.weight = nn.Parameter(torch.empty((9, dim_out, dim_in)))
+        self.bias = nn.Parameter(torch.zeros((dim_out, )))
         nn.init.kaiming_normal_(self.weight)
 
     def forward(self, x):
@@ -144,35 +125,9 @@ class RotatedConv2d3x3(nn.Module):
         return torch.conv2d(x, weight7x7, self.bias, padding=7 // 2)
 
 
-class HVLine9Conv(nn.Module):
-    def __init__(self, dim_in, dim_out) -> None:
-        super().__init__()
-        self.weight = Parameter(torch.empty((17, dim_out, dim_in)))
-        self.bias = Parameter(torch.zeros((dim_out, )))
-        nn.init.kaiming_normal_(self.weight)
-
-    def forward(self, x):
-        w = self.weight
-        _, dim_out, dim_in = w.shape
-        zero = torch.zeros((dim_out, dim_in), dtype=w.dtype, device=w.device)
-        weight9x9 = [
-            zero, zero, zero, zero, w[16], zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[15], zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[14], zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[13], zero, zero, zero, zero, \
-            w[8], w[7], w[6], w[5], w[0] , w[1], w[2], w[3], w[4], \
-            zero, zero, zero, zero, w[9],  zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[10], zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[11], zero, zero, zero, zero, \
-            zero, zero, zero, zero, w[12], zero, zero, zero, zero,
-        ]
-        weight9x9 = torch.stack(weight9x9, dim=2)
-        weight9x9 = weight9x9.reshape(dim_out, dim_in, 9, 9)
-        return torch.conv2d(x, weight9x9, self.bias, padding=9 // 2)
-
-
 @MODELS.register('mix6')
 class Mix6Net(nn.Module):
+
     def __init__(self,
                  dim_middle=128,
                  dim_policy=16,
@@ -246,6 +201,7 @@ class Mix6Net(nn.Module):
 
 @MODELS.register('mix6q')
 class Mix6QNet(nn.Module):  # Q -> quant
+
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -285,8 +241,8 @@ class Mix6QNet(nn.Module):  # Q -> quant
         self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
 
         # adaptive scales
-        self.policy_output_scale = Parameter(torch.ones(1), True)
-        self.value_output_scale = Parameter(torch.ones(1), True)
+        self.policy_output_scale = nn.Parameter(torch.ones(1), True)
+        self.value_output_scale = nn.Parameter(torch.ones(1), True)
 
         # quantization constants
         self.quantization = quantization
@@ -321,8 +277,7 @@ class Mix6QNet(nn.Module):  # Q -> quant
 
         # value head
         value = feature[:, dim_policy:]  # range [-maxf_i8_f, maxf_i8_f]
-        value = torch.mean(value,
-                           dim=(2, 3))  # range [-maxf_i8_f_after_mean, maxf_i8_f_after_mean]
+        value = torch.mean(value, dim=(2, 3))  # range [-maxf_i8_f_after_mean, maxf_i8_f_after_mean]
         value = self.value_activation(value)  # range [0, maxf_i8_f_after_mean]
         value = self.value_linear1(value)
         if self.quantization:
@@ -368,6 +323,7 @@ class Mix6QNet(nn.Module):  # Q -> quant
 
 @MODELS.register('mix7')
 class Mix7Net(nn.Module):
+
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -502,17 +458,20 @@ class Mix7Net(nn.Module):
 
 @MODELS.register('mix8')
 class Mix8Net(nn.Module):
+
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
                  dim_value=32,
                  dim_dwconv=None,
                  input_type='basic-nostm',
-                 dwconv_kernel_size=3):
+                 feature_kernel_size=3,
+                 policy_kernel_size=9):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.input_type = input_type
-        self.dwconv_kernel_size = dwconv_kernel_size
+        self.feature_kernel_size = feature_kernel_size
+        self.policy_kernel_size = policy_kernel_size
         dim_out = max(dim_policy, dim_value)
         self.dim_dwconv = dim_out if dim_dwconv is None else dim_dwconv
         assert self.dim_dwconv <= dim_out, "Incorrect dim_dwconv!"
@@ -524,12 +483,18 @@ class Mix8Net(nn.Module):
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(self.dim_dwconv,
                                           self.dim_dwconv,
-                                          ks=dwconv_kernel_size,
+                                          ks=feature_kernel_size,
                                           st=1,
-                                          padding=dwconv_kernel_size // 2,
+                                          padding=feature_kernel_size // 2,
                                           groups=self.dim_dwconv)
 
         # policy head (point-wise conv)
+        self.policy_dwconv = Conv1dLine4Block(dim_policy,
+                                              dim_policy,
+                                              ks=policy_kernel_size,
+                                              st=1,
+                                              padding=policy_kernel_size // 2,
+                                              groups=self.dim_dwconv)
         self.policy_pwconv = Conv2dBlock(dim_policy,
                                          1,
                                          ks=1,
@@ -551,57 +516,49 @@ class Mix8Net(nn.Module):
 
         input_plane = self.input_plane(data)
         feature = self.mapping(input_plane)
+
         # resize feature to range [-32, 32]
-        feature = 32 * torch.tanh(feature / 32)  # q: 256*[-32,32]
-        feature = torch.clamp(feature, max=8191 / 256)  # q: 256*[-32,31.996]
-        # average feature across four directions [B, max(PC,VC), H, W]
-        feature = torch.mean(feature, dim=1)  # q: 1024*[-32,31.996]
+        feature = 32 * torch.tanh(feature / 32)
+        # average feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, max(PC,VC) + 3, H, W]
         feature = self.mapping_activation(feature)
-        feature = torch.clamp(feature, max=8191 / 256 * 32767 / 32768)  # q: 1024*[-32,31.995]
 
         # feature conv
-        feat_dwconv = feature[:, :self.dim_dwconv]  # [B, dwconv, H, W]
+        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
         feat_direct = feature[:, self.dim_dwconv:]  # [B, max(PC,VC)-dwconv, H, W]
-        feat_dwconv = self.feature_dwconv(feat_dwconv) / 8
-        feat_dwconv = torch.clamp(feat_dwconv, min=-32, max=32767 / 32768)  # q: 1024*[-32,31.999]
         feature = torch.cat((feat_dwconv, feat_direct), dim=1)  # [B, max(PC,VC), H, W]
 
         # policy head
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
+        policy = self.policy_dwconv(policy)
         policy = self.policy_pwconv(policy)
         policy = self.policy_activation(policy)
 
         # value head
         value = feature[:, :dim_value]  # [B, dim_value, H, W]
-        value = torch.mean(value, dim=(2, 3))  # q: 1024*[-32,31.999]
-        value = value / 32  # q: 32768*[-1,0.9999]
+        value = torch.mean(value, dim=(2, 3))
         for linear in self.value_linear:
-            value = torch.clamp(value, min=-1, max=127 / 128)  # q: 128*[-1,0.992]
+            # value = torch.clamp(value, min=-1, max=127 / 128)  # q: 128*[-1,0.992]
             value = linear(value)
 
         return value, policy
-
+        
     @property
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        max_dwconv_weight = 32767 / 32768 * 8 / 10
         return [{
-            'params': ['mapping_activation.weight', 'feature_pwconv.conv.weight'],
+            'params': ['mapping_activation.weight'],
             'min_weight': -1.0,
             'max_weight': 1.0,
         }, {
             'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -max_dwconv_weight,
-            'max_weight': max_dwconv_weight,
+            'min_weight': -2.0,
+            'max_weight': 2.0,
         }, {
-            'params': ['feature_dwconv.conv.bias'],
-            'min_weight': -32 * max_dwconv_weight,
-            'max_weight': 32 * max_dwconv_weight,
-        }, {
-            'params': ['value_linear.0.weight', 'value_linear.1.weight'],
-            'min_weight': -127 / 64,
-            'max_weight': 127 / 64,
+            'params': ['policy_dwconv.conv.weight'],
+            'min_weight': -2.0,
+            'max_weight': 2.0,
         }]
 
     @property

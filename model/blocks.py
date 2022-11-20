@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 def build_activation_layer(activation):
@@ -28,7 +29,21 @@ def build_activation_layer(activation):
         assert 0, f"Unsupported activation: {activation}"
 
 
+def build_norm2d_layer(norm, norm_dim=None):
+    if norm == 'bn':
+        assert norm_dim is not None
+        return nn.BatchNorm2d(norm_dim)
+    elif norm == 'in':
+        assert norm_dim is not None
+        return nn.InstanceNorm2d(norm_dim)
+    elif norm == 'none':
+        return None
+    else:
+        assert 0, f"Unsupported normalization: {norm}"
+
+
 class ClippedReLU(nn.Module):
+
     def __init__(self, inplace=False, max=1):
         super().__init__()
         self.inplace = inplace
@@ -41,7 +56,31 @@ class ClippedReLU(nn.Module):
             return x.clamp(0, self.max)
 
 
+class ChannelWiseLeakyReLU(nn.Module):
+
+    def __init__(self, dim, bias=True, bound=0):
+        super().__init__()
+        self.neg_slope = nn.Parameter(torch.ones(dim) * 0.5)
+        self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
+        self.bound = bound
+
+    def forward(self, x):
+        assert x.ndim >= 2
+        shape = [1, -1] + [1] * (x.ndim - 2)
+
+        slope = self.neg_slope.view(shape)
+        # limit slope to range [-bound, bound]
+        if self.bound != 0:
+            slope = torch.tanh(slope / self.bound) * self.bound
+
+        x += -torch.relu(-x) * (slope - 1)
+        if self.bias is not None:
+            x += self.bias.view(shape)
+        return x
+
+
 class LinearBlock(nn.Module):
+
     def __init__(self, in_dim, out_dim, norm='none', activation='relu', bias=True):
         super(LinearBlock, self).__init__()
         self.fc = nn.Linear(in_dim, out_dim, bias)
@@ -70,6 +109,7 @@ class LinearBlock(nn.Module):
 
 
 class Conv2dBlock(nn.Module):
+
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -88,26 +128,13 @@ class Conv2dBlock(nn.Module):
         assert pad_type in ['zeros', 'reflect', 'replicate',
                             'circular'], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
-
-        # initialize normalization
-        norm_dim = out_dim
-        if norm == 'bn':
-            self.norm = nn.BatchNorm2d(norm_dim)
-        elif norm == 'in':
-            self.norm = nn.InstanceNorm2d(norm_dim)
-        elif norm == 'none':
-            self.norm = None
-        else:
-            assert 0, f"Unsupported normalization: {norm}"
-
-        # initialize activation
+        self.norm = build_norm2d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
-
         self.conv = nn.Conv2d(
-            in_dim,
-            out_dim,
-            ks,
-            st,
+            in_channels=in_dim,
+            out_channels=out_dim,
+            kernel_size=ks,
+            stride=st,
             padding=padding,
             dilation=dilation,
             groups=groups,
@@ -119,22 +146,82 @@ class Conv2dBlock(nn.Module):
             self.conv = nn.utils.spectral_norm(self.conv)
 
     def forward(self, x):
-        if self.activation_first:
-            if self.activation:
-                x = self.activation(x)
-            x = self.conv(x)
-            if self.norm:
-                x = self.norm(x)
-        else:
-            x = self.conv(x)
-            if self.norm:
-                x = self.norm(x)
-            if self.activation:
-                x = self.activation(x)
+        if self.activation and self.activation_first:
+            x = self.activation(x)
+        x = self.conv(x)
+        if self.norm:
+            x = self.norm(x)
+        if self.activation and not self.activation_first:
+            x = self.activation(x)
+        return x
+
+
+class Conv1dLine4Block(nn.Module):
+
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 ks,
+                 st,
+                 padding=0,
+                 norm='none',
+                 activation='relu',
+                 bias=True,
+                 dilation=1,
+                 groups=1,
+                 activation_first=False):
+        super().__init__()
+        assert in_dim % groups == 0, f"in_dim({in_dim}) should be divisible by groups({groups})"
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.kernel_size = ks
+        self.stride = st
+        self.padding = padding  # zeros padding
+        self.dilation = dilation
+        self.groups = groups
+        self.activation_first = activation_first
+        self.norm = build_norm2d_layer(norm, out_dim)
+        self.activation = build_activation_layer(activation)
+        self.weight = nn.Parameter(torch.empty((4 * ks - 3, out_dim, in_dim // groups)))
+        self.bias = nn.Parameter(torch.zeros((out_dim, ))) if bias else None
+        nn.init.kaiming_normal_(self.weight)
+
+    def make_kernel(self):
+        kernel = []
+        weight_index = 0
+        zero = torch.zeros_like(self.weight[0])
+        for i in range(self.kernel_size):
+            for j in range(self.kernel_size):
+                if i == j or i + j == self.kernel_size - 1 or \
+                    i == self.kernel_size // 2 or j == self.kernel_size // 2:
+                    kernel.append(self.weight[weight_index])
+                    weight_index += 1
+                else:
+                    kernel.append(zero)
+
+        assert weight_index == self.weight.size(0), f"{weight_index} != {self.weight.size(0)}"
+        kernel = torch.stack(kernel, dim=2)
+        kernel = kernel.reshape(self.out_dim, self.in_dim // self.groups, self.kernel_size,
+                                self.kernel_size)
+        return kernel
+
+    def conv(self, x):
+        return F.conv2d(x, self.make_kernel(), self.bias, self.stride, self.padding, self.dilation,
+                        self.groups)
+
+    def forward(self, x):
+        if self.activation and self.activation_first:
+            x = self.activation(x)
+        x = self.conv(x)
+        if self.norm:
+            x = self.norm(x)
+        if self.activation and not self.activation_first:
+            x = self.activation(x)
         return x
 
 
 class ResBlock(nn.Module):
+
     def __init__(self,
                  dim,
                  ks=3,
@@ -163,6 +250,7 @@ class ResBlock(nn.Module):
 
 
 class ActFirstResBlock(nn.Module):
+
     def __init__(self,
                  dim_in,
                  dim_out,
