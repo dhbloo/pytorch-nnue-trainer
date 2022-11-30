@@ -23,8 +23,8 @@ def build_head(head_type, dim_feature):
 class OutputHeadV0(nn.Module):
     def __init__(self, dim_feature, dim_value=3):
         super().__init__()
-        self.value_head = LinearBlock(dim_feature, dim_value, activation='none')
-        self.policy_head = Conv2dBlock(dim_feature, 1, ks=1, st=1, activation='none')
+        self.value_head = LinearBlock(dim_feature, dim_value, activation='none', bias=False)
+        self.policy_head = Conv2dBlock(dim_feature, 1, ks=1, st=1, activation='none', bias=False)
 
     def forward(self, feature):
         # value head
