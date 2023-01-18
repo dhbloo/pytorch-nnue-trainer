@@ -494,7 +494,7 @@ class Mix8Net(nn.Module):
                                               ks=policy_kernel_size,
                                               st=1,
                                               padding=policy_kernel_size // 2,
-                                              groups=self.dim_dwconv)
+                                              groups=dim_policy)
         self.policy_pwconv_weight_layer = LinearBlock(dim_value, dim_policy * 1)
         self.policy_activation = nn.PReLU(1)
 
@@ -555,6 +555,48 @@ class Mix8Net(nn.Module):
 
         return value, policy
         
+    def forward_debug_print(self, data):
+        _, dim_policy, dim_value = self.model_size
+
+        # get feature from both side
+        feature_self = self.get_feature(data, False)
+        feature_oppo = self.get_feature(data, True)
+        print(f"self feature after dwconv at (0,0): \n{feature_self[..., 0, 0]}")
+        print(f"oppo feature after dwconv at (0,0): \n{feature_oppo[..., 0, 0]}")
+
+        # value feature accumulator
+        value_self = feature_self[:, :dim_value]  # [B, dim_value, H, W]
+        value_oppo = feature_oppo[:, :dim_value]  # [B, dim_value, H, W]
+        value_self = torch.mean(value_self, dim=(2, 3))
+        value_oppo = torch.mean(value_oppo, dim=(2, 3))
+        print(f"self value feature mean: \n{value_self}")
+        print(f"oppo value feature mean: \n{value_oppo}")
+
+        # policy head
+        pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy * 1]
+        print(f"policy weight: \n{pwconv_weight}")
+
+        B, _, H, W = feature_self.shape
+        policy = feature_self[:, :dim_policy]   # [B, dim_policy, H, W]
+        print(f"policy feature input at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_dwconv(policy)     # [B, dim_policy, H, W]
+        print(f"policy after dwconv at (0,0): \n{policy[..., 0, 0]}")
+        policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W), 
+                          weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
+                          groups=B).reshape(B, 1, H, W)
+        print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_activation(policy) # [B, 1, H, W]
+        print(f"policy act at (0,0): \n{policy[..., 0, 0]}")
+
+        # value head
+        value = torch.cat([value_self, value_oppo], dim=1)
+        print(f"value feature input: \n{value}")
+        for i, linear in enumerate(self.value_linear):
+            value = linear(value)
+            print(f"value feature after layer {i}: \n{value}")
+
+        return value, policy
+
     @property
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
@@ -565,10 +607,18 @@ class Mix8Net(nn.Module):
             'max_weight': 1.0,
         }, {
             'params': ['feature_dwconv.conv.weight'],
+            'min_weight': -1.0,
+            'max_weight': 1.0,
+        }, {
+            'params': ['feature_dwconv.conv.bias'],
             'min_weight': -2.0,
             'max_weight': 2.0,
         }, {
-            'params': ['policy_dwconv.conv.weight'],
+            'params': ['policy_dwconv.weight'],
+            'min_weight': -1.0,
+            'max_weight': 1.0,
+        }, {
+            'params': ['policy_dwconv.bias'],
             'min_weight': -2.0,
             'max_weight': 2.0,
         }]
