@@ -1298,7 +1298,7 @@ class Mix8NetSerializer(BaseSerializer):
         ascii_hist("policy dwconv bias", conv_bias)
 
         conv_weight_clipped = np.clip(conv_weight, a_min=-1.0, a_max=1.0)
-        conv_bias_clipped = np.clip(conv_bias, a_min=-2.0, a_max=2.0)
+        conv_bias_clipped = np.clip(conv_bias, a_min=-4.0, a_max=4.0)
         weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
         conv_weight_max = np.abs(conv_weight_clipped).max()

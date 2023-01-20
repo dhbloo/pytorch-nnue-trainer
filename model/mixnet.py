@@ -495,12 +495,12 @@ class Mix8Net(nn.Module):
                                               st=1,
                                               padding=policy_kernel_size // 2,
                                               groups=dim_policy)
-        self.policy_pwconv_weight_layer = LinearBlock(dim_value, dim_policy * 1)
+        self.policy_pwconv_weight_layer = LinearBlock(dim_value + self.dim_dwconv, dim_policy * 1)
         self.policy_activation = nn.PReLU(1)
 
         # value head
         self.value_linear = nn.ModuleList([
-            LinearBlock(dim_value * 2, dim_value),  # double side feature input
+            LinearBlock((dim_value + self.dim_dwconv) * 2, dim_value),  # double side feature
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, 3, activation='none')
         ])
@@ -520,23 +520,20 @@ class Mix8Net(nn.Module):
 
         # feature conv
         feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
-        feat_direct = feature[:, self.dim_dwconv:]  # [B, max(PC,VC)-dwconv, H, W]
-        feature = torch.cat((feat_dwconv, feat_direct), dim=1)  # [B, max(PC,VC), H, W]
+        feature = torch.cat((feat_dwconv, feature), dim=1)  # [B, dwconv+max(PC,VC), H, W]
 
         return feature
 
     def forward(self, data):
-        _, dim_policy, dim_value = self.model_size
+        _, dim_policy, _ = self.model_size
 
         # get feature from both side
         feature_self = self.get_feature(data, False)
         feature_oppo = self.get_feature(data, True)
 
         # value feature accumulator
-        value_self = feature_self[:, :dim_value]  # [B, dim_value, H, W]
-        value_oppo = feature_oppo[:, :dim_value]  # [B, dim_value, H, W]
-        value_self = torch.mean(value_self, dim=(2, 3))
-        value_oppo = torch.mean(value_oppo, dim=(2, 3))
+        value_self = torch.mean(feature_self, dim=(2, 3))
+        value_oppo = torch.mean(feature_oppo, dim=(2, 3))
 
         # policy head
         B, _, H, W = feature_self.shape
@@ -565,10 +562,8 @@ class Mix8Net(nn.Module):
         print(f"oppo feature after dwconv at (0,0): \n{feature_oppo[..., 0, 0]}")
 
         # value feature accumulator
-        value_self = feature_self[:, :dim_value]  # [B, dim_value, H, W]
-        value_oppo = feature_oppo[:, :dim_value]  # [B, dim_value, H, W]
-        value_self = torch.mean(value_self, dim=(2, 3))
-        value_oppo = torch.mean(value_oppo, dim=(2, 3))
+        value_self = torch.mean(feature_self, dim=(2, 3))
+        value_oppo = torch.mean(feature_oppo, dim=(2, 3))
         print(f"self value feature mean: \n{value_self}")
         print(f"oppo value feature mean: \n{value_oppo}")
 
@@ -619,8 +614,8 @@ class Mix8Net(nn.Module):
             'max_weight': 1.0,
         }, {
             'params': ['policy_dwconv.bias'],
-            'min_weight': -2.0,
-            'max_weight': 2.0,
+            'min_weight': -4.0,
+            'max_weight': 4.0,
         }]
 
     @property
