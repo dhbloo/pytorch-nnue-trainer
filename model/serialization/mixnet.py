@@ -1116,6 +1116,7 @@ class Mix8NetSerializer(BaseSerializer):
             // 6  Policy dynamic pointwise conv
             float   policy_pwconv_weight_layer_weight[ValueDim][PolicyDim];
             float   policy_pwconv_weight_layer_bias[PolicyDim];
+            float   policy_pwconv_weight_prelu_weight[PolicyDim];
 
             // 7  Value MLP (layer 1,2,3)
             float   value_l1_weight[ValueDim * 2][ValueDim];  // shape=(in, out)
@@ -1335,6 +1336,15 @@ class Mix8NetSerializer(BaseSerializer):
         ascii_hist("policy pwconv weight layer weight", pwconv_weight_layer_weight)
         ascii_hist("policy pwconv weight layer bias", pwconv_weight_layer_bias)
 
+        # policy pw conv dynamic weight layer activation
+        pwconv_weight_prelu = model.policy_pwconv_weight_layer_act.weight.cpu().numpy()
+        pwconv_weight_prelu_clipped = np.clip(pwconv_weight_prelu, a_min=-1.0, a_max=1.0)
+        num_params_clipped = np.sum(pwconv_weight_prelu != pwconv_weight_prelu_clipped)
+        weight_max = np.abs(pwconv_weight_prelu_clipped).max()
+        ascii_hist("policy pwconv weight prelu", pwconv_weight_prelu)
+        print(f"map prelu: clipped {num_params_clipped}/{len(pwconv_weight_prelu)}, " +
+              f"weight_max = {weight_max}")
+
         # policy PReLU activation
         policy_prelu_weight = model.policy_activation.weight.cpu().numpy().item()
         policy_neg_weight = policy_prelu_weight / quant_scale
@@ -1343,7 +1353,7 @@ class Mix8NetSerializer(BaseSerializer):
               f"neg_weight = {policy_neg_weight}, pos_weight = {policy_pos_weight}")
 
         return pwconv_weight_layer_weight, pwconv_weight_layer_bias, \
-               policy_neg_weight, policy_pos_weight
+               pwconv_weight_prelu_clipped, policy_neg_weight, policy_pos_weight
 
     def _export_value(self, model: Mix7Net, quant_scale_after_conv, quant_scale_direct):
         # value layer 0: global mean
@@ -1381,8 +1391,9 @@ class Mix8NetSerializer(BaseSerializer):
             self._export_feature_dwconv(model, quant_scale_direct, quant_bound)
         policy_dwconv_weight, policy_dwconv_bias, quant_scale_policy = \
             self._export_policy_dwconv(model, quant_scale_ftconv, quant_bound_perchannel)
-        policy_pwconv_weight_layer_weight, policy_pwconv_weight_layer_bias, policy_neg_weight, \
-            policy_pos_weight = self._export_policy_pwconv(model, quant_scale_policy)
+        policy_pwconv_weight_layer_weight, policy_pwconv_weight_layer_bias, \
+            policy_pwconv_weight_prelu_weight, policy_neg_weight, policy_pos_weight = \
+            self._export_policy_pwconv(model, quant_scale_policy)
         scale_after_conv, scale_direct, linear1_weight, linear1_bias, \
             linear2_weight, linear2_bias, linear3_weight, linear3_bias = \
             self._export_value(model, quant_scale_ftconv, quant_scale_direct)
@@ -1427,6 +1438,10 @@ class Mix8NetSerializer(BaseSerializer):
 
             print('policy_pwconv_weight_layer_bias', file=out)
             policy_pwconv_weight_layer_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('policy_pwconv_weight_prelu_weight', file=out)
+            policy_pwconv_weight_prelu_weight.astype('f4').tofile(out, sep=' ')
             print(file=out)
 
             print('value_l1_weight', file=out)
@@ -1481,8 +1496,10 @@ class Mix8NetSerializer(BaseSerializer):
 
             # float   policy_pwconv_weight_layer_weight[ValueDim][PolicyDim];
             # float   policy_pwconv_weight_layer_bias[PolicyDim];
+            # float   policy_pwconv_weight_prelu_weight[PolicyDim];
             o.write(policy_pwconv_weight_layer_weight.astype('<f4').tobytes())  # (VC, PC)
             o.write(policy_pwconv_weight_layer_bias.astype('<f4').tobytes())  # (PC,)
+            o.write(policy_pwconv_weight_prelu_weight.astype('<f4').tobytes())  # (PC,)
 
             # float   value_l1_weight[ValueDim][ValueDim];  // shape=(in, out)
             # float   value_l1_bias[ValueDim];

@@ -574,6 +574,8 @@ class Mix8Net(nn.Module):
         # policy head
         pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy * 1]
         print(f"policy weight: \n{pwconv_weight}")
+        pwconv_weight = self.policy_pwconv_weight_layer_act(pwconv_weight)
+        print(f"policy weight after prelu: \n{pwconv_weight}")
 
         B, _, H, W = feature_self.shape
         policy = feature_self[:, :dim_policy]   # [B, dim_policy, H, W]
