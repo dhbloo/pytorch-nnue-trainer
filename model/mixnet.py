@@ -495,7 +495,10 @@ class Mix8Net(nn.Module):
                                               st=1,
                                               padding=policy_kernel_size // 2,
                                               groups=dim_policy)
-        self.policy_pwconv_weight_layer = LinearBlock(dim_value + self.dim_dwconv, dim_policy * 1)
+        self.policy_pwconv_weight_layer = LinearBlock(dim_value + self.dim_dwconv, 
+                                                      dim_policy * 1,
+                                                      activation='none')
+        self.policy_pwconv_weight_layer_act = nn.PReLU(dim_policy * 1)
         self.policy_activation = nn.PReLU(1)
 
         # value head
@@ -540,6 +543,7 @@ class Mix8Net(nn.Module):
         policy = feature_self[:, :dim_policy]   # [B, dim_policy, H, W]
         policy = self.policy_dwconv(policy)     # [B, dim_policy, H, W]
         pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy * 1]
+        pwconv_weight = self.policy_pwconv_weight_layer_act(pwconv_weight)
         policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W), 
                           weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
                           groups=B).reshape(B, 1, H, W)
@@ -616,6 +620,10 @@ class Mix8Net(nn.Module):
             'params': ['policy_dwconv.bias'],
             'min_weight': -4.0,
             'max_weight': 4.0,
+        }, {
+            'params': ['policy_pwconv_weight_layer_act.weight'],
+            'min_weight': -1.0,
+            'max_weight': 1.0,
         }]
 
     @property
