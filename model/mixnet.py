@@ -495,10 +495,11 @@ class Mix8Net(nn.Module):
                                               st=1,
                                               padding=policy_kernel_size // 2,
                                               groups=dim_policy)
-        self.policy_pwconv_weight_layer = LinearBlock(dim_value + self.dim_dwconv, 
-                                                      dim_policy * 1,
-                                                      activation='none')
-        self.policy_pwconv_weight_layer_act = nn.PReLU(dim_policy * 1)
+        self.policy_pwconv_weight_layer = nn.Sequential(
+            LinearBlock(dim_value + self.dim_dwconv, dim_policy, activation='none'),
+            nn.PReLU(dim_policy),
+            LinearBlock(dim_policy, dim_policy, activation='none', bias=False),
+        )
         self.policy_activation = nn.PReLU(1)
 
         # value head
@@ -542,8 +543,7 @@ class Mix8Net(nn.Module):
         B, _, H, W = feature_self.shape
         policy = feature_self[:, :dim_policy]   # [B, dim_policy, H, W]
         policy = self.policy_dwconv(policy)     # [B, dim_policy, H, W]
-        pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy * 1]
-        pwconv_weight = self.policy_pwconv_weight_layer_act(pwconv_weight)
+        pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy]
         policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W), 
                           weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
                           groups=B).reshape(B, 1, H, W)
@@ -572,10 +572,8 @@ class Mix8Net(nn.Module):
         print(f"oppo value feature mean: \n{value_oppo}")
 
         # policy head
-        pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy * 1]
+        pwconv_weight = self.policy_pwconv_weight_layer(value_self) # [B, dim_policy]
         print(f"policy weight: \n{pwconv_weight}")
-        pwconv_weight = self.policy_pwconv_weight_layer_act(pwconv_weight)
-        print(f"policy weight after prelu: \n{pwconv_weight}")
 
         B, _, H, W = feature_self.shape
         policy = feature_self[:, :dim_policy]   # [B, dim_policy, H, W]
@@ -623,7 +621,7 @@ class Mix8Net(nn.Module):
             'min_weight': -4.0,
             'max_weight': 4.0,
         }, {
-            'params': ['policy_pwconv_weight_layer_act.weight'],
+            'params': ['policy_pwconv_weight_layer.1.weight'],
             'min_weight': -1.0,
             'max_weight': 1.0,
         }]
