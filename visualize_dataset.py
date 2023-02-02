@@ -14,6 +14,7 @@ def visualize_entry(fixed_side_input,
                     value_target=None,
                     last_move=None,
                     forbidden_point=None,
+                    raw_eval=None,
                     **kwargs):
     H, W = board_size[0]
     markersize = 300 / max(H, W)
@@ -22,6 +23,14 @@ def visualize_entry(fixed_side_input,
         board_input = torch.flip(board_input, dims=(1, ))
         value_target = torch.stack([value_target[:, 1], value_target[:, 0], value_target[:, 2]],
                                    dim=1)
+
+    if policy_target.ndim == 2:
+        pass_target = policy_target[:, -1]
+        policy_target = policy_target[:, :-1].reshape(-1, H, W)
+    elif policy_target.ndim == 3:
+        pass_target = None
+    else:
+        assert 0, f"Invalid policy_target, ndim={policy_target.ndim}"
 
     fig = plt.figure(figsize=[5, 5])
     fig.patch.set_facecolor((1, 1, 1))
@@ -79,13 +88,26 @@ def visualize_entry(fixed_side_input,
                             markeredgecolor='r',
                             markeredgewidth=3)
 
+    # plot pass move if exists
+    if pass_target is not None and pass_target[0] > 0:
+        ax.plot(W - 1,
+                -0.5,
+                'o',
+                markersize=markersize * 0.5,
+                markerfacecolor=[1, 0, 0, float(pass_target[0])**0.5],
+                markeredgecolor=(0, 0, 0),
+                markeredgewidth=0)
+        ax.text(W - 2.6, -0.66, '(pass)')
+
     texts = []
     if stm_input is not None:
         texts += [f'stm={stm_input[0].item()}({"white" if stm_input[0] > 0 else "black"})']
     if value_target is not None:
         texts += [f'vt={value_target[0].cpu().numpy()}(B/W/D)']
+    if raw_eval is not None and raw_eval[0] == raw_eval[0]:  # raw_eval is not nan
+        texts += [f'eval={raw_eval[0].cpu().numpy()}']
     if texts:
-        ax.text(0, -0.5, ' '.join(texts))
+        ax.text(0, -0.7, ' '.join(texts))
 
     plt.show()
 

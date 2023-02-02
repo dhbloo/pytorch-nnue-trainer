@@ -2,6 +2,15 @@ import numpy as np
 from enum import Enum
 
 
+class Result(Enum):
+    LOSS = 0
+    DRAW = 1
+    WIN = 2
+
+    def opposite(r):
+        return Result(2 - r.value)
+
+
 class Rule(Enum):
     FREESTYLE = 0
     STANDARD = 1

@@ -113,6 +113,7 @@ def calc_loss(loss_type,
     # reshape policy
     policy_target = torch.flatten(policy_target, start_dim=1)
     policy = torch.flatten(policy, start_dim=1)
+    assert policy_target.shape[1] == policy.shape[1]
 
     if kd_results is not None:
         # apply softmax to value and policy target according to temparature
@@ -129,6 +130,7 @@ def calc_loss(loss_type,
         value_target = value_target[:, 0] - value_target[:, 1]
         value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
 
+    # ===============================================================
     # value loss
     if value_loss_type == 'CE':
         if value.ndim == 1:
@@ -147,6 +149,7 @@ def calc_loss(loss_type,
     else:
         assert 0, f"Unsupported value loss: {value_loss_type}"
 
+    # ===============================================================
     # policy loss
 
     # check if there is loss weight for policy at each empty cells
@@ -169,6 +172,8 @@ def calc_loss(loss_type,
         policy_loss = torch.mean(policy_loss)
     else:
         assert 0, f"Unsupported policy loss: {policy_loss_type}"
+
+    # ===============================================================
 
     total_loss = value_loss + policy_loss
     loss_dict = {
