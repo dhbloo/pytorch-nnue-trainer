@@ -75,7 +75,7 @@ def build_dataset(dataset_type,
     rules = rules or ['freestyle', 'standard', 'renju']
     if boardsizes is None:
         if isinstance(boardsize, int):
-            boardsizes = [(boardsizes, boardsizes)]
+            boardsizes = [(boardsize, boardsize)]
         else:
             boardsizes = [(s, s) for s in range(11, 21)]
 

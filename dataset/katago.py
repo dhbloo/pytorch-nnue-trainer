@@ -13,6 +13,7 @@ class KatagoNumpyDataset(IterableDataset):
                  file_list,
                  boardsizes,
                  fixed_side_input,
+                 has_pass_move=False,
                  apply_symmetry=False,
                  shuffle=False,
                  sample_rate=1.0,
@@ -22,6 +23,7 @@ class KatagoNumpyDataset(IterableDataset):
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
@@ -64,10 +66,12 @@ class KatagoNumpyDataset(IterableDataset):
         assert bsize * bsize + 1 == n_cells
 
         # Channel 0: policy target this turn
-        policy_target_stm = packed_data[:, 0, :bsize * bsize].reshape(-1, bsize, bsize)
-        policy_sum = np.sum(policy_target_stm.astype(np.float32), axis=(1, 2)).reshape(-1, 1, 1)
+        policy_target_stm = packed_data[:, 0, :bsize * bsize + (1 if self.has_pass_move else 0)]
+        policy_sum = np.sum(policy_target_stm.astype(np.float32), axis=1, keepdims=True)
         policy_target_stm = policy_target_stm / (policy_sum + 1e-7)
-        return policy_target_stm
+        if not self.has_pass_move:
+            policy_target_stm = policy_target_stm.reshape(-1, bsize, bsize)
+        return policy_target_stm  # [H, W] or [H*W+1] (append pass at last channel)
 
     def _unpack_data(self, binaryInputNCHWPacked, globalInputNC, globalTargetsNC,
                      policyTargetsNCMove, **kwargs):
@@ -103,7 +107,13 @@ class KatagoNumpyDataset(IterableDataset):
             symmetries = Symmetry.available_symmetries(data['board_size'])
             picked_symmetry = np.random.choice(symmetries)
             data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
-            data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
+            if self.has_pass_move:
+                policy_target_sym = data['policy_target'][:-1].reshape((-1, *data['board_size']))
+                policy_target_sym = picked_symmetry.apply_to_array(policy_target_sym)
+                policy_target_sym = policy_target_sym.reshape((policy_target_sym.shape[0], -1))
+                data['policy_target'] = np.append([policy_target_sym, data['policy_target'][-1:]])
+            else:
+                data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
 
         return data
 
@@ -139,6 +149,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
                  file_list,
                  boardsizes,
                  fixed_side_input,
+                 has_pass_move=False,
                  apply_symmetry=False,
                  filter_stm=None,
                  **kwargs):
@@ -146,6 +157,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
 
         self.data_dict = {
@@ -163,10 +175,10 @@ class ProcessedKatagoNumpyDataset(Dataset):
             if data["bf"].shape[2:] not in self.boardsizes:
                 continue
 
-            for k, tensor in data.items():
-                if k in self.data_dict:
-                    assert len(tensor) > 0, f"Empty tensor {k} in file {filename}"
-                    self.data_dict[k].append(tensor)
+            for k in self.data_dict:
+                if k in data:
+                    assert len(data[k]) > 0, f"Empty tensor {k} in file {filename}"
+                    self.data_dict[k].append(data[k])
 
         # Concatenate tensors across files
         length_list = []
@@ -175,11 +187,13 @@ class ProcessedKatagoNumpyDataset(Dataset):
                 self.data_dict[k] = np.concatenate(tensor_list, axis=0)
             elif len(tensor_list) > 0:
                 self.data_dict[k] = tensor_list[0]
+            elif k == "gf":
+                continue  # allow tensor gf to be empty
             length_list.append(len(self.data_dict[k]))
 
         # Get length of dataset and assert length are equal for all keys
         self.length = length_list[0]
-        assert self.length > 0, "No valid data entry in dataset"
+        assert self.length > 0, f"No valid data entry in dataset: {self.file_list}"
         assert length_list.count(self.length) == len(length_list), \
                "Unequal length of data in npz file"
 
@@ -200,6 +214,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         return self.fixed_side_input
 
     def _filter_data_by_side_to_move(self, side_to_move):
+        assert len(self.data_dict['gf']) > 0, "No gf data in dataset"
         stm_inputs = self.data_dict['gf'][:, 0]
         selected_indices = np.nonzero(stm_inputs == side_to_move)[0]
 
@@ -217,11 +232,17 @@ class ProcessedKatagoNumpyDataset(Dataset):
             index = index % self.length
 
         data = {
-            'board_size': np.array(self.boardsize, dtype=np.int8),
-            'board_input': self.data_dict['bf'][index].astype(np.int8),
-            'stm_input': self.data_dict['gf'][index].astype(np.float32),
-            'value_target': self.data_dict['vt'][index].astype(np.float32),
-            'policy_target': self.data_dict['pt'][index].astype(np.float32),
+            'board_size':
+            np.array(self.boardsize, dtype=np.int8),
+            'board_input':
+            self.data_dict['bf'][index].astype(np.int8),
+            'stm_input':
+            self.data_dict['gf'][index].astype(np.float32)
+            if len(self.data_dict['gf']) > 0 else np.array([0], dtype=np.float32),
+            'value_target':
+            self.data_dict['vt'][index].astype(np.float32),
+            'policy_target':
+            self.data_dict['pt'][index].astype(np.float32),
         }
 
         # Flip side when stm is white
@@ -234,7 +255,13 @@ class ProcessedKatagoNumpyDataset(Dataset):
             symmetries = Symmetry.available_symmetries(self.boardsize)
             picked_symmetry = symmetries[sym_index]
             data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
-            data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
+            if self.has_pass_move:
+                policy_target_sym = data['policy_target'][:-1].reshape((-1, *data['board_size']))
+                policy_target_sym = picked_symmetry.apply_to_array(policy_target_sym)
+                policy_target_sym = policy_target_sym.reshape((policy_target_sym.shape[0], -1))
+                data['policy_target'] = np.append([policy_target_sym, data['policy_target'][-1:]])
+            else:
+                data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
 
         return data
 
