@@ -115,10 +115,18 @@ def debug_print(board, model, data):
         print(f'Raw Policy: \n{policy.cpu().numpy()}')
 
     # apply activation function
-    value = torch.softmax(value, dim=0)
+    if value.shape[0] == 1:
+        value = torch.sigmoid(value)
+    elif value.shape[0] == 3:
+        value = torch.softmax(value, dim=0)
+    else:
+        assert 0, f"Invalid value shape: {value.shape}"
     policy = torch.softmax(policy.flatten(), dim=0).reshape(policy.shape)
     with np.printoptions(precision=2, linewidth=120, suppress=True):
-        print(f'Softmaxed Value: {value.cpu().numpy()}')
+        if value.shape[0] == 1:
+            print(f'Sigmoided Value: {value.cpu().numpy()}')
+        elif value.shape[0] == 3:
+            print(f'Softmaxed Value: {value.cpu().numpy()}')
         print(f'Softmaxed Policy: \n{policy.cpu().numpy()}')
 
 

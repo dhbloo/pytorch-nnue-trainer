@@ -19,6 +19,11 @@ class BaseSerializer(ABC):
     def is_binary(self) -> bool:
         """Whether this serializer outputs binary data."""
         return True
+    
+    @property
+    def needs_header(self) -> bool:
+        """Whether binary header is needed before the serializer output."""
+        return self.is_binary
 
     def rule_mask(self, model) -> int:
         """Applicable rule for serialized weight file."""

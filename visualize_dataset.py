@@ -1,5 +1,6 @@
 from torch.utils.data.dataloader import DataLoader
 from dataset import build_dataset
+import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import configargparse
@@ -138,6 +139,7 @@ if __name__ == "__main__":
     parser.add('--shuffle', action='store_true', help="Shuffle dataset")
     args = parser.parse_args()
 
+    np.set_printoptions(precision=4)
     dataset = build_dataset(args.dataset_type,
                             args.data_paths,
                             shuffle=args.shuffle,

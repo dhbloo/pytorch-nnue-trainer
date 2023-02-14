@@ -26,11 +26,12 @@ class FlatNNUEv1(nn.Module):
                                  activation="none")
 
         # policy head
-        self.policy_key = nn.Sequential(
-            LinearBlock(dim_policy, dim_policy, activation="relu"),
-            LinearBlock(dim_policy, dim_policy, activation="none"),
-        )
-        self.policy_query = nn.Parameter(torch.randn(flat_board_size, dim_policy))
+        if dim_policy > 0:
+            self.policy_key = nn.Sequential(
+                LinearBlock(dim_policy, dim_policy, activation="relu"),
+                LinearBlock(dim_policy, dim_policy, activation="none"),
+            )
+            self.policy_query = nn.Parameter(torch.randn(flat_board_size, dim_policy))
 
         # value head
         self.value = nn.Sequential(
@@ -47,8 +48,13 @@ class FlatNNUEv1(nn.Module):
         feature = self.embed(input_plane.flatten(start_dim=1))  # [B, dim_embed]
 
         # policy head
-        policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
-        policy = torch.matmul(policy_key, self.policy_query.t())  # [B, flat_board_size]
+        if dim_policy > 0:
+            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
+            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, flat_board_size]
+        else:
+            policy = torch.zeros((feature.shape[0], self.flat_board_size),
+                                 dtype=feature.dtype,
+                                 device=feature.device)
 
         # value head
         value = self.value(feature[:, dim_policy:])  # [B, 3]
@@ -80,9 +86,15 @@ class LadderConvLayer(nn.Module):
 
 @MODELS.register('flat_ladder7x7_nnue_v1')
 class FlatLadder7x7NNUEv1(nn.Module):
-    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, input_type='basic-nostm'):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_policy=16,
+                 dim_value=32,
+                 input_type='basic-nostm',
+                 value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
+        self.value_no_draw = value_no_draw
         dim_mapping = dim_policy + dim_value
 
         self.input_plane = build_input_plane(input_type)
@@ -93,7 +105,10 @@ class FlatLadder7x7NNUEv1(nn.Module):
             LadderConvLayer(dim_middle, dim_middle),
             nn.Mish(inplace=True),
             Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
-            LadderConvLayer(dim_middle, dim_mapping),
+            LadderConvLayer(dim_middle, dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
         )
 
         # policy head
@@ -105,10 +120,12 @@ class FlatLadder7x7NNUEv1(nn.Module):
             self.policy_query = nn.Parameter(torch.randn(7 * 7, dim_policy))
 
         # value head
+        dim_vhead = 1 if value_no_draw else 3
         self.value_linears = nn.ModuleList([
             LinearBlock(dim_value, dim_value, activation="none"),
             LinearBlock(dim_value, dim_value, activation="none"),
-            LinearBlock(dim_value, 3, activation="none"),
+            LinearBlock(dim_value, dim_value, activation="none"),
+            LinearBlock(dim_value, dim_vhead, activation="none"),
         ])
 
     def get_feature_sum(self, data):
@@ -128,9 +145,9 @@ class FlatLadder7x7NNUEv1(nn.Module):
         for y0, y1, x0, x1, k in index:
             chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
             feat = torch.clamp(self.mapping(chunk), min=-1, max=127 / 128)
-            features.append(feat)
+            features.append(feat.squeeze(-1).squeeze(-1))
 
-        return torch.sum(torch.stack(features), dim=0).squeeze(-1).squeeze(-1)
+        return torch.sum(torch.stack(features), dim=0)
 
     def forward(self, data):
         _, dim_policy, _ = self.model_size
@@ -160,9 +177,9 @@ class FlatLadder7x7NNUEv1(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': ['value.0.weight', 'value.1.weight', 'value.2.weight'],
-                'min_weight': -128 / 64,
-                'max_weight': 127 / 64
+                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
+                'min_weight': -128 / 128,
+                'max_weight': 127 / 128
             },
         ]
 

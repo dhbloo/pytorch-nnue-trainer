@@ -143,7 +143,7 @@ def export_serialization(output, output_type, model_type, model, export_args, **
 
     with open_output(output) as f:
         # serialize header for binary weight format
-        if serializer.is_binary:
+        if serializer.needs_header:
             MAGIC = zlib.crc32(b'gomoku network weight version 1')  # 0xacd8cc6a
             arch_hash = serializer.arch_hash(model) & 0xffffffff
             rule_mask = serializer.rule_mask(model) & 0xffffffff
