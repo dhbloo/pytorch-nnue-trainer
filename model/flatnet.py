@@ -6,6 +6,7 @@ from collections import Iterable
 from . import MODELS
 from .blocks import LinearBlock, Conv2dBlock
 from .input import build_input_plane
+from utils.quant_utils import fake_quant
 
 
 @MODELS.register('flat_nnue_v1')
@@ -122,10 +123,10 @@ class FlatLadder7x7NNUEv1(nn.Module):
         # value head
         dim_vhead = 1 if value_no_draw else 3
         self.value_linears = nn.ModuleList([
-            LinearBlock(dim_value, dim_value, activation="none"),
-            LinearBlock(dim_value, dim_value, activation="none"),
-            LinearBlock(dim_value, dim_value, activation="none"),
-            LinearBlock(dim_value, dim_vhead, activation="none"),
+            LinearBlock(dim_value, dim_value, activation="none", quant=True),
+            LinearBlock(dim_value, dim_value, activation="none", quant=True),
+            LinearBlock(dim_value, dim_value, activation="none", quant=True),
+            LinearBlock(dim_value, dim_vhead, activation="none", quant=True),
         ])
 
     def get_feature_sum(self, data):
@@ -145,6 +146,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
         for y0, y1, x0, x1, k in index:
             chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
             feat = torch.clamp(self.mapping(chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
             features.append(feat.squeeze(-1).squeeze(-1))
 
         return torch.sum(torch.stack(features), dim=0)
@@ -170,6 +172,33 @@ class FlatLadder7x7NNUEv1(nn.Module):
         for layer in self.value_linears:
             value = torch.clamp(value, min=0, max=127 / 128)
             value = layer(value)
+
+        return value, policy
+
+    def forward_debug_print(self, data):
+        _, dim_policy, _ = self.model_size
+
+        # get feature sum from chunks
+        feature = self.get_feature_sum(data)  # [B, dim_mapping]
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # policy head
+        if dim_policy > 0:
+            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
+            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
+            policy = policy.view(-1, 7, 7)  # [B, 7, 7]
+        else:
+            policy = torch.zeros((feature.shape[0], 7, 7),
+                                 dtype=feature.dtype,
+                                 device=feature.device)
+
+        # value head
+        value = feature[:, dim_policy:]  # [B, dim_value]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=0, max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
 
         return value, policy
 

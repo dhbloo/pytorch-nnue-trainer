@@ -76,53 +76,53 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         feature_map = torch.clamp(feature_map, min=-1, max=127 / 128)
         feature_map = feature_map.view((3**10, dim_policy + dim_value)).cpu().numpy()
         ascii_hist("feature_map", feature_map)
-        feature_map = np.clip(feature_map * 128, -128, 127).astype(np.int8)
+        feature_map = np.clip(np.around(feature_map * 128), -128, 127).astype(np.int8)
         return feature_map
 
     def _export_value(self, model: FlatLadder7x7NNUEv1):
-        linear1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        linear1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        linear2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        linear2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        linear3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        linear3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-        linear4_weight = model.value_linears[3].fc.weight.cpu().numpy()
-        linear4_bias = model.value_linears[3].fc.bias.cpu().numpy()
+        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
+        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
+        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
+        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
+        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
+        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
+        l4_weight = model.value_linears[3].fc.weight.cpu().numpy()
+        l4_bias = model.value_linears[3].fc.bias.cpu().numpy()
 
-        ascii_hist("value: linear1_weight", linear1_weight)
-        ascii_hist("value: linear1_bias", linear1_bias)
-        ascii_hist("value: linear2_weight", linear2_weight)
-        ascii_hist("value: linear2_bias", linear2_bias)
-        ascii_hist("value: linear3_weight", linear3_weight)
-        ascii_hist("value: linear3_bias", linear3_bias)
-        ascii_hist("value: linear4_weight", linear4_weight)
-        ascii_hist("value: linear4_bias", linear4_bias)
+        ascii_hist("value: linear1_weight", l1_weight)
+        ascii_hist("value: linear1_bias", l1_bias)
+        ascii_hist("value: linear2_weight", l2_weight)
+        ascii_hist("value: linear2_bias", l2_bias)
+        ascii_hist("value: linear3_weight", l3_weight)
+        ascii_hist("value: linear3_bias", l3_bias)
+        ascii_hist("value: linear4_weight", l4_weight)
+        ascii_hist("value: linear4_bias", l4_bias)
 
-        assert int(linear1_weight.min() * self.s_weight) >= -128
-        assert int(linear1_weight.max() * self.s_weight) <= 127
-        assert int(linear2_weight.min() * self.s_weight) >= -128
-        assert int(linear2_weight.max() * self.s_weight) <= 127
-        assert int(linear3_weight.min() * self.s_weight) >= -128
-        assert int(linear3_weight.max() * self.s_weight) <= 127
-        assert int(linear4_weight.min() * self.s_output) >= -128
-        assert int(linear4_weight.max() * self.s_output) <= 127
+        assert int(l1_weight.min() * self.s_weight) >= -128
+        assert int(l1_weight.max() * self.s_weight) <= 127
+        assert int(l2_weight.min() * self.s_weight) >= -128
+        assert int(l2_weight.max() * self.s_weight) <= 127
+        assert int(l3_weight.min() * self.s_weight) >= -128
+        assert int(l3_weight.max() * self.s_weight) <= 127
+        assert int(l4_weight.min() * self.s_output) >= -128
+        assert int(l4_weight.max() * self.s_output) <= 127
 
         if model.value_no_draw:
-            linear4_weight = np.concatenate([linear4_weight, np.zeros((3, 128))], axis=0)
-            linear4_bias = np.concatenate([linear4_bias, np.zeros((3, ))], axis=0)
+            l4_weight = np.concatenate([l4_weight, np.zeros((3, 128))], axis=0)
+            l4_bias = np.concatenate([l4_bias, np.zeros((3, ))], axis=0)
         else:
-            linear4_weight = np.concatenate([linear4_weight, np.zeros((1, 128))], axis=0)
-            linear4_bias = np.concatenate([linear4_bias, np.zeros((1, ))], axis=0)
+            l4_weight = np.concatenate([l4_weight, np.zeros((1, 128))], axis=0)
+            l4_bias = np.concatenate([l4_bias, np.zeros((1, ))], axis=0)
 
         return (
-            np.clip(linear1_weight * self.s_weight, -128, 127).astype(np.int8),
-            np.clip(linear1_bias * self.s_weight * 128, -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(linear2_weight * self.s_weight, -128, 127).astype(np.int8),
-            np.clip(linear2_bias * self.s_weight * 128, -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(linear3_weight * self.s_weight, -128, 127).astype(np.int8),
-            np.clip(linear3_bias * self.s_weight * 128, -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(linear4_weight * self.s_output, -128, 127).astype(np.int8),
-            np.clip(linear4_bias * self.s_output * 128, -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l1_weight * self.s_weight), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * self.s_weight * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * self.s_weight * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
+            np.clip(np.around(l3_bias * self.s_weight * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l4_weight * self.s_output), -128, 127).astype(np.int8),
+            np.clip(np.around(l4_bias * self.s_output * 128), -2**31, 2**31 - 1).astype(np.int32),
         )
 
     def serialize(self, out: io.IOBase, model: FlatLadder7x7NNUEv1, device: torch.device):
