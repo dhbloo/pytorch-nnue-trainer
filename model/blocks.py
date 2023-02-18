@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from utils.quant_utils import fake_quant
 
 
 def build_activation_layer(activation):
@@ -43,7 +44,6 @@ def build_norm2d_layer(norm, norm_dim=None):
 
 
 class ClippedReLU(nn.Module):
-
     def __init__(self, inplace=False, max=1):
         super().__init__()
         self.inplace = inplace
@@ -57,7 +57,6 @@ class ClippedReLU(nn.Module):
 
 
 class ChannelWiseLeakyReLU(nn.Module):
-
     def __init__(self, dim, bias=True, bound=0):
         super().__init__()
         self.neg_slope = nn.Parameter(torch.ones(dim) * 0.5)
@@ -80,10 +79,27 @@ class ChannelWiseLeakyReLU(nn.Module):
 
 
 class LinearBlock(nn.Module):
-
-    def __init__(self, in_dim, out_dim, norm='none', activation='relu', bias=True):
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 norm='none',
+                 activation='relu',
+                 bias=True,
+                 quant=False,
+                 input_quant_scale=128,
+                 input_quant_bits=8,
+                 weight_quant_scale=128,
+                 weight_quant_bits=8,
+                 bias_quant_bits=32):
         super(LinearBlock, self).__init__()
         self.fc = nn.Linear(in_dim, out_dim, bias)
+        self.quant = quant
+        if quant:
+            self.input_quant_scale = input_quant_scale
+            self.input_quant_bits = input_quant_bits
+            self.weight_quant_scale = weight_quant_scale
+            self.weight_quant_bits = weight_quant_bits
+            self.bias_quant_bits = bias_quant_bits
 
         # initialize normalization
         norm_dim = out_dim
@@ -100,7 +116,16 @@ class LinearBlock(nn.Module):
         self.activation = build_activation_layer(activation)
 
     def forward(self, x):
-        out = self.fc(x)
+        if self.quant:
+            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
+            w = fake_quant(self.fc.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
+            b = fake_quant(self.fc.bias,
+                           self.weight_quant_scale * self.input_quant_scale,
+                           num_bits=self.bias_quant_bits)
+            out = F.linear(x, w, b)
+        else:
+            out = self.fc(x)
+
         if self.norm:
             out = self.norm(out)
         if self.activation:
@@ -109,7 +134,6 @@ class LinearBlock(nn.Module):
 
 
 class Conv2dBlock(nn.Module):
-
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -157,7 +181,6 @@ class Conv2dBlock(nn.Module):
 
 
 class Conv1dLine4Block(nn.Module):
-
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -221,7 +244,6 @@ class Conv1dLine4Block(nn.Module):
 
 
 class ResBlock(nn.Module):
-
     def __init__(self,
                  dim,
                  ks=3,
@@ -250,7 +272,6 @@ class ResBlock(nn.Module):
 
 
 class ActFirstResBlock(nn.Module):
-
     def __init__(self,
                  dim_in,
                  dim_out,

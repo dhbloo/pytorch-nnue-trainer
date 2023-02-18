@@ -41,12 +41,13 @@ def build_input_plane(input_type):
 
 
 class BasicInputPlane(nn.Module):
-    def __init__(self, with_stm=True):
+    def __init__(self, with_stm=True, self_channel_index=0, oppo_channel_index=1):
         super().__init__()
         self.with_stm = with_stm
+        self.selected_channels = [self_channel_index, oppo_channel_index]
 
     def forward(self, data):
-        board_input = data['board_input'].float()
+        board_input = data['board_input'][:, self.selected_channels].float()
         stm_input = data['stm_input'].float()
 
         if self.with_stm:

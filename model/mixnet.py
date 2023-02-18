@@ -612,13 +612,19 @@ class Mix8Net(nn.Module):
             'min_weight': -1.0,
             'max_weight': 1.0,
         }, {
-            'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -1.0,
-            'max_weight': 1.0,
+            'params':
+            [f'feature_dwconvs.{i}.conv.weight' for i in range(self.feature_kernel_multiplier)],
+            'min_weight':
+            -1.0,
+            'max_weight':
+            1.0,
         }, {
-            'params': ['feature_dwconv.conv.bias'],
-            'min_weight': -2.0,
-            'max_weight': 2.0,
+            'params':
+            [f'feature_dwconvs.{i}.conv.bias' for i in range(self.feature_kernel_multiplier)],
+            'min_weight':
+            -2.0,
+            'max_weight':
+            2.0,
         }, {
             'params': ['policy_dwconv.weight'],
             'min_weight': -1.0,

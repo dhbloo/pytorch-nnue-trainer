@@ -3,12 +3,12 @@ import os, sys
 sys.path.append(os.path.join(os.path.dirname(os.path.realpath(__file__)), '..'))
 
 from utils import sgf
-from dataset.packed_binary import *
-from utils.data_utils import Rule
+from utils.data_utils import Rule, Result, Move
+from dataset import simple_binary
+from tqdm import tqdm
 import argparse
 import os
 import lz4.frame
-from tqdm import tqdm
 
 
 def list_files_in_dir(dir, exts=None):
@@ -68,7 +68,7 @@ def write_game_entries(output_f, game, rule):
         result = result_bpov if side == 'B' else Result.opposite(result_bpov)
         move = convert_move(node.properties[side][0])
 
-        write_entry(output_f, result, boardsize, rule, move, position)
+        simple_binary.write_entry(output_f, result, boardsize, rule, move, position)
         #print(side, result, boardsize, move, position)
 
         entries_written += 1

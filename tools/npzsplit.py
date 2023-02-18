@@ -11,6 +11,7 @@ def npz_split():
     parser.add_argument('-o', '--outdir', type=str, help="Output directory")
     parser.add_argument('-s', '--splits', type=int, required=True, help="Number of splits")
     parser.add_argument('--shuffle', action='store_true', help="Shuffle data before saving")
+    parser.add_argument('--exclude_keys', type=str, nargs='+', help="Exclude keys from splitting")
     args = parser.parse_args()
 
     outdir = args.outdir or os.path.dirname(args.file)
@@ -23,20 +24,30 @@ def npz_split():
 
     data = np.load(args.file)
 
-    for key, array in data.items():
-        assert args.splits <= len(array), "splits must be less than length of data array"
-        if len(array) % args.splits != 0:
-            print(
-                f"Warning: array {key} of length {len(array)} is not divisible by splits {args.splits}",
-                file=sys.stderr)
+    # load data and print data overview
+    print(f"Data overview: {len(data)} arrays")
+    data_to_split = {}
+    for key in data:
+        if args.exclude_keys and key in args.exclude_keys:
+            print(f"{key}: (excluded)")
+            continue
+        print(f"{key}: {data[key].shape} {data[key].dtype}")
+        assert args.splits <= len(data[key]), "splits must be less than length of data array"
+        if len(data[key]) % args.splits != 0:
+            print(f"Warning: array {key} of length {len(data[key])} "
+                  f"is not divisible by splits {args.splits}")
+        data_to_split[key] = data[key]
+    print()
 
+    # shuffle data array if requested
     if args.shuffle:
-        for array in data.values():
+        for key, array in data_to_split.items():
             np.random.shuffle(array)
 
+    # split data and save
     for idx in tqdm(range(args.splits)):
         data_chunk = {}
-        for key, array in data.items():
+        for key, array in data_to_split.items():
             data_chunk[key] = array[idx::args.splits]
         np.savez_compressed(make_filename(idx), **data_chunk)
 
