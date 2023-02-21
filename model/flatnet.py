@@ -123,10 +123,10 @@ class FlatLadder7x7NNUEv1(nn.Module):
         # value head
         dim_vhead = 1 if value_no_draw else 3
         self.value_linears = nn.ModuleList([
-            LinearBlock(dim_value, dim_value, activation="none", quant=True),
-            LinearBlock(dim_value, dim_value, activation="none", quant=True),
-            LinearBlock(dim_value, dim_value, activation="none", quant=True),
-            LinearBlock(dim_value, dim_vhead, activation="none", quant=True),
+            LinearBlock(dim_value, 32, activation="none", quant=True),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, dim_vhead, activation="none", quant=True),
         ])
 
     def get_feature_sum(self, data):

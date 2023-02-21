@@ -20,13 +20,13 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         int8_t  mapping[59049][ValueDim];
 
         // nnue layers weights
-        int8_t  l1_weight[ValueDim][ValueDim];
-        int32_t l1_bias[ValueDim];
-        int8_t  l2_weight[ValueDim][ValueDim];
-        int32_t l2_bias[ValueDim];
-        int8_t  l3_weight[ValueDim][ValueDim];
-        int32_t l3_bias[ValueDim];
-        int8_t  l4_weight[4][ValueDim];
+        int8_t  l1_weight[32][ValueDim];
+        int32_t l1_bias[32];
+        int8_t  l2_weight[32][32];
+        int32_t l2_bias[32];
+        int8_t  l3_weight[32][32];
+        int32_t l3_bias[32];
+        int8_t  l4_weight[4][32];
         int32_t l4_bias[4];
     };
     """
@@ -108,10 +108,10 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         assert int(l4_weight.max() * self.s_output) <= 127
 
         if model.value_no_draw:
-            l4_weight = np.concatenate([l4_weight, np.zeros((3, 128))], axis=0)
+            l4_weight = np.concatenate([l4_weight, np.zeros((3, 32))], axis=0)
             l4_bias = np.concatenate([l4_bias, np.zeros((3, ))], axis=0)
         else:
-            l4_weight = np.concatenate([l4_weight, np.zeros((1, 128))], axis=0)
+            l4_weight = np.concatenate([l4_weight, np.zeros((1, 32))], axis=0)
             l4_bias = np.concatenate([l4_bias, np.zeros((1, ))], axis=0)
 
         return (
@@ -137,22 +137,22 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         # int8_t  mapping[59049][ValueDim];
         o.write(feature_map.astype('<i1').tobytes())  # (59049, 128)
 
-        # float l1_weight[ValueDim][ValueDim];
-        # float l1_bias[ValueDim];
-        o.write(linear1_weight.astype('<i1').tobytes())  # (128, 128)
-        o.write(linear1_bias.astype('<i4').tobytes())  # (128,)
+        # float l1_weight[32][ValueDim];
+        # float l1_bias[32];
+        o.write(linear1_weight.astype('<i1').tobytes())  # (32, 128)
+        o.write(linear1_bias.astype('<i4').tobytes())  # (32,)
 
-        # float l2_weight[ValueDim][ValueDim];
-        # float l2_bias[ValueDim];
-        o.write(linear2_weight.astype('<i1').tobytes())  # (128, 128)
-        o.write(linear2_bias.astype('<i4').tobytes())  # (128,)
+        # float l2_weight[32][32];
+        # float l2_bias[32];
+        o.write(linear2_weight.astype('<i1').tobytes())  # (32, 32)
+        o.write(linear2_bias.astype('<i4').tobytes())  # (32,)
 
-        # float l3_weight[ValueDim][ValueDim];
-        # float l3_bias[ValueDim];
-        o.write(linear3_weight.astype('<i1').tobytes())  # (128, 128)
-        o.write(linear3_bias.astype('<i4').tobytes())  # (128,)
+        # float l3_weight[32][32];
+        # float l3_bias[32];
+        o.write(linear3_weight.astype('<i1').tobytes())  # (32, 32)
+        o.write(linear3_bias.astype('<i4').tobytes())  # (32,)
 
-        # float l4_weight[4][ValueDim];
+        # float l4_weight[4][32];
         # float l4_bias[4];
-        o.write(linear4_weight.astype('<i1').tobytes())  # (4, 128)
+        o.write(linear4_weight.astype('<i1').tobytes())  # (4, 32)
         o.write(linear4_bias.astype('<i4').tobytes())  # (4,)
