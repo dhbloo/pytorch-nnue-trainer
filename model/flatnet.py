@@ -133,18 +133,21 @@ class FlatLadder7x7NNUEv1(nn.Module):
         input_plane = self.input_plane(data)  # [B, C, H, W]
 
         index = [
-            [0, 4, 0, 4, 0],
-            [0, 4, 0, 4, 2],
-            [0, 4, 3, 7, 1],
-            [0, 4, 3, 7, -1],
-            [3, 7, 3, 7, 2],
-            [3, 7, 3, 7, 0],
-            [3, 7, 0, 4, -1],
-            [3, 7, 0, 4, 1],
+            [0, 4, 0, 4, 0, False],
+            [0, 4, 0, 4, 0, True],
+            [0, 4, 3, 7, 1, False],
+            [0, 4, 3, 7, -1, True],
+            [3, 7, 3, 7, 2, False],
+            [3, 7, 3, 7, 2, True],
+            [3, 7, 0, 4, -1, False],
+            [3, 7, 0, 4, 1, True],
         ]
         features = []
-        for y0, y1, x0, x1, k in index:
-            chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
+        for y0, y1, x0, x1, k, t in index:
+            chunk = input_plane[:, :, y0:y1, x0:x1]
+            if t:
+                chunk = torch.transpose(chunk, 2, 3)
+            chunk = torch.rot90(chunk, k, (2, 3))
             feat = torch.clamp(self.mapping(chunk), min=-1, max=127 / 128)
             feat = fake_quant(feat, scale=128)
             features.append(feat.squeeze(-1).squeeze(-1))
@@ -216,3 +219,153 @@ class FlatLadder7x7NNUEv1(nn.Module):
     def name(self):
         m, p, v = self.model_size
         return f"flat_ladder7x7_nnue_v1_{m}m{p}p{v}v"
+
+
+@MODELS.register('flat_ladder7x7_nnue_v2')
+class FlatLadder7x7NNUEv2(nn.Module):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_policy=16,
+                 dim_value=32,
+                 input_type='basic-nostm',
+                 value_no_draw=False):
+        super().__init__()
+        self.model_size = (dim_middle, dim_policy, dim_value)
+        self.value_no_draw = value_no_draw
+        self.input_plane = build_input_plane(input_type)
+        self.mapping1 = self._make_ladder_mapping(dim_middle, dim_policy + dim_value)
+        self.mapping2 = self._make_ladder_mapping(dim_middle, dim_policy + dim_value)
+
+        # policy head
+        if dim_policy > 0:
+            self.policy_key = nn.Sequential(
+                LinearBlock(dim_policy, dim_policy, activation="relu"),
+                LinearBlock(dim_policy, dim_policy, activation="none"),
+            )
+            self.policy_query = nn.Parameter(torch.randn(7 * 7, dim_policy))
+
+        # value head
+        dim_vhead = 1 if value_no_draw else 3
+        self.value_linears = nn.ModuleList([
+            LinearBlock(dim_value, 32, activation="none", quant=True),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, dim_vhead, activation="none", quant=True),
+        ])
+
+    def _make_ladder_mapping(self, dim_middle, dim_mapping):
+        return nn.Sequential(
+            LadderConvLayer(self.input_plane.dim_plane, dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            LadderConvLayer(dim_middle, dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            LadderConvLayer(dim_middle, dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
+        )
+
+    def get_feature_sum(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        features = []
+
+        mapping1_index = [
+            [0, 4, 0, 4, 0, False],
+            [0, 4, 0, 4, 0, True],
+            [0, 4, 3, 7, 1, False],
+            [0, 4, 3, 7, -1, True],
+            [3, 7, 3, 7, 2, False],
+            [3, 7, 3, 7, 2, True],
+            [3, 7, 0, 4, -1, False],
+            [3, 7, 0, 4, 1, True],
+        ]
+        for y0, y1, x0, x1, k, t in mapping1_index:
+            chunk = input_plane[:, :, y0:y1, x0:x1]
+            if t:
+                chunk = torch.transpose(chunk, 2, 3)
+            chunk = torch.rot90(chunk, k, (2, 3))
+            feat = torch.clamp(self.mapping1(chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
+            features.append(feat.squeeze(-1).squeeze(-1))
+
+        mapping2_index = [
+            [0, 4, 0, 4, 1],
+            [0, 4, 3, 7, 2],
+            [3, 7, 3, 7, -1],
+            [3, 7, 0, 4, 0],
+        ]
+        for y0, y1, x0, x1, k in mapping2_index:
+            chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
+            feat = torch.clamp(self.mapping2(chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
+            features.append(feat.squeeze(-1).squeeze(-1))
+
+        return torch.sum(torch.stack(features), dim=0)
+
+    def forward(self, data):
+        _, dim_policy, _ = self.model_size
+
+        # get feature sum from chunks
+        feature = self.get_feature_sum(data)  # [B, dim_mapping]
+
+        # policy head
+        if dim_policy > 0:
+            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
+            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
+            policy = policy.view(-1, 7, 7)  # [B, 7, 7]
+        else:
+            policy = torch.zeros((feature.shape[0], 7, 7),
+                                 dtype=feature.dtype,
+                                 device=feature.device)
+
+        # value head
+        value = feature[:, dim_policy:]  # [B, dim_value]
+        for layer in self.value_linears:
+            value = torch.clamp(value, min=0, max=127 / 128)
+            value = layer(value)
+
+        return value, policy
+
+    def forward_debug_print(self, data):
+        _, dim_policy, _ = self.model_size
+
+        # get feature sum from chunks
+        feature = self.get_feature_sum(data)  # [B, dim_mapping]
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # policy head
+        if dim_policy > 0:
+            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
+            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
+            policy = policy.view(-1, 7, 7)  # [B, 7, 7]
+        else:
+            policy = torch.zeros((feature.shape[0], 7, 7),
+                                 dtype=feature.dtype,
+                                 device=feature.device)
+
+        # value head
+        value = feature[:, dim_policy:]  # [B, dim_value]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=0, max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
+
+        return value, policy
+
+    @property
+    def weight_clipping(self):
+        return [
+            {
+                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
+                'min_weight': -128 / 128,
+                'max_weight': 127 / 128
+            },
+        ]
+
+    @property
+    def name(self):
+        m, p, v = self.model_size
+        return f"flat_ladder7x7_nnue_v2_{m}m{p}p{v}v"
