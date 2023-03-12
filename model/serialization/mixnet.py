@@ -1170,7 +1170,12 @@ class Mix8NetSerializer(BaseSerializer):
         hash ^= crc32(model.input_type.encode('utf-8'))
         hash ^= crc32(model.feature_kernel_size.to_bytes(4, 'little'))
         hash ^= crc32(model.policy_kernel_size.to_bytes(4, 'little'))
-        hash ^= (1 << 24) | (model.dim_dwconv << 16) | (dim_policy << 8) | dim_value
+        print(f"Mix8 ArchHashBase: {hex(hash)}")
+        hash ^= (1 << 24) \
+              | ((model.feature_kernel_multiplier.bit_length() - 1) << 20) \
+              | ((model.dim_dwconv.bit_length() - 1) << 16) \
+              | ((dim_policy.bit_length() - 1) << 8) \
+              | (dim_value.bit_length() - 1)
         return hash
 
     def _export_map_table(self, model: Mix8Net, device, line, stm=None):
