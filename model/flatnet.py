@@ -369,3 +369,196 @@ class FlatLadder7x7NNUEv2(nn.Module):
     def name(self):
         m, p, v = self.model_size
         return f"flat_ladder7x7_nnue_v2_{m}m{p}p{v}v"
+
+
+@MODELS.register('flat_ladder7x7_nnue_v3')
+class FlatLadder7x7NNUEv3(nn.Module):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_global_feature=128,
+                 dim_conv_feature=32,
+                 input_type='basic-nostm',
+                 value_no_draw=False):
+        super().__init__()
+        self.model_size = (dim_middle, dim_global_feature, dim_conv_feature)
+        self.value_no_draw = value_no_draw
+        self.input_plane = build_input_plane(input_type)
+        self.mapping1 = self._make_ladder_mapping(dim_middle, dim_global_feature)
+        self.mapping2 = self._make_ladder_mapping(dim_middle, dim_global_feature)
+        self.convs = self._make_conv3x3_mappings(25, dim_middle, dim_conv_feature)
+
+        # value head
+        dim_vhead = 1 if value_no_draw else 3
+        self.value_linears = nn.ModuleList([
+            LinearBlock(dim_global_feature + dim_conv_feature, 32, activation="none", quant=True),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, dim_vhead, activation="none", quant=True),
+        ])
+
+    def _make_ladder_mapping(self, dim_middle, dim_mapping):
+        return nn.Sequential(
+            LadderConvLayer(self.input_plane.dim_plane, dim_middle),
+            nn.BatchNorm2d(dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            LadderConvLayer(dim_middle, dim_middle),
+            nn.BatchNorm2d(dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            LadderConvLayer(dim_middle, dim_middle),
+            nn.BatchNorm2d(dim_middle),
+            nn.Mish(inplace=True),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
+        )
+
+    def _make_conv3x3_mappings(self, num_conv, dim_middle, dim_mapping):
+        conv_list = nn.ModuleList()
+        for _ in range(num_conv):
+            conv_list.append(
+                nn.Sequential(
+                    Conv2dBlock(self.input_plane.dim_plane,
+                                dim_middle,
+                                ks=2,
+                                st=1,
+                                norm="bn",
+                                activation="mish"),
+                    Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
+                ))
+        return conv_list
+
+    def get_phase_plane(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        empty_plane = (input_plane[:, 0] + input_plane[:, 1]) != 0
+        empty_count = torch.sum(empty_plane, dim=(1, 2))  # [B]
+        phase = torch.div(49 - empty_count, 49.0)  # [B]
+        x = phase * 2 - 1  # scale [0,1] to [-1,1]
+        return x[:, None, None, None].expand(-1, -1, 7, 7)  # [B, 1, 7, 7]
+
+    def get_feature_sum(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        features = []
+        conv_features = []
+
+        mapping1_index = [
+            [0, 4, 0, 4, 0, False],
+            [0, 4, 0, 4, 0, True],
+            [0, 4, 3, 7, 1, False],
+            [0, 4, 3, 7, -1, True],
+            [3, 7, 3, 7, 2, False],
+            [3, 7, 3, 7, 2, True],
+            [3, 7, 0, 4, -1, False],
+            [3, 7, 0, 4, 1, True],
+        ]
+        for y0, y1, x0, x1, k, t in mapping1_index:
+            chunk = input_plane[:, :, y0:y1, x0:x1]
+            if t:
+                chunk = torch.transpose(chunk, 2, 3)
+            chunk = torch.rot90(chunk, k, (2, 3))
+            feat = torch.clamp(self.mapping1(chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
+            features.append(feat.squeeze(-1).squeeze(-1))
+
+        mapping2_index = [
+            [0, 4, 0, 4, 1],
+            [0, 4, 3, 7, 2],
+            [3, 7, 3, 7, -1],
+            [3, 7, 0, 4, 0],
+        ]
+        for y0, y1, x0, x1, k in mapping2_index:
+            chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
+            feat = torch.clamp(self.mapping2(chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
+            features.append(feat.squeeze(-1).squeeze(-1))
+
+        conv_index = [
+            # line 1
+            [0, 0, False],
+            [1, 0, False],
+            [2, 0, False],
+            [1, -1, True],
+            [0, -1, False],
+            # line 2
+            [1, 0, False],
+            [3, 0, False],
+            [4, 0, False],
+            [3, -1, False],
+            [1, -1, True],
+            # line 3
+            [2, -1, False],
+            [4, -1, False],
+            [5, 0, False],
+            [4, 1, False],
+            [2, 1, False],
+            # line 4
+            [1, -1, False],
+            [3, -1, False],
+            [4, 2, False],
+            [3, 2, False],
+            [1, 2, True],
+            # line 5
+            [0, -1, False],
+            [1, 1, True],
+            [2, 2, False],
+            [1, 2, False],
+            [0, 2, False],
+        ]
+        for (y, x), (conv_idx, k, t) in zip([(y, x) for y in range(0, 5) for x in range(0, 5)],
+                                            conv_index):
+            chunk = input_plane[:, :, y:y + 3, x:x + 3]
+            if t:
+                chunk = torch.transpose(chunk, 2, 3)
+            chunk = torch.rot90(chunk, k, (2, 3))
+            feat = torch.clamp(self.convs[conv_idx](chunk), min=-1, max=127 / 128)
+            feat = fake_quant(feat, scale=128)
+            conv_features.append(feat.squeeze(-1).squeeze(-1))
+
+        global_feature = torch.sum(torch.stack(features), dim=0)
+        conv_feature = torch.sum(torch.stack(conv_features), dim=0)
+        return torch.cat([global_feature, conv_feature], dim=1)
+
+    def forward(self, data):
+        # get feature sum from chunks
+        feature = self.get_feature_sum(data)
+
+        # value head
+        value = feature  # [B, dim_mapping]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            value = layer(value)
+
+        policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
+        return value, policy
+
+    def forward_debug_print(self, data):
+        # get feature sum from chunks
+        feature = self.get_feature_sum(data)
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # value head
+        value = feature
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=0, max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
+
+        policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
+        return value, policy
+
+    @property
+    def weight_clipping(self):
+        return [
+            {
+                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
+                'min_weight': -128 / 128,
+                'max_weight': 127 / 128
+            },
+        ]
+
+    @property
+    def name(self):
+        m, gf, cf = self.model_size
+        return f"flat_ladder7x7_nnue_v3_{m}m{gf}gf{cf}cf"
