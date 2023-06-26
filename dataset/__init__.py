@@ -64,7 +64,7 @@ def build_dataset(dataset_type,
                   shuffle=False,
                   pipeline_args=None,
                   **kwargs):
-    assert dataset_type in DATASETS
+    assert dataset_type in DATASETS, f'Unknown dataset type: {dataset_type}'
     dataset_cls = DATASETS[dataset_type]
 
     if dataset_cls == MultiIterativeDataset:

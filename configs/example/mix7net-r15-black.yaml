@@ -1,0 +1,48 @@
+# An example config of training a mix7nnue model for Black side with renju 15 dataset
+
+# Path to save running logs and checkpoints
+# It is recommended to briefly record the config of the network in the rundir name
+rundir: run_dirs/mix7/basicns128m32p64v32d-r15-black
+
+# Dataset configs
+
+# For example, if you have a processed katago dataset (.npz files)
+dataset_type: iterative_processed_katago_numpy
+# Or you have a packed binary dataset (.binpack files) produced by c-gomoku-cli sampling mode
+# dataset_type: packed_binary
+
+dataset_args:
+  sample_rate: 1
+  apply_symmetry: true
+  filter_stm: -1  # -1 for black side, and 1 for white side
+
+# Path to the splited dataset directory
+# For example, if you have dataset files in data/r15/train and data/r15/val
+train_datas:
+- data/r15/train
+val_datas:
+- data/r15/val
+
+# Model configs
+
+model_type: mix7
+model_args:
+  dim_middle: 128
+  dim_policy: 32
+  dim_value: 64
+  dim_dwconv: 32
+  input_type: basic-nostm
+
+
+# Training configs
+
+batch_size: 512
+iterations: 1000000
+save_interval: 20000
+learning_rate: 0.001
+clip_grad_norm: 1.0
+
+lr_scheduler_type: step
+lr_scheduler_args:
+  step_size: 100000
+  step_gamma: 0.9

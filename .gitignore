@@ -156,3 +156,10 @@ run_dirs
 run_dirs/**
 data
 data/**
+
+
+# Config files
+configs
+!configs/
+configs/*
+!configs/example

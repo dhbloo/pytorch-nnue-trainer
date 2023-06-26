@@ -4,15 +4,15 @@
 
 ### Requirements
 
-+ 64-bit Python 3.8 and Pytorch 1.10 or later.
-+ Accelerate 0.6.2 or later.
-+ Other python libraries: `configargparse tqdm tensorboardX matplotlib pybind11 `.
++ 64-bit Python 3.9 and Pytorch 1.10 or later.
++ Huggingface Accelerate 0.6.2 or later.
++ Other python libraries: `configargparse tqdm tensorboard matplotlib pybind11 lz4`.
 
-### Setup
+### Setup dataset pipeline 
 
-After install all required packages in specified in requirements, it is needed to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup c++ compiling environment. Then do the following commands.
+After install all required packages in specified in requirements, it is necessary to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup the C++ compiling environment. Then install the dataset pipelines by doing the following commands.
 
-+ Line Encoding:
++ Line Encoding: Fast line encoding for transforming board features.
 
   ```bash
   cd dataset/pipeline/line_encoding_cpp
@@ -20,37 +20,47 @@ After install all required packages in specified in requirements, it is needed t
   python setup.py install
   ```
 
++ Forbidden Point (optional): Finding forbidden points for Renju rule. Can be skipped if you don't need to train a network for Renju rule.
+
+  ```bash
+  cd dataset/pipeline/forbidden_point_cpp
+  python setup.py build
+  python setup.py install
+  ```
+
 ### Train a network
 
-We recommend to launch from the accelerate-cli, which automatically handles settings for distributed training. But first of all, you need to configurate the training environment:
+You are recommended to launch from the accelerate-cli, which automatically handles settings for distributed training. But first of all, you need to configurate the training environment:
 
 ```
 accelerate config
 ```
 
-All configs about training can be directly specified from command line, for example:
+All configs about training can be directly specified from command line. For example, suppose you have a unprocessed katago selfplay dataset in folder `./data`, and you want to train a `mix6` network with specific model arguments, you can run the following command:
 
 ```bash
-accelerate launch train.py -r runs/01 --dataset_type katago_numpy --model_type mix6 --model_args "{dim_middle: 128, dim_policy: 32, dim_value: 32, input_type: basic}" -d ./data --batch_size 256 --iterations 1000000
+accelerate launch train.py -r run_dirs/run01 -d ./data --dataset_type katago_numpy --model_type mix6 --model_args "{dim_middle: 128, dim_policy: 32, dim_value: 32, input_type: basic}" --batch_size 256 --iterations 1000000
 ```
 
-Config can also be specified in a yaml file, which can be passed into command line:
+Configs can also be specified in a yaml file to be reused for multiple runs, which can be passed in command line using `-c` flag. For example, if you have a config file `configs/train_config.yaml`, you can run the following command:
 
 ```bash
 accelerate launch train.py -c configs/train_config.yaml
 ```
 
+Examples of config file can be found in `configs/example`.
+
 #### Resuming from a checkpoint
 
-Training config is saved to `run_config.yaml` under the running directory. When resuming from an interrupted run, just pass the config to the trainer. The trainer will automatically find the last checkpoint and resume from it.
+Training config is saved to `run_config.yaml` under the running directory. When resuming from an interrupted run, just pass the config to the trainer. The trainer will automatically find the last checkpoint and resume from it. For example, if you have a run directory at `run_dirs/run01` and want to resume from it, you can run the following command:
 
 ```bash
-accelerate launch train.py -c rundir/run_config.yaml
+accelerate launch train.py -c run_dirs/run01/run_config.yaml
 ```
 
 #### Train on the CPU
 
-By defaults, accelerate uses GPU for training. However if you want to use CPU, pass `--use_cpu` to the trainer.
+By defaults, accelerate uses GPU for training. However if you want to use CPU only, pass `--use_cpu` to the trainer.
 
 ```bash
 accelerate launch train.py --use_cpu [other options...]
@@ -86,15 +96,27 @@ Export to ONNX:
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type onnx -d <path to dataset>
 ```
 
-Export to (lz4 compressed) serialized binary:
+Export to (lz4 compressed) serialized binary to be used in Rapfi:
 
 ```bash
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type serialization-lz4 --export_args "{[extra export options]...}"
 ```
 
+Note that some NNUE serializer requires specifying exporting arguments, such as rule (options are `freestyle`, `standard`, `renju`), board size (usually a number between 5 and 22), etc. For example, to export a binary network file of `mix7` NNUE for Renju rule and 15x15 board size, you can run the following command:
+
+```bash
+python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type serialization-lz4 --export_args "{rule: renju, board_size: 15}"
+```
+
 ### Visualize a dataset
 
-A simple tool is provided to inspect a dataset. For example, to view a packed binary file:
+A simple tool is provided to inspect a dataset. For example, to view a processed katago dataset file (`.npz`):
+
+```bash
+python visualize_dataset.py --dataset_type processed_katago_numpy <path to data file>
+```
+
+Or to view a packed binary dataset file (`.binpack`) produced by [c-gomoku-cli](https://github.com/dhbloo/c-gomoku-cli):
 
 ```bash
 python visualize_dataset.py --dataset_type packed_binary <path to data file>
