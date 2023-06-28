@@ -9,9 +9,16 @@ from torch.utils.data.dataloader import DataLoader
 
 
 def weights_init(init_type):
+    '''Generate a init function given a init type'''
     def init_fun(m):
         classname = m.__class__.__name__
-        if (classname.find('Conv') == 0 or classname.find('Linear') == 0) and hasattr(m, 'weight'):
+        # First we check if the layer has custom init method.
+        # If so, we just call it without our uniform initialization.
+        if hasattr(m, 'custom_init'):
+            m.custom_init()
+        # Call our unifrom initialization methods for all Conv and Linear layers
+        elif (classname.startswith('Conv') or classname.startswith('Linear')) \
+            and hasattr(m, 'weight'):
             if init_type == 'gaussian':
                 init.normal_(m.weight.data, 0.0, 0.02)
             elif init_type == 'xavier':
@@ -26,8 +33,12 @@ def weights_init(init_type):
                 pass
             else:
                 assert 0, f"Unsupported initialization: {init_type}"
+                
             if hasattr(m, 'bias') and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
+
+        if hasattr(m, 'post_init'):
+            m.post_init()
 
     return init_fun
 

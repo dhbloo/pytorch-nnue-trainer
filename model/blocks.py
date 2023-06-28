@@ -44,6 +44,7 @@ def build_norm2d_layer(norm, norm_dim=None):
 
 
 class ClippedReLU(nn.Module):
+
     def __init__(self, inplace=False, max=1):
         super().__init__()
         self.inplace = inplace
@@ -57,6 +58,7 @@ class ClippedReLU(nn.Module):
 
 
 class ChannelWiseLeakyReLU(nn.Module):
+
     def __init__(self, dim, bias=True, bound=0):
         super().__init__()
         self.neg_slope = nn.Parameter(torch.ones(dim) * 0.5)
@@ -78,7 +80,40 @@ class ChannelWiseLeakyReLU(nn.Module):
         return x
 
 
+class QuantPReLU(nn.PReLU):
+
+    def __init__(self,
+                 num_parameters: int = 1,
+                 init: float = 0.25,
+                 input_quant_scale=128,
+                 input_quant_bits=8,
+                 weight_quant_scale=128,
+                 weight_quant_bits=8,
+                 weight_signed=True):
+        super().__init__(num_parameters, init)
+        self.input_quant_scale = input_quant_scale
+        self.input_quant_bits = input_quant_bits
+        self.weight_quant_scale = weight_quant_scale
+        self.weight_quant_bits = weight_quant_bits
+        self.weight_signed = weight_signed
+
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        input = fake_quant(
+            input,
+            self.input_quant_scale,
+            num_bits=self.input_quant_bits,
+        )
+        weight = fake_quant(
+            self.weight,
+            self.weight_quant_scale,
+            num_bits=self.weight_quant_bits,
+            signed=self.weight_signed,
+        )
+        return F.prelu(input, weight)
+
+
 class LinearBlock(nn.Module):
+
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -119,10 +154,13 @@ class LinearBlock(nn.Module):
         if self.quant:
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
             w = fake_quant(self.fc.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
-            b = fake_quant(self.fc.bias,
-                           self.weight_quant_scale * self.input_quant_scale,
-                           num_bits=self.bias_quant_bits)
-            out = F.linear(x, w, b)
+            if self.fc.bias is not None:
+                b = fake_quant(self.fc.bias,
+                               self.weight_quant_scale * self.input_quant_scale,
+                               num_bits=self.bias_quant_bits)
+                out = F.linear(x, w, b)
+            else:
+                out = F.linear(x, w)
         else:
             out = self.fc(x)
 
@@ -134,6 +172,7 @@ class LinearBlock(nn.Module):
 
 
 class Conv2dBlock(nn.Module):
+
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -147,7 +186,14 @@ class Conv2dBlock(nn.Module):
                  dilation=1,
                  groups=1,
                  activation_first=False,
-                 use_spectral_norm=False):
+                 use_spectral_norm=False,
+                 quant=False,
+                 input_quant_scale=128,
+                 input_quant_bits=8,
+                 weight_quant_scale=128,
+                 weight_quant_bits=8,
+                 bias_quant_scale=None,
+                 bias_quant_bits=32):
         super(Conv2dBlock, self).__init__()
         assert pad_type in ['zeros', 'reflect', 'replicate',
                             'circular'], f"Unsupported padding mode: {pad_type}"
@@ -169,10 +215,31 @@ class Conv2dBlock(nn.Module):
         if use_spectral_norm:
             self.conv = nn.utils.spectral_norm(self.conv)
 
+        self.quant = quant
+        if quant:
+            assert self.conv.padding_mode == 'zeros', "quant conv requires zero padding"
+            self.input_quant_scale = input_quant_scale
+            self.input_quant_bits = input_quant_bits
+            self.weight_quant_scale = weight_quant_scale
+            self.weight_quant_bits = weight_quant_bits
+            self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
+            self.bias_quant_bits = bias_quant_bits
+
     def forward(self, x):
         if self.activation and self.activation_first:
             x = self.activation(x)
-        x = self.conv(x)
+        if self.quant:
+            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
+            w = fake_quant(self.conv.weight,
+                           self.weight_quant_scale,
+                           num_bits=self.weight_quant_bits)
+            b = self.conv.bias
+            if b is not None:
+                b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
+            x = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation,
+                         self.conv.groups)
+        else:
+            x = self.conv(x)
         if self.norm:
             x = self.norm(x)
         if self.activation and not self.activation_first:
@@ -181,6 +248,7 @@ class Conv2dBlock(nn.Module):
 
 
 class Conv1dLine4Block(nn.Module):
+
     def __init__(self,
                  in_dim,
                  out_dim,
@@ -192,7 +260,14 @@ class Conv1dLine4Block(nn.Module):
                  bias=True,
                  dilation=1,
                  groups=1,
-                 activation_first=False):
+                 activation_first=False,
+                 quant=False,
+                 input_quant_scale=128,
+                 input_quant_bits=8,
+                 weight_quant_scale=128,
+                 weight_quant_bits=8,
+                 bias_quant_scale=None,
+                 bias_quant_bits=32):
         super().__init__()
         assert in_dim % groups == 0, f"in_dim({in_dim}) should be divisible by groups({groups})"
         self.in_dim = in_dim
@@ -208,6 +283,15 @@ class Conv1dLine4Block(nn.Module):
         self.weight = nn.Parameter(torch.empty((4 * ks - 3, out_dim, in_dim // groups)))
         self.bias = nn.Parameter(torch.zeros((out_dim, ))) if bias else None
         nn.init.kaiming_normal_(self.weight)
+
+        self.quant = quant
+        if quant:
+            self.input_quant_scale = input_quant_scale
+            self.input_quant_bits = input_quant_bits
+            self.weight_quant_scale = weight_quant_scale
+            self.weight_quant_bits = weight_quant_bits
+            self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
+            self.bias_quant_bits = bias_quant_bits
 
     def make_kernel(self):
         kernel = []
@@ -229,8 +313,16 @@ class Conv1dLine4Block(nn.Module):
         return kernel
 
     def conv(self, x):
-        return F.conv2d(x, self.make_kernel(), self.bias, self.stride, self.padding, self.dilation,
-                        self.groups)
+        w = self.make_kernel()
+        b = self.bias
+
+        if self.quant:
+            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
+            w = fake_quant(w, self.weight_quant_scale, num_bits=self.weight_quant_bits)
+            if b is not None:
+                b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
+
+        return F.conv2d(x, w, b, self.stride, self.padding, self.dilation, self.groups)
 
     def forward(self, x):
         if self.activation and self.activation_first:
@@ -244,6 +336,7 @@ class Conv1dLine4Block(nn.Module):
 
 
 class ResBlock(nn.Module):
+
     def __init__(self,
                  dim,
                  ks=3,
@@ -272,6 +365,7 @@ class ResBlock(nn.Module):
 
 
 class ActFirstResBlock(nn.Module):
+
     def __init__(self,
                  dim_in,
                  dim_out,

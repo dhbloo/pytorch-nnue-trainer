@@ -5,7 +5,7 @@ import torch.nn as nn
 def build_input_plane(input_type):
     if input_type == 'basic':
         return BasicInputPlane(with_stm=True)
-    elif input_type == 'basic-nostm':
+    elif input_type == 'basic-nostm' or input_type == 'basicns':
         return BasicInputPlane(with_stm=False)
     elif input_type.startswith('pcode'):
         input_type = input_type[5:]
