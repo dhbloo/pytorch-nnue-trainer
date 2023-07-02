@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, Conv1dLine4Block, QuantPReLU
 from .input import build_input_plane
-from utils.quant_utils import fake_quant
 
 ###########################################################
 # Mix6Net adopted from https://github.com/hzyhhzy/gomoku_nnue/blob/87603e908cb1ae9106966e3596830376a637c21a/train_pytorch/model.py#L736
@@ -462,18 +461,18 @@ class Mix8Net(nn.Module):
 
     def __init__(self,
                  dim_middle=128,
-                 dim_feature=96,
+                 dim_feature=64,
                  dim_policy=32,
                  dim_value=64,
                  dim_value_quadrand=32,
                  dim_dwconv=None,
-                 input_type='basic-nostm',
+                 input_type='basicns',
                  feature_kernel_multiplier=2):
         super().__init__()
+        dim_feature = max(dim_policy, dim_value)
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_quadrand)
         self.input_type = input_type
         self.feature_kernel_multiplier = feature_kernel_multiplier
-        dim_feature = max(dim_policy, dim_value)
         self.dim_dwconv = dim_policy if dim_dwconv is None else dim_dwconv
         self.dim_vsum = dim_feature + self.dim_dwconv * (feature_kernel_multiplier - 1)
         assert self.dim_dwconv <= dim_feature, f"Invalid dim_dwconv {self.dim_dwconv}"
@@ -512,10 +511,10 @@ class Mix8Net(nn.Module):
             groups=dim_policy,
             activation='relu',
         )
-        self.policy_pwconv_weight_linear = nn.ModuleList([
+        self.policy_pwconv_weight_linear = nn.Sequential(
             LinearBlock(self.dim_vsum, dim_policy),
             LinearBlock(dim_policy, dim_policy, activation='none', bias=False),
-        ])
+        )
         self.policy_activation = nn.PReLU(1)
 
         # value head
@@ -523,12 +522,12 @@ class Mix8Net(nn.Module):
             LinearBlock(self.dim_vsum, dim_value_quadrand),
             LinearBlock(dim_value_quadrand, dim_value_quadrand),
         )
-        self.value_linear = nn.ModuleList([
+        self.value_linear = nn.Sequential(
             LinearBlock(self.dim_vsum + 4 * dim_value_quadrand, dim_value),
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, 3, activation='none'),
-        ])
+        )
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
@@ -578,12 +577,8 @@ class Mix8Net(nn.Module):
         feature_11_mean = torch.mean(feature_11, dim=(2, 3))  # [B, dim_vsum]
 
         # policy head
-        pwconv_weight = feature_mean
-        for linear in self.policy_pwconv_weight_linear:
-            pwconv_weight = linear(pwconv_weight)
-
-        policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
-        policy = self.policy_dwconv(policy)  # [B, dim_policy, H, W]
+        pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
+        policy = self.policy_dwconv(feature[:, :dim_policy])  # [B, dim_policy, H, W]
         policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
                           weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
                           groups=B).reshape(B, 1, H, W)  # [B, 1, H, W]
@@ -601,8 +596,7 @@ class Mix8Net(nn.Module):
             value_10,
             value_11,
         ], 1)  # [B, dim_vsum + 4 * dim_value_quadrand]
-        for linear in self.value_linear:
-            value = linear(value)
+        value = self.value_linear(value)
 
         return value, policy
 
