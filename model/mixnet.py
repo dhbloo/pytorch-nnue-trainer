@@ -464,13 +464,13 @@ class Mix8Net(nn.Module):
                  dim_feature=64,
                  dim_policy=32,
                  dim_value=64,
-                 dim_value_quadrand=32,
+                 dim_value_group=32,
                  dim_dwconv=None,
                  input_type='basicns',
                  feature_kernel_multiplier=2):
         super().__init__()
         dim_feature = max(dim_policy, dim_value)
-        self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_quadrand)
+        self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_group)
         self.input_type = input_type
         self.feature_kernel_multiplier = feature_kernel_multiplier
         self.dim_dwconv = dim_policy if dim_dwconv is None else dim_dwconv
@@ -518,12 +518,12 @@ class Mix8Net(nn.Module):
         self.policy_activation = nn.PReLU(1)
 
         # value head
-        self.value_quadrant_linear = nn.Sequential(
-            LinearBlock(self.dim_vsum, dim_value_quadrand),
-            LinearBlock(dim_value_quadrand, dim_value_quadrand),
-        )
+        self.value_corner_linear = LinearBlock(self.dim_vsum, dim_value_group)
+        self.value_edge_linear = LinearBlock(self.dim_vsum, dim_value_group)
+        self.value_center_linear = LinearBlock(self.dim_vsum, dim_value_group)
+        self.value_quadrant_linear = LinearBlock(dim_value_group, dim_value_group)
         self.value_linear = nn.Sequential(
-            LinearBlock(self.dim_vsum + 4 * dim_value_quadrand, dim_value),
+            LinearBlock(self.dim_vsum + 4 * dim_value_group, dim_value),
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, 3, activation='none'),
@@ -567,14 +567,19 @@ class Mix8Net(nn.Module):
 
         # value feature accumulator of four quadrants
         B, _, H, W = feature.shape
-        feature_00 = feature[:, :, :(H + 1) // 2, :(W + 1) // 2]
-        feature_01 = feature[:, :, :(H + 1) // 2, W // 2:]
-        feature_10 = feature[:, :, H // 2:, :(W + 1) // 2]
-        feature_11 = feature[:, :, H // 2:, W // 2:]
-        feature_00_mean = torch.mean(feature_00, dim=(2, 3))  # [B, dim_vsum]
-        feature_01_mean = torch.mean(feature_01, dim=(2, 3))  # [B, dim_vsum]
-        feature_10_mean = torch.mean(feature_10, dim=(2, 3))  # [B, dim_vsum]
-        feature_11_mean = torch.mean(feature_11, dim=(2, 3))  # [B, dim_vsum]
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_vsum]
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
@@ -585,17 +590,26 @@ class Mix8Net(nn.Module):
         policy = self.policy_activation(policy)
 
         # value head
-        value_00 = self.value_quadrant_linear(feature_00_mean)
-        value_01 = self.value_quadrant_linear(feature_01_mean)
-        value_10 = self.value_quadrant_linear(feature_10_mean)
-        value_11 = self.value_quadrant_linear(feature_11_mean)
+        value_00 = self.value_corner_linear(feature_00)
+        value_01 = self.value_edge_linear(feature_01)
+        value_02 = self.value_corner_linear(feature_02)
+        value_10 = self.value_edge_linear(feature_10)
+        value_11 = self.value_center_linear(feature_11)
+        value_12 = self.value_edge_linear(feature_12)
+        value_20 = self.value_corner_linear(feature_20)
+        value_21 = self.value_edge_linear(feature_21)
+        value_22 = self.value_corner_linear(feature_22)
+        value_q00 = self.value_quadrant_linear(value_00 + value_01 + value_10 + value_11)
+        value_q01 = self.value_quadrant_linear(value_01 + value_02 + value_11 + value_12)
+        value_q10 = self.value_quadrant_linear(value_10 + value_11 + value_20 + value_21)
+        value_q11 = self.value_quadrant_linear(value_11 + value_12 + value_21 + value_22)
         value = torch.cat([
             feature_mean,
-            value_00,
-            value_01,
-            value_10,
-            value_11,
-        ], 1)  # [B, dim_vsum + 4 * dim_value_quadrand]
+            value_q00,
+            value_q01,
+            value_q10,
+            value_q11,
+        ], 1)  # [B, dim_vsum + 4 * dim_value_group]
         value = self.value_linear(value)
 
         return value, policy
@@ -613,18 +627,28 @@ class Mix8Net(nn.Module):
 
         # value feature accumulator of four quadrants
         B, _, H, W = feature.shape
-        feature_00 = feature[:, :, :(H + 1) // 2, :(W + 1) // 2]
-        feature_01 = feature[:, :, :(H + 1) // 2, W // 2:]
-        feature_10 = feature[:, :, H // 2:, :(W + 1) // 2]
-        feature_11 = feature[:, :, H // 2:, W // 2:]
-        feature_00_mean = torch.mean(feature_00, dim=(2, 3))  # [B, dim_vsum]
-        feature_01_mean = torch.mean(feature_01, dim=(2, 3))  # [B, dim_vsum]
-        feature_10_mean = torch.mean(feature_10, dim=(2, 3))  # [B, dim_vsum]
-        feature_11_mean = torch.mean(feature_11, dim=(2, 3))  # [B, dim_vsum]
-        print(f"feature 00 mean: \n{feature_00_mean}")
-        print(f"feature 01 mean: \n{feature_01_mean}")
-        print(f"feature 10 mean: \n{feature_10_mean}")
-        print(f"feature 11 mean: \n{feature_11_mean}")
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_vsum]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_vsum]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        print(f"feature 00 mean: \n{feature_00}")
+        print(f"feature 01 mean: \n{feature_01}")
+        print(f"feature 02 mean: \n{feature_02}")
+        print(f"feature 10 mean: \n{feature_10}")
+        print(f"feature 11 mean: \n{feature_11}")
+        print(f"feature 12 mean: \n{feature_12}")
+        print(f"feature 20 mean: \n{feature_20}")
+        print(f"feature 21 mean: \n{feature_21}")
+        print(f"feature 22 mean: \n{feature_22}")
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight_layer(feature_mean)  # [B, dim_policy]
@@ -642,21 +666,39 @@ class Mix8Net(nn.Module):
         print(f"policy act at (0,0): \n{policy[..., 0, 0]}")
 
         # value head
-        value_00 = self.value_quadrant_linear(feature_00_mean)
-        value_01 = self.value_quadrant_linear(feature_01_mean)
-        value_10 = self.value_quadrant_linear(feature_10_mean)
-        value_11 = self.value_quadrant_linear(feature_11_mean)
+        value_00 = self.value_corner_linear(feature_00)
+        value_01 = self.value_edge_linear(feature_01)
+        value_02 = self.value_corner_linear(feature_02)
+        value_10 = self.value_edge_linear(feature_10)
+        value_11 = self.value_center_linear(feature_11)
+        value_12 = self.value_edge_linear(feature_12)
+        value_20 = self.value_corner_linear(feature_20)
+        value_21 = self.value_edge_linear(feature_21)
+        value_22 = self.value_corner_linear(feature_22)
         print(f"value_00: \n{value_00}")
         print(f"value_01: \n{value_01}")
+        print(f"value_02: \n{value_02}")
         print(f"value_10: \n{value_10}")
         print(f"value_11: \n{value_11}")
+        print(f"value_12: \n{value_12}")
+        print(f"value_20: \n{value_20}")
+        print(f"value_21: \n{value_21}")
+        print(f"value_22: \n{value_22}")
+        value_q00 = self.value_quadrant_linear(value_00 + value_01 + value_10 + value_11)
+        value_q01 = self.value_quadrant_linear(value_01 + value_02 + value_11 + value_12)
+        value_q10 = self.value_quadrant_linear(value_10 + value_11 + value_20 + value_21)
+        value_q11 = self.value_quadrant_linear(value_11 + value_12 + value_21 + value_22)
+        print(f"value_quad00: \n{value_q00}")
+        print(f"value_quad01: \n{value_q01}")
+        print(f"value_quad10: \n{value_q10}")
+        print(f"value_quad11: \n{value_q11}")
         value = torch.cat([
             feature_mean,
-            value_00,
-            value_01,
-            value_10,
-            value_11,
-        ], 1)  # [B, dim_vsum + 4 * dim_value_quadrand]
+            value_q00,
+            value_q01,
+            value_q10,
+            value_q11,
+        ], 1)  # [B, dim_vsum + 4 * dim_value_group]
         print(f"value feature input: \n{value}")
         for i, linear in enumerate(self.value_linear):
             value = linear(value)
