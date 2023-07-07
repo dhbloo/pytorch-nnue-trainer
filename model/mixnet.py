@@ -651,7 +651,7 @@ class Mix8Net(nn.Module):
         print(f"feature 22 mean: \n{feature_22}")
 
         # policy head
-        pwconv_weight = self.policy_pwconv_weight_layer(feature_mean)  # [B, dim_policy]
+        pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)  # [B, dim_policy]
         print(f"policy weight: \n{pwconv_weight}")
 
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]

@@ -102,7 +102,7 @@ def debug_print(board, model, data):
             data[k] = torch.unsqueeze(data[k], dim=0)
 
     if hasattr(model, 'forward_debug_print'):
-        torch.set_printoptions(precision=3, linewidth=120, sci_mode=False)
+        torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
         value, policy, *retvals = model.forward_debug_print(data)
     else:
         value, policy, *retvals = model(data)

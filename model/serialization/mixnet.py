@@ -1100,8 +1100,8 @@ class Mix8NetSerializer(BaseSerializer):
         int16_t map_prelu_weight[FeatureDim];
 
         // 3  Depthwise conv
-        int16_t feature_dwconv_weight[9][FeatureKernelMultiplier][FeatureDWConvDim];
-        int16_t feature_dwconv_bias[FeatureKernelMultiplier][FeatureDWConvDim];
+        int16_t feature_dwconv_weight[9][FeatureKernelMultiplier*FeatureDWConvDim];
+        int16_t feature_dwconv_bias[FeatureKernelMultiplier*FeatureDWConvDim];
 
         // 4  Value sum scale
         float   value_sum_scale_after_conv;
@@ -1120,14 +1120,18 @@ class Mix8NetSerializer(BaseSerializer):
             float   policy_pwconv_layer_l1_bias[PolicyDim];
             float   policy_pwconv_layer_l2_weight[PolicyDim][PolicyDim];
             
-            // 7  Quadrant Value MLP (layer 1,2)
-            float   value_quadrant_l1_weight[VSumDim][VQuadrantDim];
-            float   value_quadrant_l1_bias[VQuadrantDim];
-            float   value_quadrant_l2_weight[VQuadrantDim][VQuadrantDim];
-            float   value_quadrant_l2_bias[VQuadrantDim];
+            // 7  Group Value MLP (layer 1,2)
+            float   value_corner_weight[VSumDim][VGroupDim];
+            float   value_corner_bias[VGroupDim];
+            float   value_edge_weight[VSumDim][VGroupDim];
+            float   value_edge_bias[VGroupDim];
+            float   value_center_weight[VSumDim][VGroupDim];
+            float   value_center_bias[VGroupDim];
+            float   value_quadrant_weight[VGroupDim][VGroupDim];
+            float   value_quadrant_bias[VGroupDim];
 
             // 8  Value MLP (layer 1,2,3,4)
-            float   value_l1_weight[VSumDim+4*VQuadrantDim][ValueDim]; // shape=(in, out)
+            float   value_l1_weight[VSumDim+4*VGroupDim][ValueDim]; // shape=(in, out)
             float   value_l1_bias[ValueDim];
             float   value_l2_weight[ValueDim][ValueDim];
             float   value_l2_bias[ValueDim];
@@ -1167,7 +1171,7 @@ class Mix8NetSerializer(BaseSerializer):
 
     def arch_hash(self, model: Mix8Net) -> int:
         assert model.input_plane.dim_plane == 2
-        _, dim_feature, dim_policy, dim_value, dim_value_quadrand = model.model_size
+        _, dim_feature, dim_policy, dim_value, dim_value_group = model.model_size
         hash = crc32(b'Mix8Net')
         hash ^= crc32(model.input_type.encode('utf-8'))
         hash ^= crc32(
@@ -1177,16 +1181,16 @@ class Mix8NetSerializer(BaseSerializer):
         assert dim_feature % 8 == 0, f"dim_feature must be a multiply of 8"
         assert dim_policy % 8 == 0, f"dim_policy must be a multiply of 8"
         assert dim_value % 8 == 0, f"dim_value must be a multiply of 8"
-        assert dim_value_quadrand % 8 == 0, f"dim_value_quadrand must be a multiply of 8"
+        assert dim_value_group % 8 == 0, f"dim_value_group must be a multiply of 8"
         assert model.dim_dwconv % 8 == 0, f"dim_dwconv must be a multiply of 8"
         hash ^= (dim_feature // 8) \
               | ((dim_policy // 8) << 8) \
               | ((dim_value // 8) << 14) \
-              | ((dim_value_quadrand // 8) << 20) \
+              | ((dim_value_group // 8) << 20) \
               | ((model.dim_dwconv // 8) << 26)
         return hash
 
-    def _export_map_table(self, model: Mix8Net, device, line, stm=None):
+    def _export_map_table(self, model: Mix8Net, device, line):
         """
         Export line -> feature mapping table.
 
@@ -1196,11 +1200,7 @@ class Mix8NetSerializer(BaseSerializer):
         N, L = line.shape
         b, w = line == 1, line == 2
 
-        if stm is not None:
-            s = np.ones_like(line) * stm
-            line = (b, w, s)
-        else:
-            line = (b, w)
+        line = (b, w)
         line = np.stack(line, axis=0)[np.newaxis]  # [B=1, C=2 or 3, N, L]
         line = torch.tensor(line, dtype=torch.float32, device=device)
 
@@ -1213,17 +1213,17 @@ class Mix8NetSerializer(BaseSerializer):
             end = min((i + 1) * batch_size, N)
 
             map = model.mapping(line[:, :, start:end])[0, 0]
-            map = 32 * torch.tanh(map / 32)
+            map = torch.clamp(map, min=-32, max=32)
             map_table.append(map.cpu().numpy())
 
         map_table = np.concatenate(map_table, axis=1)  # [dim_feature, N, L]
         return map_table
 
-    def _export_feature_map(self, model: Mix8Net, device, stm=None):
+    def _export_feature_map(self, model: Mix8Net, device):
         L = self.line_length
         dim_feature = model.model_size[1]
         lines = generate_base3_permutation(L)  # [177147, 11]
-        map_table = self._export_map_table(model, device, lines, stm)  # [dim_feature, 177147, 11]
+        map_table = self._export_map_table(model, device, lines)  # [dim_feature, 177147, 11]
 
         feature_map = np.zeros((4 * 3**L, dim_feature), dtype=np.float32)  # [708588, dim_feature]
         usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
@@ -1244,7 +1244,7 @@ class Mix8NetSerializer(BaseSerializer):
         for l in range(1, (L + 1) // 2):
             for r in range(1, (L + 1) // 2):
                 lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines, stm)
+                map_table = self._export_map_table(model, device, lines)
                 idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
                 idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
                 for i in range(idx.shape[0]):
@@ -1375,24 +1375,33 @@ class Mix8NetSerializer(BaseSerializer):
         return pwconv_layer_l1_weight, pwconv_layer_l1_bias, \
                pwconv_layer_l2_weight, policy_neg_weight, policy_pos_weight
 
-    def _export_value(self, model: Mix7Net, quant_scale_after_conv, quant_scale_direct):
+    def _export_value(self, model: Mix8Net, quant_scale_after_conv, quant_scale_direct):
         # feature accumulator mean
         scale_after_conv = 1 / quant_scale_after_conv  # Note: divide board_size**2 in engine
         scale_direct = 1 / quant_scale_direct  # Note: divide board_size**2 in engine
         print(f"value: scale_after_conv = {scale_after_conv}, scale_direct = {scale_direct}")
 
-        # quadrant value layer 1: linear mlp 01
-        quadrand_l1_weight = model.value_quadrant_linear[0].fc.weight.cpu().numpy().T
-        quadrand_l1_bias = model.value_quadrant_linear[0].fc.bias.cpu().numpy()
+        # group value layer 1: 3x3 group
+        corner_weight = model.value_corner_linear.fc.weight.cpu().numpy().T
+        corner_bias = model.value_corner_linear.fc.bias.cpu().numpy()
+        edge_weight = model.value_edge_linear.fc.weight.cpu().numpy().T
+        edge_bias = model.value_edge_linear.fc.bias.cpu().numpy()
+        center_weight = model.value_center_linear.fc.weight.cpu().numpy().T
+        center_bias = model.value_center_linear.fc.bias.cpu().numpy()
 
-        # quadrant value layer 2: linear mlp 02
-        quadrand_l2_weight = model.value_quadrant_linear[1].fc.weight.cpu().numpy().T
-        quadrand_l2_bias = model.value_quadrant_linear[1].fc.bias.cpu().numpy()
+        ascii_hist("value: corner linear weight", corner_weight)
+        ascii_hist("value: corner linear bias", corner_bias)
+        ascii_hist("value: edge linear weight", edge_weight)
+        ascii_hist("value: edge linear bias", edge_bias)
+        ascii_hist("value: center linear weight", center_weight)
+        ascii_hist("value: center linear bias", center_bias)
 
-        ascii_hist("value: quadrant linear1 weight", quadrand_l1_weight)
-        ascii_hist("value: quadrant linear1 bias", quadrand_l1_bias)
-        ascii_hist("value: quadrant linear2 weight", quadrand_l2_weight)
-        ascii_hist("value: quadrant linear2 bias", quadrand_l2_bias)
+        # group value layer 2: quadrant group
+        quadrant_weight = model.value_quadrant_linear.fc.weight.cpu().numpy().T
+        quadrant_bias = model.value_quadrant_linear.fc.bias.cpu().numpy()
+
+        ascii_hist("value: quadrant linear weight", quadrant_weight)
+        ascii_hist("value: quadrant linear bias", quadrant_bias)
 
         # value layer 1: linear mlp 01
         l1_weight = model.value_linear[0].fc.weight.cpu().numpy().T
@@ -1419,9 +1428,9 @@ class Mix8NetSerializer(BaseSerializer):
         ascii_hist("value: linear4 weight", l4_weight)
         ascii_hist("value: linear4 bias", l4_bias)
 
-        return (scale_after_conv, scale_direct, quadrand_l1_weight, quadrand_l1_bias,
-                quadrand_l2_weight, quadrand_l2_bias, l1_weight, l1_bias, l2_weight, l2_bias,
-                l3_weight, l3_bias, l4_weight, l4_bias)
+        return (scale_after_conv, scale_direct, corner_weight, corner_bias, edge_weight, edge_bias,
+                center_weight, center_bias, quadrant_weight, quadrant_bias, l1_weight, l1_bias,
+                l2_weight, l2_bias, l3_weight, l3_bias, l4_weight, l4_bias)
 
     def serialize(self, out: io.IOBase, model: Mix7Net, device):
         feature_map, usage_flags, quant_scale_direct, quant_bound = \
@@ -1434,8 +1443,8 @@ class Mix8NetSerializer(BaseSerializer):
         policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
             policy_pwconv_layer_l2_weight, policy_neg_weight, policy_pos_weight = \
             self._export_policy_pwconv(model, quant_scale_policy)
-        scale_after_conv, scale_direct, quadrant_l1_weight, quadrant_l1_bias, \
-            quadrant_l2_weight, quadrant_l2_bias, l1_weight, l1_bias, \
+        scale_after_conv, scale_direct, corner_weight, corner_bias, edge_weight, edge_bias, \
+            center_weight, center_bias, quadrant_weight, quadrant_bias, l1_weight, l1_bias, \
             l2_weight, l2_bias, l3_weight, l3_bias, l4_weight, l4_bias = \
             self._export_value(model, quant_scale_ftconv, quant_scale_direct)
 
@@ -1485,18 +1494,32 @@ class Mix8NetSerializer(BaseSerializer):
             policy_pwconv_layer_l2_weight.astype('f4').tofile(out, sep=' ')
             print(file=out)
 
-            print('value_quadrand_l1_weight', file=out)
-            quadrant_l1_weight.astype('f4').tofile(out, sep=' ')
+            print('value_corner_weight', file=out)
+            corner_weight.astype('f4').tofile(out, sep=' ')
             print(file=out)
-            print('value_quadrand_l1_bias', file=out)
-            quadrant_l1_bias.astype('f4').tofile(out, sep=' ')
+            print('value_corner_bias', file=out)
+            corner_bias.astype('f4').tofile(out, sep=' ')
             print(file=out)
 
-            print('value_quadrand_l2_weight', file=out)
-            quadrant_l2_weight.astype('f4').tofile(out, sep=' ')
+            print('value_edge_weight', file=out)
+            edge_weight.astype('f4').tofile(out, sep=' ')
             print(file=out)
-            print('value_quadrand_l2_bias', file=out)
-            quadrant_l2_bias.astype('f4').tofile(out, sep=' ')
+            print('value_edge_bias', file=out)
+            edge_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('value_center_weight', file=out)
+            center_weight.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+            print('value_center_bias', file=out)
+            center_bias.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+
+            print('value_quadrant_weight', file=out)
+            quadrant_weight.astype('f4').tofile(out, sep=' ')
+            print(file=out)
+            print('value_quadrant_bias', file=out)
+            quadrant_bias.astype('f4').tofile(out, sep=' ')
             print(file=out)
 
             print('value_l1_weight', file=out)
@@ -1565,15 +1588,22 @@ class Mix8NetSerializer(BaseSerializer):
             o.write(policy_pwconv_layer_l1_bias.astype('<f4').tobytes())  # (PC,)
             o.write(policy_pwconv_layer_l2_weight.astype('<f4').tobytes())  # (PC,PC)
 
-            # float   value_quadrand_l1_weight[VSumDim][VQuadrantDim];
-            # float   value_quadrand_l1_bias[VQuadrantDim];
-            o.write(quadrant_l1_weight.astype('<f4').tobytes())  # (VSum, VQuadrant)
-            o.write(quadrant_l1_bias.astype('<f4').tobytes())  # (VQuadrant,)
-
-            # float   value_quadrand_l2_weight[VQuadrantDim][VQuadrantDim];
-            # float   value_quadrand_l2_bias[VQuadrantDim];
-            o.write(quadrant_l2_weight.astype('<f4').tobytes())  # (VQuadrant, VQuadrant)
-            o.write(quadrant_l2_bias.astype('<f4').tobytes())  # (VQuadrant,)
+            # float   value_corner_weight[VSumDim][VGroupDim];
+            # float   value_corner_bias[VGroupDim];
+            # float   value_edge_weight[VSumDim][VGroupDim];
+            # float   value_edge_bias[VGroupDim];
+            # float   value_center_weight[VSumDim][VGroupDim];
+            # float   value_center_bias[VGroupDim];
+            # float   value_quadrant_weight[VGroupDim][VGroupDim];
+            # float   value_quadrant_bias[VGroupDim];
+            o.write(corner_weight.astype('<f4').tobytes())  # (VSum, VGroupDim)
+            o.write(corner_bias.astype('<f4').tobytes())  # (VGroupDim,)
+            o.write(edge_weight.astype('<f4').tobytes())  # (VSum, VGroupDim)
+            o.write(edge_bias.astype('<f4').tobytes())  # (VGroupDim,)
+            o.write(center_weight.astype('<f4').tobytes())  # (VSum, VGroupDim)
+            o.write(center_bias.astype('<f4').tobytes())  # (VGroupDim,)
+            o.write(quadrant_weight.astype('<f4').tobytes())  # (VGroupDim, VGroupDim)
+            o.write(quadrant_bias.astype('<f4').tobytes())  # (VGroupDim,)
 
             # float   value_l1_weight[VSumDim+4*VQuadrantDim][ValueDim];
             # float   value_l1_bias[ValueDim];
