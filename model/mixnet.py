@@ -466,15 +466,12 @@ class Mix8Net(nn.Module):
                  dim_value=64,
                  dim_value_group=32,
                  dim_dwconv=None,
-                 input_type='basicns',
-                 feature_kernel_multiplier=2):
+                 input_type='basicns'):
         super().__init__()
         dim_feature = max(dim_policy, dim_value)
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_group)
         self.input_type = input_type
-        self.feature_kernel_multiplier = feature_kernel_multiplier
         self.dim_dwconv = dim_policy if dim_dwconv is None else dim_dwconv
-        self.dim_vsum = dim_feature + self.dim_dwconv * (feature_kernel_multiplier - 1)
         assert self.dim_dwconv <= dim_feature, f"Invalid dim_dwconv {self.dim_dwconv}"
         assert self.dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
@@ -489,42 +486,39 @@ class Mix8Net(nn.Module):
         )
 
         # feature depth-wise conv
-        self.feature_dwconvs = nn.ModuleList([
-            Conv2dBlock(
-                self.dim_dwconv,
-                self.dim_dwconv,
-                ks=3,
-                st=1,
-                padding=3 // 2,
-                groups=self.dim_dwconv,
-                activation='relu',
-            ) for _ in range(feature_kernel_multiplier)
-        ])
+        self.feature_dwconv = Conv2dBlock(
+            self.dim_dwconv,
+            self.dim_dwconv,
+            ks=3,
+            st=1,
+            padding=3 // 2,
+            groups=self.dim_dwconv,
+            activation='relu',
+        )
 
         # policy head (point-wise conv)
         self.policy_dwconv = Conv1dLine4Block(
             dim_policy,
             dim_policy,
-            ks=11,
+            ks=9,
             st=1,
-            padding=11 // 2,
+            padding=9 // 2,
             groups=dim_policy,
             activation='relu',
         )
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(self.dim_vsum, dim_policy),
+            LinearBlock(dim_feature, dim_policy),
             LinearBlock(dim_policy, dim_policy, activation='none', bias=False),
         )
         self.policy_activation = nn.PReLU(1)
 
         # value head
-        self.value_corner_linear = LinearBlock(self.dim_vsum, dim_value_group)
-        self.value_edge_linear = LinearBlock(self.dim_vsum, dim_value_group)
-        self.value_center_linear = LinearBlock(self.dim_vsum, dim_value_group)
+        self.value_corner_linear = LinearBlock(dim_feature, dim_value_group)
+        self.value_edge_linear = LinearBlock(dim_feature, dim_value_group)
+        self.value_center_linear = LinearBlock(dim_feature, dim_value_group)
         self.value_quadrant_linear = LinearBlock(dim_value_group, dim_value_group)
         self.value_linear = nn.Sequential(
-            LinearBlock(self.dim_vsum + 4 * dim_value_group, dim_value),
-            LinearBlock(dim_value, dim_value),
+            LinearBlock(dim_feature + 4 * dim_value_group, dim_value),
             LinearBlock(dim_value, dim_value),
             LinearBlock(dim_value, 3, activation='none'),
         )
@@ -547,12 +541,9 @@ class Mix8Net(nn.Module):
         feature = self.mapping_activation(feature)  # int16, scale=1024, [-32,32]
 
         # apply feature depth-wise conv
-        feats = [
-            conv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
-            for conv in self.feature_dwconvs
-        ]
-        feats.append(feature[:, self.dim_dwconv:])  # [B, dim_feature-dwconv, H, W]
-        feature = torch.cat(feats, dim=1)  # [B, dim_vsum, H, W]
+        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
+        feat_direct = feature[:, self.dim_dwconv:]  # [B, dim_feature-dwconv, H, W]
+        feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
         return feature
 
@@ -560,10 +551,10 @@ class Mix8Net(nn.Module):
         _, _, dim_policy, _, _ = self.model_size
 
         # get feature from single side
-        feature = self.get_feature(data, False)  # [B, dim_vsum, H, W]
+        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value feature accumulator
-        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_vsum]
+        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature]
 
         # value feature accumulator of four quadrants
         B, _, H, W = feature.shape
@@ -571,15 +562,15 @@ class Mix8Net(nn.Module):
         H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
         H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
         H3, W3 = H, W
-        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_vsum]
-        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_vsum]
-        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
@@ -609,7 +600,7 @@ class Mix8Net(nn.Module):
             value_q01,
             value_q10,
             value_q11,
-        ], 1)  # [B, dim_vsum + 4 * dim_value_group]
+        ], 1)  # [B, dim_feature + 4 * dim_value_group]
         value = self.value_linear(value)
 
         return value, policy
@@ -622,7 +613,7 @@ class Mix8Net(nn.Module):
         print(f"feature after dwconv at (0,0): \n{feature[..., 0, 0]}")
 
         # value feature accumulator
-        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_vsum, H, W]
+        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature, H, W]
         print(f"feature mean: \n{feature_mean}")
 
         # value feature accumulator of four quadrants
@@ -631,15 +622,15 @@ class Mix8Net(nn.Module):
         H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
         H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
         H3, W3 = H, W
-        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_vsum]
-        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_vsum]
-        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_vsum]
-        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_vsum]
-        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_vsum]
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
         print(f"feature 00 mean: \n{feature_00}")
         print(f"feature 01 mean: \n{feature_01}")
         print(f"feature 02 mean: \n{feature_02}")
@@ -698,7 +689,7 @@ class Mix8Net(nn.Module):
             value_q01,
             value_q10,
             value_q11,
-        ], 1)  # [B, dim_vsum + 4 * dim_value_group]
+        ], 1)  # [B, dim_feature + 4 * dim_value_group]
         print(f"value feature input: \n{value}")
         for i, linear in enumerate(self.value_linear):
             value = linear(value)
@@ -715,19 +706,13 @@ class Mix8Net(nn.Module):
             'min_weight': -1.0,
             'max_weight': 1.0,
         }, {
-            'params':
-            [f'feature_dwconvs.{i}.conv.weight' for i in range(self.feature_kernel_multiplier)],
-            'min_weight':
-            -1.25,
-            'max_weight':
-            1.25,
+            'params': [f'feature_dwconv.conv.weight'],
+            'min_weight': -1.5,
+            'max_weight': 1.5,
         }, {
-            'params':
-            [f'feature_dwconvs.{i}.conv.bias' for i in range(self.feature_kernel_multiplier)],
-            'min_weight':
-            -2.5,
-            'max_weight':
-            2.5,
+            'params': [f'feature_dwconv.conv.bias'],
+            'min_weight': -4.0,
+            'max_weight': 4.0,
         }, {
             'params': ['policy_dwconv.weight'],
             'min_weight': -1.5,
