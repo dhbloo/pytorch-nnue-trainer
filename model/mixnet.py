@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from . import MODELS
 from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, Conv1dLine4Block, QuantPReLU
 from .input import build_input_plane
+from utils.quant_utils import fake_quant
 
 ###########################################################
 # Mix6Net adopted from https://github.com/hzyhhzy/gomoku_nnue/blob/87603e908cb1ae9106966e3596830376a637c21a/train_pytorch/model.py#L736
@@ -497,26 +498,25 @@ class Mix8Net(nn.Module):
         )
 
         # policy head (point-wise conv)
-        self.policy_dwconv = Conv1dLine4Block(
-            dim_policy,
-            dim_policy,
-            ks=9,
-            st=1,
-            padding=9 // 2,
-            groups=dim_policy,
-            activation='relu',
-        )
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy),
-            LinearBlock(dim_policy, dim_policy, activation='none', bias=False),
+            LinearBlock(dim_feature, dim_policy, activation='none'),
+            nn.PReLU(dim_policy),
+            LinearBlock(dim_policy, 4 * dim_policy, activation='none'),
         )
-        self.policy_activation = nn.PReLU(1)
+        self.policy_output = nn.Sequential(
+            nn.PReLU(4),
+            nn.Conv2d(4, 1, 1),
+        )
 
         # value head
-        self.value_corner_linear = LinearBlock(dim_feature, dim_value_group)
-        self.value_edge_linear = LinearBlock(dim_feature, dim_value_group)
-        self.value_center_linear = LinearBlock(dim_feature, dim_value_group)
-        self.value_quadrant_linear = LinearBlock(dim_value_group, dim_value_group)
+        self.value_corner_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_corner_act = nn.PReLU(dim_value_group)
+        self.value_edge_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_edge_act = nn.PReLU(dim_value_group)
+        self.value_center_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_center_act = nn.PReLU(dim_value_group)
+        self.value_quad_linear = LinearBlock(dim_value_group, dim_value_group, activation='none')
+        self.value_quad_act = nn.PReLU(dim_value_group)
         self.value_linear = nn.Sequential(
             LinearBlock(dim_feature + 4 * dim_value_group, dim_value),
             LinearBlock(dim_value, dim_value),
@@ -535,10 +535,11 @@ class Mix8Net(nn.Module):
         feature = self.mapping(input_plane)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-32, max=32)  # int14, scale=256, [-32,32]
+        feature = torch.clamp(feature, min=-32, max=32)  # int16, scale=255, [-32,32]
+        feature = fake_quant(feature, scale=255, num_bits=16)
         # sum (and rescale) feature across four directions
-        feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=1024, [-32,32]
-        feature = self.mapping_activation(feature)  # int16, scale=1024, [-32,32]
+        feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=1020, [-32,32]
+        feature = self.mapping_activation(feature)  # int16, scale=1020, [-32,32]
 
         # apply feature depth-wise conv
         feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
@@ -574,26 +575,35 @@ class Mix8Net(nn.Module):
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
-        policy = self.policy_dwconv(feature[:, :dim_policy])  # [B, dim_policy, H, W]
-        policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                          weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
-                          groups=B).reshape(B, 1, H, W)  # [B, 1, H, W]
-        policy = self.policy_activation(policy)
+        pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
+        policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
+        policy = torch.cat([
+            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                     groups=B).reshape(B, 1, H, W)
+            for i in range(4)
+        ], dim=1)
+        policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value head
-        value_00 = self.value_corner_linear(feature_00)
-        value_01 = self.value_edge_linear(feature_01)
-        value_02 = self.value_corner_linear(feature_02)
-        value_10 = self.value_edge_linear(feature_10)
-        value_11 = self.value_center_linear(feature_11)
-        value_12 = self.value_edge_linear(feature_12)
-        value_20 = self.value_corner_linear(feature_20)
-        value_21 = self.value_edge_linear(feature_21)
-        value_22 = self.value_corner_linear(feature_22)
-        value_q00 = self.value_quadrant_linear(value_00 + value_01 + value_10 + value_11)
-        value_q01 = self.value_quadrant_linear(value_01 + value_02 + value_11 + value_12)
-        value_q10 = self.value_quadrant_linear(value_10 + value_11 + value_20 + value_21)
-        value_q11 = self.value_quadrant_linear(value_11 + value_12 + value_21 + value_22)
+        value_00 = self.value_corner_act(self.value_corner_linear(feature_00))
+        value_01 = self.value_edge_act(self.value_edge_linear(feature_01))
+        value_02 = self.value_corner_act(self.value_corner_linear(feature_02))
+        value_10 = self.value_edge_act(self.value_edge_linear(feature_10))
+        value_11 = self.value_center_act(self.value_center_linear(feature_11))
+        value_12 = self.value_edge_act(self.value_edge_linear(feature_12))
+        value_20 = self.value_corner_act(self.value_corner_linear(feature_20))
+        value_21 = self.value_edge_act(self.value_edge_linear(feature_21))
+        value_22 = self.value_corner_act(self.value_corner_linear(feature_22))
+
+        value_q00 = value_00 + value_01 + value_10 + value_11
+        value_q01 = value_01 + value_02 + value_11 + value_12
+        value_q10 = value_10 + value_11 + value_20 + value_21
+        value_q11 = value_11 + value_12 + value_21 + value_22
+        value_q00 = self.value_quad_act(self.value_quad_linear(value_q00))
+        value_q01 = self.value_quad_act(self.value_quad_linear(value_q01))
+        value_q10 = self.value_quad_act(self.value_quad_linear(value_q10))
+        value_q11 = self.value_quad_act(self.value_quad_linear(value_q11))
         value = torch.cat([
             feature_mean,
             value_q00,
@@ -644,28 +654,29 @@ class Mix8Net(nn.Module):
         # policy head
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)  # [B, dim_policy]
         print(f"policy weight: \n{pwconv_weight}")
-
+        pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
-        print(f"policy feature input at (0,0): \n{policy[..., 0, 0]}")
-        policy = self.policy_dwconv(policy)  # [B, dim_policy, H, W]
         print(f"policy after dwconv at (0,0): \n{policy[..., 0, 0]}")
-        policy = F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                          weight=pwconv_weight.reshape(B, dim_policy, 1, 1),
-                          groups=B).reshape(B, 1, H, W)
+        policy = torch.cat([
+            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                     groups=B).reshape(B, 1, H, W)
+            for i in range(4)
+        ], dim=1)
         print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
-        policy = self.policy_activation(policy)  # [B, 1, H, W]
-        print(f"policy act at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_output(policy)  # [B, 1, H, W]
+        print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
 
         # value head
-        value_00 = self.value_corner_linear(feature_00)
-        value_01 = self.value_edge_linear(feature_01)
-        value_02 = self.value_corner_linear(feature_02)
-        value_10 = self.value_edge_linear(feature_10)
-        value_11 = self.value_center_linear(feature_11)
-        value_12 = self.value_edge_linear(feature_12)
-        value_20 = self.value_corner_linear(feature_20)
-        value_21 = self.value_edge_linear(feature_21)
-        value_22 = self.value_corner_linear(feature_22)
+        value_00 = self.value_corner_act(self.value_corner_linear(feature_00))
+        value_01 = self.value_edge_act(self.value_edge_linear(feature_01))
+        value_02 = self.value_corner_act(self.value_corner_linear(feature_02))
+        value_10 = self.value_edge_act(self.value_edge_linear(feature_10))
+        value_11 = self.value_center_act(self.value_center_linear(feature_11))
+        value_12 = self.value_edge_act(self.value_edge_linear(feature_12))
+        value_20 = self.value_corner_act(self.value_corner_linear(feature_20))
+        value_21 = self.value_edge_act(self.value_edge_linear(feature_21))
+        value_22 = self.value_corner_act(self.value_corner_linear(feature_22))
         print(f"value_00: \n{value_00}")
         print(f"value_01: \n{value_01}")
         print(f"value_02: \n{value_02}")
@@ -675,10 +686,18 @@ class Mix8Net(nn.Module):
         print(f"value_20: \n{value_20}")
         print(f"value_21: \n{value_21}")
         print(f"value_22: \n{value_22}")
-        value_q00 = self.value_quadrant_linear(value_00 + value_01 + value_10 + value_11)
-        value_q01 = self.value_quadrant_linear(value_01 + value_02 + value_11 + value_12)
-        value_q10 = self.value_quadrant_linear(value_10 + value_11 + value_20 + value_21)
-        value_q11 = self.value_quadrant_linear(value_11 + value_12 + value_21 + value_22)
+        value_q00 = value_00 + value_01 + value_10 + value_11
+        value_q01 = value_01 + value_02 + value_11 + value_12
+        value_q10 = value_10 + value_11 + value_20 + value_21
+        value_q11 = value_11 + value_12 + value_21 + value_22
+        print(f"value_quad00 sum: \n{value_q00}")
+        print(f"value_quad01 sum: \n{value_q01}")
+        print(f"value_quad10 sum: \n{value_q10}")
+        print(f"value_quad11 sum: \n{value_q11}")
+        value_q00 = self.value_quad_act(self.value_quad_linear(value_q00))
+        value_q01 = self.value_quad_act(self.value_quad_linear(value_q01))
+        value_q10 = self.value_quad_act(self.value_quad_linear(value_q10))
+        value_q11 = self.value_quad_act(self.value_quad_linear(value_q11))
         print(f"value_quad00: \n{value_q00}")
         print(f"value_quad01: \n{value_q01}")
         print(f"value_quad10: \n{value_q10}")
@@ -702,9 +721,15 @@ class Mix8Net(nn.Module):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
         return [{
-            'params': ['mapping_activation.weight'],
-            'min_weight': -1.0,
-            'max_weight': 1.0,
+            'params': [
+                'mapping_activation.weight', 'policy_pwconv_weight_linear.1.weight',
+                'value_corner_act.weight', 'value_edge_act.weight', 'value_center_act.weight',
+                'value_quad_act.weight'
+            ],
+            'min_weight':
+            -1.0,
+            'max_weight':
+            1.0,
         }, {
             'params': [f'feature_dwconv.conv.weight'],
             'min_weight': -1.5,
@@ -713,14 +738,6 @@ class Mix8Net(nn.Module):
             'params': [f'feature_dwconv.conv.bias'],
             'min_weight': -4.0,
             'max_weight': 4.0,
-        }, {
-            'params': ['policy_dwconv.weight'],
-            'min_weight': -1.5,
-            'max_weight': 1.5,
-        }, {
-            'params': ['policy_dwconv.bias'],
-            'min_weight': -5.0,
-            'max_weight': 5.0,
         }]
 
     @property
