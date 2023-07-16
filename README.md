@@ -5,7 +5,7 @@
 ### Requirements
 
 + 64-bit Python 3.9 and Pytorch 1.10 or later.
-+ Huggingface Accelerate 0.6.2 or later.
++ Huggingface Accelerate 0.21.0 or later.
 + Other python libraries: `configargparse tqdm tensorboard matplotlib pybind11 lz4`.
 
 ### Setup dataset pipeline 
@@ -30,7 +30,7 @@ After install all required packages in specified in requirements, it is necessar
 
 ### Train a network
 
-You are recommended to launch from the accelerate-cli, which automatically handles settings for distributed training. But first of all, you need to configurate the training environment:
+You are recommended to launch from the accelerate-cli, which automatically handles settings for distributed training. But first of all, you need to configurate the training environment, to set single-GPU or multi-GPU training and the number of GPUs to use, etc. You can do this by running the following command:
 
 ```
 accelerate config
@@ -116,7 +116,7 @@ A simple tool is provided to inspect a dataset. For example, to view a processed
 python visualize_dataset.py --dataset_type processed_katago_numpy <path to data file>
 ```
 
-Or to view a packed binary dataset file (`.binpack`) produced by [c-gomoku-cli](https://github.com/dhbloo/c-gomoku-cli):
+Or to view a (optionally lz4 compressed) packed binary dataset file (`.binpack` or `.binpack.lz4`) produced by [c-gomoku-cli](https://github.com/dhbloo/c-gomoku-cli):
 
 ```bash
 python visualize_dataset.py --dataset_type packed_binary <path to data file>
@@ -128,12 +128,12 @@ In order to improve the ease of managing weights for different rules and board s
 
 ```C
 struct Header {
-    uint32_t magic;				// 0xacd8cc6a = crc32("gomoku network weight version 1")
-    uint32_t arch_hash;			// architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
-    uint32_t rule_mask;			// applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
-    uint32_t boardsize_mask;	// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
-    uint32_t desc_len;			// length of desc string (=0 for no description)
-    char description[desc_len];	// weight description (encoded in utf-8)
+  uint32_t magic;				// 0xacd8cc6a = crc32("gomoku network weight version 1")
+  uint32_t arch_hash;			// architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
+  uint32_t rule_mask;			// applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
+  uint32_t boardsize_mask;	// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
+  uint32_t desc_len;			// length of desc string (=0 for no description)
+  char description[desc_len];	// weight description (encoded in utf-8)
 }
 ```
 

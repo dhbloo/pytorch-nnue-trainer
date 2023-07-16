@@ -16,14 +16,18 @@ class MultiIterativeDataset(IterableDataset):
         self.fixed_side_input = kwargs['fixed_side_input']
         self.sync_length = sync_length
         self.datasets = []
-        for dataset_type, dataset_args in dataset_dict.items():
-            assert dataset_type in DATASETS
+        for dataset_name, dataset_args in dataset_dict.items():
+            dataset_type = dataset_args.pop('dataset_type')
+            assert dataset_type in DATASETS, f'Invalid dataset type in {dataset_name}: {dataset_type}'
             dataset_cls = DATASETS[dataset_type]
             assert issubclass(dataset_cls, IterableDataset)
 
             data_paths = dataset_args.pop('data_paths', None)
             if isinstance(data_paths, str):
                 data_paths = [data_paths]
+            else:
+                assert data_paths is None or isinstance(data_paths, (list, tuple)), \
+                    f'Invalid data_paths in {dataset_name}, must be None or list of str'
             flist = make_file_list(data_paths or file_list, dataset_cls.FILE_EXTS)
             dataset = dataset_cls(file_list=flist, **kwargs, **dataset_args)
             self.datasets.append(dataset)

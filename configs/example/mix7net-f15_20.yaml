@@ -1,0 +1,67 @@
+# An example config of training a mix7nnue model with mixed dataset of freestyle 15 & 20
+
+# Path to save running logs and checkpoints
+# It is recommended to briefly record the config of the network in the rundir name
+rundir: run_dirs/mix7/basicns128m32p64v32d-f15_20
+
+# Dataset configs
+
+# We will use "multi" dataset type to load multiple datasets (possibly with different sub-dataset types)
+dataset_type: multi
+
+dataset_args:
+  # The dataset_dict is a list of configs for sub-datasets, each item's key is the 
+  # dataset's name and its value is a dict of the sub-dataset's config.
+  # For example, if you have a raw katago dataset for freestyle 15 in data/f15,
+  # and a processed katago dataset for freestyle 20 in data/f20, you can write:
+  dataset_dict:
+    f15:
+      dataset_type: katago_numpy
+      data_paths:
+      - data/f15
+      sample_rate: 1.0
+    f20:
+      dataset_type: iterative_processed_katago_numpy
+      data_paths:
+      - data/f20
+      sample_rate: 1.0
+
+  sample_rate: 1.0
+  apply_symmetry: true
+  sync_length: true  # Setting this to true will sample the same amount of data for each sub-dataset
+
+dataloader_args:
+  # Ensure the same board size for entries in the same batch
+  batch_by_boardsize: true
+
+# Model configs
+
+model_type: mix7
+model_args:
+  dim_middle: 128
+  dim_policy: 32
+  dim_value: 64
+  dim_dwconv: 32
+  input_type: basic-nostm
+
+
+# Training configs
+
+batch_size: 512
+iterations: 1000000
+save_interval: 20000
+learning_rate: 0.001
+weight_decay: 1.0e-7
+clip_grad_norm: 1.0
+
+lr_scheduler_type: step
+lr_scheduler_args:
+  step_size: 100000
+  step_gamma: 0.9
+
+
+log_interval: 100
+show_interval: 1000
+save_interval: 10000
+val_interval: 25000
+avg_loss_interval: 2500

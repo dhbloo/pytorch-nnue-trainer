@@ -1,6 +1,5 @@
 import numpy as np
 import argparse
-import sys
 import os
 from tqdm import tqdm
 
@@ -22,6 +21,8 @@ def npz_split():
         filename = f"{filename_noext}_{idx:04d}" + file_ext
         return os.path.join(outdir, filename)
 
+    assert os.path.exists(args.file), f"File {args.file} does not exist"
+    assert os.path.isfile(args.file), f"Path {args.file} is not a file"
     data = np.load(args.file)
 
     # load data and print data overview
@@ -41,10 +42,12 @@ def npz_split():
 
     # shuffle data array if requested
     if args.shuffle:
+        print("Shuffling data arrays...")
         for key, array in data_to_split.items():
             np.random.shuffle(array)
 
     # split data and save
+    print(f"Splitting data into {args.splits} chunks...")
     for idx in tqdm(range(args.splits)):
         data_chunk = {}
         for key, array in data_to_split.items():
