@@ -184,8 +184,8 @@ def calc_loss(loss_type,
     }
 
     if policy_reg_lambda is not None:
-        policy_reg = float(policy_reg_lambda) * torch.mean(policy).square()
-        total_loss += policy_reg
+        policy_reg = torch.mean(policy).square()
+        total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict['policy_reg'] = policy_reg.detach()
 
     if kd_results is not None:
