@@ -1154,9 +1154,13 @@ class Mix8NetSerializer(BaseSerializer):
                  text_output=False,
                  feature_bound_scale=1.0,
                  **kwargs):
-        super().__init__(rules=[rule],
-                         boardsizes=list(range(5, 23)) if board_size is None else [board_size],
-                         **kwargs)
+        if board_size is None:
+            boardsizes = [15]
+        elif isinstance(board_size, (list, tuple)):
+            boardsizes = list(board_size)
+        else:
+            boardsizes = [board_size]
+        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
         self.line_length = 11
         self.text_output = text_output
         self.feature_bound_scale = feature_bound_scale
