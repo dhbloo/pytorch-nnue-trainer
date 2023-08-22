@@ -96,6 +96,7 @@ def calc_loss(loss_type,
               kd_results=None,
               kd_T=None,
               kd_alpha=None,
+              policy_reg_lambda=None,
               ignore_forbidden_point_policy=False):
     value_loss_type, policy_loss_type = loss_type.split('+')
 
@@ -165,8 +166,8 @@ def calc_loss(loss_type,
                                                    adjust=True,
                                                    weight=policy_loss_weight)
     elif policy_loss_type == 'MSE':
-        policy = torch.softmax(policy, dim=1)
-        policy_loss = F.mse_loss(policy, policy_target, size_average='none')
+        policy_softmaxed = torch.softmax(policy, dim=1)
+        policy_loss = F.mse_loss(policy_softmaxed, policy_target, size_average='none')
         if policy_loss_weight is not None:
             policy_loss = policy_loss * policy_loss_weight
         policy_loss = torch.mean(policy_loss)
@@ -182,12 +183,18 @@ def calc_loss(loss_type,
         'policy_loss': policy_loss.detach(),
     }
 
+    if policy_reg_lambda is not None:
+        policy_reg = torch.mean(policy).square()
+        total_loss += float(policy_reg_lambda) * policy_reg
+        loss_dict['policy_reg'] = policy_reg.detach()
+
     if kd_results is not None:
         # also get a true loss from real data
         real_loss, real_loss_dict = calc_loss(
             loss_type,
             data,
             results,
+            policy_reg_lambda=policy_reg_lambda,
             ignore_forbidden_point_policy=ignore_forbidden_point_policy,
         )
 
