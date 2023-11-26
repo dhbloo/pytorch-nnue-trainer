@@ -3,7 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, Conv1dLine4Block, QuantPReLU
+from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, QuantPReLU, Conv1dLine4Block, \
+    SwitchLinearBlock, SwitchConv2dBlock, SwitchPReLU, SequentialWithExtraArguments
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
 
@@ -17,7 +18,6 @@ def tuple_op(f, x):
 
 
 class DirectionalConvLayer(nn.Module):
-
     def __init__(self, dim_in, dim_out):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
@@ -44,7 +44,6 @@ class DirectionalConvLayer(nn.Module):
 
 
 class DirectionalConvResBlock(nn.Module):
-
     def __init__(self, dim):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim, dim)
@@ -62,7 +61,6 @@ class DirectionalConvResBlock(nn.Module):
 
 
 class Conv0dResBlock(nn.Module):
-
     def __init__(self, dim):
         super().__init__()
         self.conv1 = nn.Conv2d(dim, dim, kernel_size=1)
@@ -80,7 +78,6 @@ class Conv0dResBlock(nn.Module):
 
 
 class Mapping(nn.Module):
-
     def __init__(self, dim_in, dim_middle, dim_out):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim_in, dim_middle)
@@ -101,7 +98,6 @@ class Mapping(nn.Module):
 
 
 class RotatedConv2d3x3(nn.Module):
-
     def __init__(self, dim_in, dim_out) -> None:
         super().__init__()
         self.weight = nn.Parameter(torch.empty((9, dim_out, dim_in)))
@@ -128,7 +124,6 @@ class RotatedConv2d3x3(nn.Module):
 
 @MODELS.register('mix6')
 class Mix6Net(nn.Module):
-
     def __init__(self,
                  dim_middle=128,
                  dim_policy=16,
@@ -202,7 +197,6 @@ class Mix6Net(nn.Module):
 
 @MODELS.register('mix6q')
 class Mix6QNet(nn.Module):  # Q -> quant
-
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -324,7 +318,6 @@ class Mix6QNet(nn.Module):  # Q -> quant
 
 @MODELS.register('mix7')
 class Mix7Net(nn.Module):
-
     def __init__(self,
                  dim_middle=128,
                  dim_policy=32,
@@ -459,7 +452,6 @@ class Mix7Net(nn.Module):
 
 @MODELS.register('mix8')
 class Mix8Net(nn.Module):
-
     def __init__(self,
                  dim_middle=128,
                  dim_feature=64,
@@ -580,9 +572,9 @@ class Mix8Net(nn.Module):
         policy = torch.cat([
             F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
                      weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W)
-            for i in range(4)
-        ], dim=1)
+                     groups=B).reshape(B, 1, H, W) for i in range(4)
+        ],
+                           dim=1)
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value head
@@ -660,9 +652,9 @@ class Mix8Net(nn.Module):
         policy = torch.cat([
             F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
                      weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W)
-            for i in range(4)
-        ], dim=1)
+                     groups=B).reshape(B, 1, H, W) for i in range(4)
+        ],
+                           dim=1)
         print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
         policy = self.policy_output(policy)  # [B, 1, H, W]
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
@@ -745,3 +737,333 @@ class Mix8Net(nn.Module):
         _, f, p, v, q = self.model_size
         d = self.dim_dwconv
         return f"mix8_{self.input_type}_{f}f{p}p{v}v{q}q{d}d"
+
+
+@MODELS.register('mix9')
+class Mix9Net(nn.Module):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_feature=64,
+                 dim_policy=32,
+                 dim_value=64,
+                 dim_value_group=32,
+                 dim_dwconv=None,
+                 input_type='basicns',
+                 num_buckets=32):
+        super().__init__()
+        dim_feature = max(dim_policy, dim_value)
+        self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_group)
+        self.input_type = input_type
+        self.dim_dwconv = dim_policy if dim_dwconv is None else dim_dwconv
+        self.num_buckets = num_buckets
+        assert self.dim_dwconv <= dim_feature, f"Invalid dim_dwconv {self.dim_dwconv}"
+        assert self.dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
+
+        self.input_plane = build_input_plane(input_type)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+        self.mapping_activation = QuantPReLU(
+            dim_feature,
+            input_quant_scale=1024,
+            input_quant_bits=16,
+            weight_quant_scale=32768,
+            weight_quant_bits=16,
+        )
+
+        # feature depth-wise conv
+        self.feature_dwconv = Conv2dBlock(self.dim_dwconv,
+                                          self.dim_dwconv,
+                                          ks=3,
+                                          st=1,
+                                          padding=3 // 2,
+                                          groups=self.dim_dwconv,
+                                          activation='relu')
+
+        # MoE router layer
+        self.router_linear = LinearBlock(self.dim_dwconv, num_buckets, activation='none')
+
+        # policy head (point-wise conv)
+        self.policy_pwconv_weight = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_feature, dim_policy, num_buckets, activation='none'),
+            SwitchPReLU(dim_policy, num_buckets),
+            SwitchLinearBlock(dim_policy, 4 * dim_policy, num_buckets, activation='none'))
+        self.policy_output = nn.Sequential(nn.PReLU(4), Conv2dBlock(4, 1, ks=1, st=1))
+
+        # value head
+        self.value_corner = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_feature, dim_value_group, num_buckets, activation='none'),
+            SwitchPReLU(dim_value_group, num_buckets))
+        self.value_edge = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_feature, dim_value_group, num_buckets, activation='none'),
+            SwitchPReLU(dim_value_group, num_buckets))
+        self.value_center = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_feature, dim_value_group, num_buckets, activation='none'),
+            SwitchPReLU(dim_value_group, num_buckets))
+        self.value_quad = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_value_group, dim_value_group, num_buckets, activation='none'),
+            SwitchPReLU(dim_value_group, num_buckets))
+        self.value_linear = SequentialWithExtraArguments(
+            SwitchLinearBlock(dim_feature + 4 * dim_value_group, dim_value, num_buckets),
+            SwitchLinearBlock(dim_value, dim_value, num_buckets),
+            SwitchLinearBlock(dim_value, 3, num_buckets, activation='none'),
+        )
+
+    def get_feature(self, data, inv_side=False):
+        # get the input plane from board and side to move input
+        input_plane = self.input_plane({
+            'board_input':
+            torch.flip(data['board_input'], dims=[1]) if inv_side else data['board_input'],
+            'stm_input':
+            -data['stm_input'] if inv_side else data['stm_input']
+        })  # [B, 2, H, W]
+        # get per-point 4-direction cell features
+        feature = self.mapping(input_plane)  # [B, 4, dim_feature, H, W]
+
+        # clamp feature for int quantization
+        feature = torch.clamp(feature, min=-32, max=32)  # int16, scale=255, [-32,32]
+        feature = fake_quant(feature, scale=255, num_bits=16)
+        # sum (and rescale) feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=1020, [-32,32]
+        feature = self.mapping_activation(feature)  # int16, scale=1020, [-32,32]
+
+        # apply feature depth-wise conv
+        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
+        feat_direct = feature[:, self.dim_dwconv:]  # [B, dim_feature-dwconv, H, W]
+        feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
+
+        return feature
+
+    def get_routing(self, feature_mean):
+        # does not propogate gradients back
+        route_feature = feature_mean.detach()[:, :self.dim_dwconv]
+        
+        # get routing probabilities and index
+        route_logits = self.router_linear(route_feature)
+        route_probs = torch.softmax(route_logits, dim=1)  # [B, num_buckets]
+        route_prob_max, route_idx = torch.max(route_probs, dim=1)  # [B]
+
+        # calc load balancing loss
+        inv_batch_size = 1.0 / route_logits.shape[0]
+        route_frac = torch.tensor([(route_idx == i).sum() * inv_batch_size
+                                   for i in range(self.num_buckets)],
+                                  dtype=route_probs.dtype,
+                                  device=route_probs.device)  # [num_buckets]
+        route_prob_mean = route_probs.mean(0)  # [num_buckets]
+        load_balancing_loss = self.num_buckets * torch.dot(route_frac, route_prob_mean)
+
+        return route_idx, route_prob_max, route_frac, load_balancing_loss
+
+    def forward(self, data):
+        _, _, dim_policy, _, _ = self.model_size
+
+        # get feature from single side
+        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
+
+        # value feature accumulator
+        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature]
+
+        # routing layer
+        route_idx, route_prob_max, route_frac, load_balancing_loss = self.get_routing(feature_mean)
+        route_scale = (route_prob_max / route_prob_max.detach()).view(-1, 1)  # [B, 1]
+
+        # value feature accumulator of four quadrants
+        B, _, H, W = feature.shape
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+
+        # policy head
+        pwconv_weight = self.policy_pwconv_weight(feature_mean, route_idx)
+        pwconv_weight = (pwconv_weight * route_scale).reshape(B, 4 * dim_policy, 1, 1)
+        policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
+        policy = torch.cat([
+            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                     groups=B).reshape(B, 1, H, W) for i in range(4)
+        ], 1)
+        policy = self.policy_output(policy)  # [B, 1, H, W]
+
+        # value head
+        value_00 = self.value_corner(feature_00, route_idx)
+        value_01 = self.value_edge(feature_01, route_idx)
+        value_02 = self.value_corner(feature_02, route_idx)
+        value_10 = self.value_edge(feature_10, route_idx)
+        value_11 = self.value_center(feature_11, route_idx)
+        value_12 = self.value_edge(feature_12, route_idx)
+        value_20 = self.value_corner(feature_20, route_idx)
+        value_21 = self.value_edge(feature_21, route_idx)
+        value_22 = self.value_corner(feature_22, route_idx)
+        value_q00 = self.value_quad(value_00 + value_01 + value_10 + value_11, route_idx)
+        value_q01 = self.value_quad(value_01 + value_02 + value_11 + value_12, route_idx)
+        value_q10 = self.value_quad(value_10 + value_11 + value_20 + value_21, route_idx)
+        value_q11 = self.value_quad(value_11 + value_12 + value_21 + value_22, route_idx)
+        value = torch.cat([
+            feature_mean,
+            value_q00,
+            value_q01,
+            value_q10,
+            value_q11,
+        ], 1)  # [B, dim_feature + 4 * dim_value_group]
+        value = self.value_linear(value, route_idx) * route_scale
+
+        aux_losses = {'load_balancing': load_balancing_loss}
+        aux_outputs = {
+            'route_prob_max': route_prob_max,
+            'route_frac_min': route_frac.min(),
+            'route_frac_max': route_frac.max(),
+            'route_frac_std': route_frac.std(),
+        }
+        return value, policy, aux_losses, aux_outputs
+
+    def forward_debug_print(self, data):
+        _, _, dim_policy, _, _ = self.model_size
+
+        # get feature from single side
+        feature = self.get_feature(data, False)
+        print(f"feature after dwconv at (0,0): \n{feature[..., 0, 0]}")
+
+        # value feature accumulator
+        feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature, H, W]
+        print(f"feature mean: \n{feature_mean}")
+
+        # value feature accumulator of four quadrants
+        B, _, H, W = feature.shape
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        print(f"feature 00 mean: \n{feature_00}")
+        print(f"feature 01 mean: \n{feature_01}")
+        print(f"feature 02 mean: \n{feature_02}")
+        print(f"feature 10 mean: \n{feature_10}")
+        print(f"feature 11 mean: \n{feature_11}")
+        print(f"feature 12 mean: \n{feature_12}")
+        print(f"feature 20 mean: \n{feature_20}")
+        print(f"feature 21 mean: \n{feature_21}")
+        print(f"feature 22 mean: \n{feature_22}")
+
+        # policy head
+        pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)  # [B, dim_policy]
+        print(f"policy weight: \n{pwconv_weight}")
+        pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
+        policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
+        print(f"policy after dwconv at (0,0): \n{policy[..., 0, 0]}")
+        policy = torch.cat([
+            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                     groups=B).reshape(B, 1, H, W) for i in range(4)
+        ],
+                           dim=1)
+        print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
+        policy = self.policy_output(policy)  # [B, 1, H, W]
+        print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
+
+        # value head
+        value_00 = self.value_corner_act(self.value_corner_linear(feature_00))
+        value_01 = self.value_edge_act(self.value_edge_linear(feature_01))
+        value_02 = self.value_corner_act(self.value_corner_linear(feature_02))
+        value_10 = self.value_edge_act(self.value_edge_linear(feature_10))
+        value_11 = self.value_center_act(self.value_center_linear(feature_11))
+        value_12 = self.value_edge_act(self.value_edge_linear(feature_12))
+        value_20 = self.value_corner_act(self.value_corner_linear(feature_20))
+        value_21 = self.value_edge_act(self.value_edge_linear(feature_21))
+        value_22 = self.value_corner_act(self.value_corner_linear(feature_22))
+        print(f"value_00: \n{value_00}")
+        print(f"value_01: \n{value_01}")
+        print(f"value_02: \n{value_02}")
+        print(f"value_10: \n{value_10}")
+        print(f"value_11: \n{value_11}")
+        print(f"value_12: \n{value_12}")
+        print(f"value_20: \n{value_20}")
+        print(f"value_21: \n{value_21}")
+        print(f"value_22: \n{value_22}")
+        value_q00 = value_00 + value_01 + value_10 + value_11
+        value_q01 = value_01 + value_02 + value_11 + value_12
+        value_q10 = value_10 + value_11 + value_20 + value_21
+        value_q11 = value_11 + value_12 + value_21 + value_22
+        print(f"value_quad00 sum: \n{value_q00}")
+        print(f"value_quad01 sum: \n{value_q01}")
+        print(f"value_quad10 sum: \n{value_q10}")
+        print(f"value_quad11 sum: \n{value_q11}")
+        value_q00 = self.value_quad_act(self.value_quad_linear(value_q00))
+        value_q01 = self.value_quad_act(self.value_quad_linear(value_q01))
+        value_q10 = self.value_quad_act(self.value_quad_linear(value_q10))
+        value_q11 = self.value_quad_act(self.value_quad_linear(value_q11))
+        print(f"value_quad00: \n{value_q00}")
+        print(f"value_quad01: \n{value_q01}")
+        print(f"value_quad10: \n{value_q10}")
+        print(f"value_quad11: \n{value_q11}")
+        value = torch.cat([
+            feature_mean,
+            value_q00,
+            value_q01,
+            value_q10,
+            value_q11,
+        ], 1)  # [B, dim_feature + 4 * dim_value_group]
+        print(f"value feature input: \n{value}")
+        for i, linear in enumerate(self.value_linear):
+            value = linear(value)
+            print(f"value feature after layer {i}: \n{value}")
+
+        return value, policy
+
+    @property
+    def weight_clipping(self):
+        # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
+        # In this range, prelu is the same as `max(x, ax)`.
+        return [{
+            'params': ['mapping_activation.weight'],
+            'min_weight': -1.0,
+            'max_weight': 1.0,
+        }, {
+            'params': [
+                'policy_pwconv_weight.1.weight',
+                'value_corner.1.weight',
+                'value_edge.1.weight',
+                'value_center.1.weight',
+                'value_quad.1.weight',
+            ],
+            'virtual_params': [
+                'policy_pwconv_weight.1.weight_fact',
+                'value_corner.1.weight_fact',
+                'value_edge.1.weight_fact',
+                'value_center.1.weight_fact',
+                'value_quad.1.weight_fact',
+            ],
+            'min_weight':
+            -1.0,
+            'max_weight':
+            1.0,
+        }, {
+            'params': [f'feature_dwconv.conv.weight'],
+            'min_weight': -1.5,
+            'max_weight': 1.5,
+        }, {
+            'params': [f'feature_dwconv.conv.bias'],
+            'min_weight': -4.0,
+            'max_weight': 4.0,
+        }]
+
+    @property
+    def name(self):
+        _, f, p, v, q = self.model_size
+        d = self.dim_dwconv
+        return f"mix9_{self.input_type}_{f}f{p}p{v}v{q}q{d}d"

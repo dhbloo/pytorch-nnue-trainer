@@ -97,11 +97,14 @@ def calc_loss(loss_type,
               kd_T=None,
               kd_alpha=None,
               policy_reg_lambda=None,
-              ignore_forbidden_point_policy=False):
+              ignore_forbidden_point_policy=False,
+              **extra_args):
     value_loss_type, policy_loss_type = loss_type.split('+')
 
     # get predicted value and policy from model results
     value, policy, *retvals = results
+    aux_losses = retvals[0] if len(retvals) >= 1 else None
+    aux_outputs = retvals[1] if len(retvals) >= 2 else None
 
     if kd_results is not None:
         # get value and policy target from teacher model
@@ -178,7 +181,6 @@ def calc_loss(loss_type,
 
     total_loss = value_loss + policy_loss
     loss_dict = {
-        'total_loss': total_loss.detach(),
         'value_loss': value_loss.detach(),
         'policy_loss': policy_loss.detach(),
     }
@@ -204,6 +206,18 @@ def calc_loss(loss_type,
         loss_dict = real_loss_dict
         loss_dict.update(kd_loss_dict)
 
+    if aux_losses is not None:
+        for aux_loss_name, aux_loss in aux_losses.items():
+            if f'{aux_loss_name}_lambda' in extra_args:
+                aux_loss = aux_loss * float(extra_args[f'{aux_loss_name}_lambda'])
+            total_loss += aux_loss
+            loss_dict[f'{aux_loss_name}_loss'] = aux_loss.detach()
+
+    if aux_outputs is not None:
+        for aux_output_name, aux_output in aux_outputs.items():
+            loss_dict[f'{aux_output_name}'] = aux_output.detach()
+
+    loss_dict['total_loss'] = total_loss.detach()
     return total_loss, loss_dict
 
 
@@ -405,6 +419,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 val_loss_dict = {}
                 num_val_batches = 0
 
+                model.eval()
                 with torch.no_grad():
                     for val_data in val_loader:
                         # evaulate teacher model for knowledge distillation
@@ -415,6 +430,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                                                   **loss_args)
                         add_dict_to(val_loss_dict, val_losses)
                         num_val_batches += 1
+                model.train()
 
                 # gather all loss dict across processes
                 val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches
