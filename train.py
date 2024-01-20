@@ -118,7 +118,10 @@ def calc_loss(loss_type,
 
     if kd_results is not None:
         # apply softmax to value and policy target according to temparature
-        value_target = torch.softmax(value_target / kd_T, dim=1)
+        if value_target.size(1) > 1:
+            value_target = torch.softmax(value_target / kd_T, dim=1)
+        else:  # for value without draw info
+            value_target = torch.sigmoid(value_target / kd_T)
         policy_target = torch.softmax(policy_target / kd_T, dim=1)
 
         # scale prediction value and policy according to temparature
@@ -127,9 +130,12 @@ def calc_loss(loss_type,
 
     # convert value_target if value has no draw info
     if value.size(1) == 1:
-        value = value[:, 0]
-        value_target = value_target[:, 0] - value_target[:, 1]
-        value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
+        value = value[:, 0]  # squeeze value channel dim
+        if value_target.size(1) == 1:
+            value_target = value_target[:, 0]   # squeeze value channel dim
+        else:
+            value_target = value_target[:, 0] - value_target[:, 1]
+            value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
 
     # ===============================================================
     # value loss

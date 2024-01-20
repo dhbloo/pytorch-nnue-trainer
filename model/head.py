@@ -14,7 +14,7 @@ def build_head(head_type, dim_feature):
     if head_type == 'v0':
         return OutputHeadV0(dim_feature, dim_value)
     elif head_type == 'v1' or head_type.starts_with('v1-'):
-        scale = int(head_type[3:] or 1)
+        scale = int(head_type[3:]) if head_type[3:] else 1
         return OutputHeadV1(dim_feature, dim_feature * scale, dim_value)
     else:
         assert 0, f"Unsupported head: {head_type}"
