@@ -1036,7 +1036,7 @@ class FlatSquare7x7NNUEv1(nn.Module):
 class FlatSquare7x7NNUEv2(nn.Module):
     def __init__(self,
                  dim_middle=128,
-                 dim_feature=8,
+                 dim_feature=32,
                  quant_int4=False,
                  input_type='basic-nostm',
                  value_no_draw=False):
@@ -1051,7 +1051,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
         # value head
         dim_vhead = 1 if value_no_draw else 3
         self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 4, 32, activation="none", quant=True),
+            LinearBlock(dim_feature * 4, 32, activation="none", quant=True, weight_quant_scale=256),
             LinearBlock(32, 32, activation="none", quant=True),
             LinearBlock(32, dim_vhead, activation="none", quant=True),
         ])
@@ -1078,7 +1078,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
             Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
         )
 
-    def get_feature_sum(self, input_plane):
+    def get_features(self, input_plane):
         corner_index = [
             [0, 4, 0, 4, 0],
             [0, 4, 3, 7, 1],
@@ -1098,9 +1098,9 @@ class FlatSquare7x7NNUEv2(nn.Module):
             
         middle_index = [
             [0, 4, 2, 5, 0],
-            [2, 5, 0, 4, -1],
             [2, 5, 3, 7, 1],
             [3, 7, 2, 5, 2],
+            [2, 5, 0, 4, -1],
         ]
         features_middle = []
         for y0, y1, x0, x1, k in middle_index:
@@ -1110,22 +1110,49 @@ class FlatSquare7x7NNUEv2(nn.Module):
             feat = feat.squeeze(-1).squeeze(-1)
             features_middle.append(feat)
             
-        feature_corner = torch.cat(features_corner, dim=1)
-        feature_middle = torch.cat(features_middle, dim=1)
-        return feature_corner + feature_middle
+        return features_corner, features_middle
 
     def forward(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
         _, _, H, W = input_plane.shape
 
         # get feature sum from chunks
-        feature = self.get_feature_sum(input_plane)
+        features_corner, features_middle = self.get_features(input_plane)
+        feature_corner = torch.cat(features_corner, dim=1)
+        feature_middle = torch.cat(features_middle, dim=1)
+        feature = feature_corner + feature_middle
 
         # value head
         value = feature  # [B, dim_feature]
         for i, layer in enumerate(self.value_linears):
             value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
             value = layer(value)
+
+        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        return value, policy
+    
+    def forward_debug_print(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        _, _, H, W = input_plane.shape
+
+        # get feature sum from chunks
+        features_corner, features_middle = self.get_features(input_plane)
+        for i, f_corner in enumerate(features_corner):
+            print(f"feature4x4[{i}]: \n{(f_corner * 128).int()}")
+        for i, f_middle in enumerate(features_middle):
+            print(f"feature4x3[{i}]: \n{(f_middle * 128).int()}")
+        feature_corner = torch.cat(features_corner, dim=1)
+        feature_middle = torch.cat(features_middle, dim=1)
+        feature = feature_corner + feature_middle
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # value head
+        value = feature  # [B, dim_feature]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
         return value, policy
@@ -1192,6 +1219,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
             [2, 6, 0, 4, 1, True , self.mapping4x4_edge],
             [0, 4, 1, 5, 0, True , self.mapping4x4_edge],
             [0, 4, 2, 6, 3, False, self.mapping4x4_edge],
+            
             [3, 7, 1, 5, 1, False, self.mapping4x4_edge],
             [3, 7, 2, 6, 2, True , self.mapping4x4_edge],
             [1, 5, 3, 7, 3, True , self.mapping4x4_edge],

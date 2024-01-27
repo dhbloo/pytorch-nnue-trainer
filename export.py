@@ -31,6 +31,7 @@ def parse_args_and_init():
                type=yaml.safe_load,
                default={},
                help="Extra dataloader arguments")
+    parser.add('--use_cpu', action='store_true', help="Use cpu only")
 
     args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
@@ -122,9 +123,9 @@ def export_onnx(output, model, **kwargs):
     print(f"Onnx model has been written to {output}.")
 
 
-def export_serialization(output, output_type, model_type, model, export_args, **kwargs):
+def export_serialization(output, output_type, model_type, model, export_args, use_cpu, **kwargs):
     serializer = build_serializer(model_type, **export_args)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if not use_cpu and torch.cuda.is_available() else 'cpu')
     model.to(device)
 
     def open_output(output):

@@ -205,7 +205,7 @@ def calc_loss(loss_type,
         )
 
         # merge real loss and knowledge distillation loss
-        total_loss = kd_alpha * total_loss + (1 - kd_alpha) * real_loss
+        total_loss = kd_alpha * total_loss * (kd_T**2) + (1 - kd_alpha) * real_loss
         kd_loss_dict = {'kd_' + k: v for k, v in loss_dict.items()}
         loss_dict = real_loss_dict
         loss_dict.update(kd_loss_dict)

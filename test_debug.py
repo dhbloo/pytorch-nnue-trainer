@@ -110,7 +110,7 @@ def debug_print(board, model, data):
     # remove batch dimension
     value = value.squeeze(0)
     policy = policy.squeeze(0)
-    with np.printoptions(precision=3, linewidth=120, suppress=True):
+    with np.printoptions(precision=4, linewidth=120, suppress=True):
         print(f'Raw Value: {value.cpu().numpy()}')
     with np.printoptions(precision=2, linewidth=120, suppress=True):
         print(f'Raw Policy: \n{policy.cpu().numpy()}')
@@ -123,7 +123,7 @@ def debug_print(board, model, data):
     else:
         assert 0, f"Invalid value shape: {value.shape}"
     policy = torch.softmax(policy.flatten(), dim=0).reshape(policy.shape)
-    with np.printoptions(precision=3, linewidth=120, suppress=True):
+    with np.printoptions(precision=4, linewidth=120, suppress=True):
         if value.shape[0] == 1:
             print(f'Sigmoided Value: {value.cpu().numpy()}')
         elif value.shape[0] == 3:

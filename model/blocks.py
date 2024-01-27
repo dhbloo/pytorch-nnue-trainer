@@ -149,7 +149,8 @@ class LinearBlock(nn.Module):
 
     def forward(self, x):
         if self.quant:
-            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
+            # Using floor for inputs leads to closer results to the actual inference code
+            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits, floor=True)
             w = fake_quant(self.fc.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             if self.fc.bias is not None:
                 b = fake_quant(self.fc.bias,
