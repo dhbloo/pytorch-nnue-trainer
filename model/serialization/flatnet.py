@@ -476,3 +476,156 @@ class FlatSquare7x7NNUEv2Serializer(BaseSerializer):
         # float l3_bias[4];
         o.write(linear3_weight.astype('<i1').tobytes())  # (4, 32)
         o.write(linear3_bias.astype('<i4').tobytes())  # (4,)
+        
+        
+@SERIALIZERS.register('flat_square7x7_nnue_v3')
+class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
+    """
+    FlatSquare7x7NNUEv3 binary serializer.
+
+    The corresponding C-language struct layout: 
+    struct FlatSquare7x7NNUEv3Weight {
+        // mapping features
+        int8_t  mapping3x4[3][531441][FeatureDim];
+
+        // nnue layers weights
+        int8_t  l1_weight[64][FeatureDim * 4];
+        int32_t l1_bias[64];
+        int8_t  l2_weight[32][64];
+        int32_t l2_bias[32];
+        int8_t  l3_weight[4][32];
+        int32_t l3_bias[4];
+    };
+    """
+    def __init__(self, s_input=256, s_weight=128, **kwargs):
+        super().__init__(**kwargs)
+        self.s_input = s_input
+        self.s_weight = s_weight
+        
+    @property
+    def is_binary(self) -> bool:
+        return True
+
+    @property
+    def needs_header(self) -> bool:
+        return False
+
+    def arch_hash(self, model) -> int:
+        raise NotImplementedError()
+    
+    def _get_mapping3x4_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
+        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
+        inputs = torch.zeros(indices.shape[0], 2, 3, 4)
+        for i in range(3 * 4):
+            bit = (indices // 3**i) % 3
+            inputs[:, 0, i // 4, i % 4] = bit == 1
+            inputs[:, 1, i // 4, i % 4] = bit == 2
+        return inputs
+    
+    @torch.no_grad()
+    def _export_feature_map(self, model: FlatSquare7x7NNUEv3, device: torch.device):
+        _, dim_feature = model.model_size
+        batch_size = 4096
+        
+        mapping3x4_corner1 = []
+        mapping3x4_corner2 = []
+        mapping3x4_middle = []
+        for i_start in tqdm(range(0, 3**12, batch_size)):
+            i_end = min(i_start + batch_size, 3**12)
+            chunk3x4_input = self._get_mapping3x4_input(i_start, i_end).to(device)
+            mapping3x4_corner1.append(model.mapping3x4_corner1(chunk3x4_input))
+            mapping3x4_corner2.append(model.mapping3x4_corner2(chunk3x4_input))
+            mapping3x4_middle.append(model.mapping3x4_middle(chunk3x4_input))
+
+        def export_mapping3x4(name, mapping3x4):
+            mapping3x4 = torch.cat(mapping3x4, dim=0).squeeze(-1).squeeze(-1)
+            
+            if model.quant_int4:  # int4 quant
+                mapping3x4 = torch.clamp(mapping3x4, min=-1, max=7 / 8)
+            else:  # int8 quant
+                mapping3x4 = torch.clamp(mapping3x4, min=-1, max=127 / 128)
+        
+            mapping3x4 = mapping3x4.view((3**12, dim_feature)).cpu().numpy()
+            ascii_hist(f"mapping3x4[{name}]", mapping3x4)
+        
+            if model.quant_int4:  # int4 quant
+                mapping3x4 = np.clip(np.around(mapping3x4 * 8), -8, 7).astype(np.int8)
+            else:  # int8 quant
+                mapping3x4 = np.clip(np.around(mapping3x4 * 128), -128, 127).astype(np.int8)
+                
+            return mapping3x4
+        
+        mapping3x4_corner1 = export_mapping3x4("corner1", mapping3x4_corner1)
+        mapping3x4_corner2 = export_mapping3x4("corner2", mapping3x4_corner2)
+        mapping3x4_middle = export_mapping3x4("middle", mapping3x4_middle)
+        return np.stack([mapping3x4_corner1, mapping3x4_corner2, mapping3x4_middle])
+    
+    def _export_value(self, model: FlatSquare7x7NNUEv3):
+        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
+        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
+        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
+        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
+        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
+        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
+
+        ascii_hist("value: linear1_weight", l1_weight)
+        ascii_hist("value: linear1_bias", l1_bias)
+        ascii_hist("value: linear2_weight", l2_weight)
+        ascii_hist("value: linear2_bias", l2_bias)
+        ascii_hist("value: linear3_weight", l3_weight)
+        ascii_hist("value: linear3_bias", l3_bias)
+
+        if model.value_no_draw:
+            l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
+            l3_bias = np.concatenate([l3_bias, np.zeros((3, ))], axis=0)
+        else:
+            l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
+            l3_bias = np.concatenate([l3_bias, np.zeros((1, ))], axis=0)
+
+        return (
+            np.clip(np.around(l1_weight * self.s_input), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * self.s_input * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * self.s_weight * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
+            np.clip(np.around(l3_bias * self.s_weight * 128), -2**31, 2**31 - 1).astype(np.int32),
+        )
+    
+    def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv3, device: torch.device):
+        mapping3x4 = self._export_feature_map(model, device)
+        linear1_weight, linear1_bias, \
+        linear2_weight, linear2_bias, \
+        linear3_weight, linear3_bias = self._export_value(model)
+
+        o: io.RawIOBase = out
+
+        if model.quant_int4:
+            # int8_t mapping3x4[3][531441][FeatureDim // 2];
+            mapping3x4 = mapping3x4.astype('<i1')
+            mapping3x4_u8_lo = mapping3x4[..., 0::2] + 8
+            mapping3x4_u8_hi = mapping3x4[..., 1::2] + 8
+            assert mapping3x4_u8_lo.min() >= 0 and mapping3x4_u8_lo.max() <= 15
+            assert mapping3x4_u8_hi.min() >= 0 and mapping3x4_u8_hi.max() <= 15
+            mapping3x4_u8 = np.bitwise_or(np.left_shift(mapping3x4_u8_hi, 4), mapping3x4_u8_lo)
+            o.write(mapping3x4_u8.tobytes())  # (3, 531441, F//2)
+        else:
+            # int8_t mapping3x4[3][531441][FeatureDim];
+            o.write((mapping3x4[0] + 128).astype('<u1').tobytes())  # (531441, F)
+            o.write((mapping3x4[1] + 128).astype('<u1').tobytes())  # (531441, F)
+            o.write(mapping3x4[2].astype('<i1').tobytes())  # (531441, F)
+
+        # float l1_weight[64][FeatureDim * 4];
+        # float l1_bias[64];
+        o.write(linear1_weight.astype('<i1').tobytes())  # (64, F)
+        o.write(linear1_bias.astype('<i4').tobytes())  # (64,)
+
+        # float l2_weight[32][64];
+        # float l2_bias[32];
+        o.write(linear2_weight.astype('<i1').tobytes())  # (32, 64)
+        o.write(linear2_bias.astype('<i4').tobytes())  # (32,)
+
+        # float l3_weight[4][32];
+        # float l3_bias[4];
+        o.write(linear3_weight.astype('<i1').tobytes())  # (4, 32)
+        o.write(linear3_bias.astype('<i4').tobytes())  # (4,)
+        

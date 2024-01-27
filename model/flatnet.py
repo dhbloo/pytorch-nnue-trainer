@@ -1175,7 +1175,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
 class FlatSquare7x7NNUEv3(nn.Module):
     def __init__(self,
                  dim_middle=128,
-                 dim_feature=8,
+                 dim_feature=32,
                  quant_int4=False,
                  input_type='basic-nostm',
                  value_no_draw=False):
@@ -1184,73 +1184,69 @@ class FlatSquare7x7NNUEv3(nn.Module):
         self.quant_int4 = quant_int4
         self.value_no_draw = value_no_draw
         self.input_plane = build_input_plane(input_type)
-        self.mapping4x4_corner = self._make_4x4_mapping(dim_middle, dim_feature)
-        self.mapping4x4_edge = self._make_4x4_mapping(dim_middle, dim_feature)
-        self.mapping4x4_center = self._make_4x4_mapping(dim_middle, dim_feature)
+        self.mapping3x4_corner1 = self._make_3x4_mapping(dim_middle, dim_feature)
+        self.mapping3x4_corner2 = self._make_3x4_mapping(dim_middle, dim_feature)
+        self.mapping3x4_middle = self._make_3x4_mapping(dim_middle, dim_feature)
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
         self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 16, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(dim_feature * 4, 64, activation="none", quant=True, weight_quant_scale=256),
+            LinearBlock(64, 32, activation="none", quant=True),
             LinearBlock(32, dim_vhead, activation="none", quant=True),
         ])
 
-    def _make_4x4_mapping(self, dim_middle, dim_mapping):
+    def _make_3x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
             Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, activation="mish"),
             Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
             Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
             Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_middle, ks=(1, 2), st=1, norm="bn", activation="mish"),
             Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
             Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
         )
 
     def get_feature_sum(self, input_plane):
+        fs_corner1, fs_corner2, fs_middle = [], [], []
         patterns = [
-            # Corner x 4
-            [0, 4, 0, 4, 0, False, self.mapping4x4_corner],
-            [0, 4, 3, 7, 1, False, self.mapping4x4_corner],
-            [3, 7, 3, 7, 2, False, self.mapping4x4_corner],
-            [3, 7, 0, 4, 3, False, self.mapping4x4_corner],
-            # Edge x 8
-            [1, 5, 0, 4, 0, False, self.mapping4x4_edge],
-            [2, 6, 0, 4, 1, True , self.mapping4x4_edge],
-            [0, 4, 1, 5, 0, True , self.mapping4x4_edge],
-            [0, 4, 2, 6, 3, False, self.mapping4x4_edge],
+            [0, 3, 0, 4, 0, fs_corner1, self.mapping3x4_corner1],
+            [0, 4, 4, 7, 1, fs_corner1, self.mapping3x4_corner1],
+            [4, 7, 3, 7, 2, fs_corner1, self.mapping3x4_corner1],
+            [3, 7, 0, 3, 3, fs_corner1, self.mapping3x4_corner1],
             
-            [3, 7, 1, 5, 1, False, self.mapping4x4_edge],
-            [3, 7, 2, 6, 2, True , self.mapping4x4_edge],
-            [1, 5, 3, 7, 3, True , self.mapping4x4_edge],
-            [2, 6, 3, 7, 2, False, self.mapping4x4_edge],
-            # Center x 4
-            [1, 5, 1, 5, 0, False, self.mapping4x4_center],
-            [1, 5, 2, 6, 1, False, self.mapping4x4_center],
-            [2, 6, 2, 6, 2, False, self.mapping4x4_center],
-            [2, 6, 1, 5, 3, False, self.mapping4x4_center],
+            [0, 4, 0, 3, 3, fs_corner2, self.mapping3x4_corner2],
+            [0, 3, 3, 7, 0, fs_corner2, self.mapping3x4_corner2],
+            [3, 7, 4, 7, 1, fs_corner2, self.mapping3x4_corner2],
+            [4, 7, 0, 4, 2, fs_corner2, self.mapping3x4_corner2],
+            
+            [0, 4, 2, 5, 3, fs_middle, self.mapping3x4_middle],
+            [2, 5, 3, 7, 0, fs_middle, self.mapping3x4_middle],
+            [3, 7, 2, 5, 1, fs_middle, self.mapping3x4_middle],
+            [2, 5, 0, 4, 2, fs_middle, self.mapping3x4_middle],
         ]
-        features = []
-        for y0, y1, x0, x1, k, t, mapping in patterns:
+        for y0, y1, x0, x1, k, fs, mapping in patterns:
             chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
-            if t:
-                chunk = torch.transpose(chunk, 2, 3)
             feat = mapping(chunk)
             if self.quant_int4:  # int4 quant
                 feat = fake_quant(torch.clamp(feat, min=-1, max=7 / 8), scale=8, num_bits=4)
             else:  # int8 quant
                 feat = fake_quant(torch.clamp(feat, min=-1, max=127 / 128), scale=128)
             feat = feat.squeeze(-1).squeeze(-1)
-            features.append(feat)
+            fs.append(feat)
 
-        return torch.cat(features, dim=1)
+        return fs_corner1, fs_corner2, fs_middle
 
     def forward(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
         _, _, H, W = input_plane.shape
 
         # get feature sum from chunks
-        feature = self.get_feature_sum(input_plane)
+        fs_corner1, fs_corner2, fs_middle = self.get_feature_sum(input_plane)
+        f_corner1 = torch.cat(fs_corner1, dim=1)
+        f_corner2 = torch.cat(fs_corner2, dim=1)
+        f_middle = torch.cat(fs_middle, dim=1)
+        feature = fake_quant((f_corner1 + f_corner2 + 1/128) / 2, floor=True) + f_middle
 
         # value head
         value = feature  # [B, dim_feature]
@@ -1260,13 +1256,46 @@ class FlatSquare7x7NNUEv3(nn.Module):
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
         return value, policy
+    
+    def forward_debug_print(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        _, _, H, W = input_plane.shape
+
+        # get feature sum from chunks
+        fs_corner1, fs_corner2, fs_middle = self.get_feature_sum(input_plane)
+        for i, f in enumerate(fs_corner1):
+            print(f"fs_corner1[{i}]: \n{(f * 128).int()}")
+        for i, f in enumerate(fs_corner2):
+            print(f"fs_corner2[{i}]: \n{(f * 128).int()}")
+        for i, f in enumerate(fs_middle):
+            print(f"fs_middle[{i}]: \n{(f * 128).int()}")
+        f_corner1 = torch.cat(fs_corner1, dim=1)
+        f_corner2 = torch.cat(fs_corner2, dim=1)
+        f_middle = torch.cat(fs_middle, dim=1)
+        feature = fake_quant((f_corner1 + f_corner2 + 1/128) / 2, floor=True) + f_middle
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # value head
+        value = feature  # [B, dim_feature]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
+
+        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        return value, policy
 
     @property
     def weight_clipping(self):
         return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
+            'params': ['value_linears.1.fc.weight', 'value_linears.2.fc.weight'],
             'min_weight': -128 / 128,
             'max_weight': 127 / 128
+        }, {
+            'params': [f'value_linears.0.fc.weight'],
+            'min_weight': -128 / 256,
+            'max_weight': 127 / 256
         }]
 
     @property
