@@ -104,7 +104,8 @@ class KatagoNumpyDataset(IterableDataset):
             value_target[0], value_target[1] = value_target[1], value_target[0]
 
         if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(data['board_size'])
+            symmetry_type = self.apply_symmetry if isinstance(self.apply_symmetry, str) else "default"
+            symmetries = Symmetry.available_symmetries(data['board_size'], symmetry_type)
             picked_symmetry = np.random.choice(symmetries)
             data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
             if self.has_pass_move:
@@ -210,7 +211,8 @@ class ProcessedKatagoNumpyDataset(Dataset):
             self._filter_data_by_custom_condition(filter_custom_condition)
 
         if self.apply_symmetry:
-            self.symmetries = Symmetry.available_symmetries(self.boardsize)
+            symmetry_type = self.apply_symmetry if isinstance(self.apply_symmetry, str) else "default"
+            self.symmetries = Symmetry.available_symmetries(self.boardsize, symmetry_type)
         else:
             self.symmetries = [Symmetry.IDENTITY]
 
@@ -285,8 +287,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
             value_target[0], value_target[1] = value_target[1], value_target[0]
 
         if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(self.boardsize)
-            picked_symmetry = symmetries[sym_index]
+            picked_symmetry = self.symmetries[sym_index]
             data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
         if self.apply_symmetry and 'pt' in self.data_dict:
             if self.has_pass_move:

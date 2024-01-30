@@ -55,15 +55,24 @@ class Symmetry(Enum):
     FLIP_XY = 6  # (x, y) -> (y, x)
     FLIP_YX = 7  # (x, y) -> (s - y, s - x)
 
-    def available_symmetries(boardsize):
+    def available_symmetries(boardsize, symmetry_type="default"):
         sx, sy = boardsize
-        if sx == sy:
-            return [
-                Symmetry.IDENTITY, Symmetry.ROTATE_90, Symmetry.ROTATE_180, Symmetry.ROTATE_270,
-                Symmetry.FLIP_X, Symmetry.FLIP_Y, Symmetry.FLIP_XY, Symmetry.FLIP_YX
-            ]
+        if symmetry_type == "default":
+            if sx == sy:
+                return [
+                    Symmetry.IDENTITY, Symmetry.ROTATE_90, Symmetry.ROTATE_180, Symmetry.ROTATE_270,
+                    Symmetry.FLIP_X, Symmetry.FLIP_Y, Symmetry.FLIP_XY, Symmetry.FLIP_YX
+                ]
+            else:
+                return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_X, Symmetry.FLIP_Y]
+        elif symmetry_type == "rotate":
+            return [Symmetry.IDENTITY, Symmetry.ROTATE_90, Symmetry.ROTATE_180, Symmetry.ROTATE_270]
+        elif symmetry_type == "flip":
+            return [Symmetry.IDENTITY, Symmetry.FLIP_X, Symmetry.FLIP_Y, Symmetry.FLIP_XY, Symmetry.FLIP_YX]
+        elif symmetry_type == "flip_diag_rotate180":
+            return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_XY, Symmetry.FLIP_YX]
         else:
-            return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_X, Symmetry.FLIP_Y]
+            assert 0, f"unsupported symmetry_type: {symmetry_type}"
 
     def apply(self, pos, boardsize):
         assert self in Symmetry.available_symmetries(boardsize)
