@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, QuantPReLU, Conv1dLine4Block, \
-    SwitchLinearBlock, SwitchConv2dBlock, SwitchPReLU, SequentialWithExtraArguments
+from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, QuantPReLU, \
+    SwitchGate, SwitchLinearBlock, SwitchPReLU, SequentialWithExtraArguments
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
 
@@ -749,7 +749,8 @@ class Mix9Net(nn.Module):
                  dim_value_group=32,
                  dim_dwconv=None,
                  input_type='basicns',
-                 num_buckets=32):
+                 num_buckets=32,
+                 jitter_eps=0.0):
         super().__init__()
         dim_feature = max(dim_policy, dim_value)
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_group)
@@ -779,7 +780,8 @@ class Mix9Net(nn.Module):
                                           activation='relu')
 
         # MoE router layer
-        self.router_linear = LinearBlock(self.dim_dwconv, num_buckets, activation='none')
+        self.router_linear = LinearBlock(self.dim_dwconv, num_buckets, activation='none', bias=False)
+        self.router_gate = SwitchGate(num_buckets, jitter_eps)
 
         # policy head (point-wise conv)
         self.policy_pwconv_weight = SequentialWithExtraArguments(
@@ -832,26 +834,6 @@ class Mix9Net(nn.Module):
 
         return feature
 
-    def get_routing(self, feature_mean):
-        # does not propogate gradients back
-        route_feature = feature_mean.detach()[:, :self.dim_dwconv]
-        
-        # get routing probabilities and index
-        route_logits = self.router_linear(route_feature)
-        route_probs = torch.softmax(route_logits, dim=1)  # [B, num_buckets]
-        route_prob_max, route_idx = torch.max(route_probs, dim=1)  # [B]
-
-        # calc load balancing loss
-        inv_batch_size = 1.0 / route_logits.shape[0]
-        route_frac = torch.tensor([(route_idx == i).sum() * inv_batch_size
-                                   for i in range(self.num_buckets)],
-                                  dtype=route_probs.dtype,
-                                  device=route_probs.device)  # [num_buckets]
-        route_prob_mean = route_probs.mean(0)  # [num_buckets]
-        load_balancing_loss = self.num_buckets * torch.dot(route_frac, route_prob_mean)
-
-        return route_idx, route_prob_max, route_frac, load_balancing_loss
-
     def forward(self, data):
         _, _, dim_policy, _, _ = self.model_size
 
@@ -862,8 +844,10 @@ class Mix9Net(nn.Module):
         feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature]
 
         # routing layer
-        route_idx, route_prob_max, route_frac, load_balancing_loss = self.get_routing(feature_mean)
-        route_scale = (route_prob_max / route_prob_max.detach()).view(-1, 1)  # [B, 1]
+        route_feature = feature_mean.detach()[:, :self.dim_dwconv]  # does not propogate gradients back
+        route_logits = self.router_linear(route_feature)  # calculate routing logits
+        route_idx, route_multiplier, lb_loss, aux_outputs = self.router_gate(route_logits)
+        route_multiplier = route_multiplier.view(-1, 1)  # [B, 1]
 
         # value feature accumulator of four quadrants
         B, _, H, W = feature.shape
@@ -883,7 +867,7 @@ class Mix9Net(nn.Module):
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight(feature_mean, route_idx)
-        pwconv_weight = (pwconv_weight * route_scale).reshape(B, 4 * dim_policy, 1, 1)
+        pwconv_weight = (pwconv_weight * route_multiplier).reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
         policy = torch.cat([
             F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
@@ -913,15 +897,9 @@ class Mix9Net(nn.Module):
             value_q10,
             value_q11,
         ], 1)  # [B, dim_feature + 4 * dim_value_group]
-        value = self.value_linear(value, route_idx) * route_scale
+        value = self.value_linear(value, route_idx) * route_multiplier
 
-        aux_losses = {'load_balancing': load_balancing_loss}
-        aux_outputs = {
-            'route_prob_max': route_prob_max,
-            'route_frac_min': route_frac.min(),
-            'route_frac_max': route_frac.max(),
-            'route_frac_std': route_frac.std(),
-        }
+        aux_losses = {'load_balancing': lb_loss}
         return value, policy, aux_losses, aux_outputs
 
     def forward_debug_print(self, data):

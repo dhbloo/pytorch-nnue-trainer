@@ -37,9 +37,6 @@ def weights_init(init_type):
             if hasattr(m, 'bias') and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
 
-        if hasattr(m, 'post_init'):
-            m.post_init()
-
     return init_fun
 
 

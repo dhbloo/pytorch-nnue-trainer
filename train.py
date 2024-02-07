@@ -198,7 +198,7 @@ def calc_loss(loss_type,
 
     if kd_results is not None:
         # also get a true loss from real data
-        real_loss, real_loss_dict = calc_loss(
+        real_loss, real_loss_dict, _ = calc_loss(
             loss_type,
             data,
             results,
@@ -219,12 +219,13 @@ def calc_loss(loss_type,
             total_loss += aux_loss
             loss_dict[f'{aux_loss_name}_loss'] = aux_loss.detach()
 
+    aux_outputs_dict = {}
     if aux_outputs is not None:
-        for aux_output_name, aux_output in aux_outputs.items():
-            loss_dict[f'{aux_output_name}'] = aux_output.detach()
+        for aux_name, aux_output in aux_outputs.items():
+            aux_outputs_dict[aux_name] = aux_output.detach()
 
     loss_dict['total_loss'] = total_loss.detach()
-    return total_loss, loss_dict
+    return total_loss, loss_dict, aux_outputs_dict
 
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
@@ -330,7 +331,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     last_it = it
     last_time = time.time()
     stop_training = False
-    avg_loss_dict = {}
+    avg_metric_dict = {}
     model.train()
     while not stop_training:
         epoch += 1
@@ -354,7 +355,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             # model update
             optimizer.zero_grad()
             results = model(data)
-            loss, loss_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
+            loss, loss_dict, aux_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
             accelerator.backward(loss)
 
             # apply gradient clipping if needed
@@ -366,22 +367,27 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
             # update running average loss
             loss_dict = accelerator.gather(loss_dict)
-            for key, value in loss_dict.items():
-                value = torch.mean(value, dim=0).item()
-                if not key in avg_loss_dict:
-                    avg_loss_dict[key] = deque(maxlen=avg_loss_interval)
-                avg_loss_dict[key].append(value)
-                loss_dict[key] = np.mean(avg_loss_dict[key])
+            aux_dict = accelerator.gather(aux_dict)
+            for metric_dict in [loss_dict, aux_dict]:
+                for key, value in metric_dict.items():
+                    value = torch.mean(value, dim=0).item()
+                    if not key in avg_metric_dict:
+                        avg_metric_dict[key] = deque(maxlen=avg_loss_interval)
+                    avg_metric_dict[key].append(value)
+                    metric_dict[key] = np.mean(avg_metric_dict[key])
 
             # logging
             if it % log_interval == 0 and accelerator.is_local_main_process:
                 log_value_dict(tb_logger, 'train', loss_dict, it)
+                if aux_dict:
+                    log_value_dict(tb_logger, 'train_aux', aux_dict, it)
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({
                         'it': it,
                         'epoch': epoch,
                         'rows': rows,
                         'train_loss': loss_dict,
+                        'train_aux': aux_dict,
                         'lr': lr_scheduler.get_last_lr()[0],
                     })
                     log.writelines([json_text, '\n'])
@@ -422,7 +428,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             # validation
             if it % val_interval == 0 and val_loader is not None:
                 val_start_time = time.time()
-                val_loss_dict = {}
+                val_loss_dict, val_aux_dict = {}, {}
                 num_val_batches = 0
 
                 model.eval()
@@ -432,9 +438,10 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         kd_results = kd_model(val_data) if kd_model is not None else None
                         # model evaluation
                         results = model(val_data)
-                        _, val_losses = calc_loss(loss_type, val_data, results, kd_results,
-                                                  **loss_args)
+                        _, val_losses, val_auxs = calc_loss(loss_type, val_data, results,
+                                                            kd_results, **loss_args)
                         add_dict_to(val_loss_dict, val_losses)
+                        add_dict_to(val_aux_dict, val_auxs)
                         num_val_batches += 1
                 model.train()
 
@@ -442,24 +449,30 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches
                                                                      ]).to(accelerator.device)
                 all_val_loss_dict = accelerator.gather(val_loss_dict)
+                all_val_aux_dict = accelerator.gather(val_aux_dict)
 
                 if accelerator.is_local_main_process:
                     # average all losses
                     num_val_batches_tensor = all_val_loss_dict.pop('num_val_batches')
                     num_val_batches = torch.sum(num_val_batches_tensor).item()
-                    val_loss_dict = {}
+                    val_loss_dict, val_aux_dict = {}, {}
                     for k, loss_tensor in all_val_loss_dict.items():
                         val_loss_dict[k] = torch.sum(loss_tensor).item() / num_val_batches
+                    for k, aux_tensor in all_val_aux_dict.items():
+                        val_aux_dict[k] = torch.sum(aux_tensor).item() / num_val_batches
 
                     val_elasped = time.time() - val_start_time
                     num_val_entries = num_val_batches * batch_size
                     # log validation results
                     log_value_dict(tb_logger, 'validation', val_loss_dict, it)
+                    if val_aux_dict:
+                        log_value_dict(tb_logger, 'validation_aux', val_aux_dict, it)
                     with open(log_filename, 'a') as log:
                         json_text = json.dumps({
                             'it': it,
                             'epoch': epoch,
                             'val_loss': val_loss_dict,
+                            'val_aux': val_aux_dict,
                             'num_val_entries': num_val_entries,
                             'elasped_seconds': val_elasped,
                         })
