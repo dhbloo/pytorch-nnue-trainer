@@ -120,6 +120,8 @@ class PackedBinaryDataset(IterableDataset):
                  fixed_side_input,
                  has_pass_move=False,
                  value_lambda=0.0,
+                 multipv_temperature=0.03,
+                 use_mate_multipv=False,
                  winrate_model=None,
                  apply_symmetry=False,
                  shuffle=False,
@@ -133,6 +135,8 @@ class PackedBinaryDataset(IterableDataset):
         self.fixed_side_input = fixed_side_input
         self.has_pass_move = has_pass_move
         self.value_lambda = value_lambda
+        self.multipv_temperature = multipv_temperature
+        self.use_mate_multipv = use_mate_multipv
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
@@ -153,6 +157,33 @@ class PackedBinaryDataset(IterableDataset):
         else:
             return open(filename, "rb")
 
+    def _setup_policy_target(self, boardsize: tuple[int, int], movedata: MoveData):
+        H, W = boardsize
+        policy = np.zeros(H * W + (1 if self.has_pass_move else 0), dtype=np.float32)
+
+        # single bestmove
+        move, besteval = movedata[0]
+        if len(movedata) == 1 or self.multipv_temperature == 0.0 \
+            or any(ev is None for ev in movedata.evals) \
+            or (not self.use_mate_multipv and besteval >= self.winrate_model.eval_mate_threshold):
+            if move is None and self.has_pass_move:
+                policy[-1] = 1.0
+            else:
+                policy[move.y * W + move.x] = 1.0
+        # multipv
+        else:
+            winrates = np.array([self.winrate_model.eval_to_winrate(ev) for ev in movedata.evals],
+                                dtype=np.float32)
+            winrates_exp = np.exp(winrates / self.multipv_temperature)
+            winrates_softmax = winrates_exp / np.sum(winrates_exp)
+            for i, (move, _) in enumerate(movedata):
+                if move is None:
+                    policy[-1] = winrates_softmax[i]
+                else:
+                    policy[move.y * W + move.x] = winrates_softmax[i]
+
+        return policy if self.has_pass_move else policy.reshape(boardsize)
+
     def _prepare_data(
         self,
         result: Result,
@@ -160,10 +191,12 @@ class PackedBinaryDataset(IterableDataset):
         rule: Rule,
         ply: int,
         position: list[Optional[Move]],
-        move: Optional[Move],
-        eval: Optional[int],
+        movedata: MoveData,
     ) -> dict:
         stm_is_black = ply % 2 == 0
+        bestmove, eval = movedata[0]
+
+        # setup board input
         board_input = np.zeros((2, boardsize[0], boardsize[1]), dtype=np.int8)
         for i, m in enumerate(position):
             if m is None:  # skip pass move
@@ -186,21 +219,21 @@ class PackedBinaryDataset(IterableDataset):
             value_target = wld_result * (1 - self.value_lambda) + wld_eval * self.value_lambda
 
         # make policy target
-        policy_target = np.zeros(boardsize, dtype=np.int8)
-        if move is not None:
-            policy_target[move.y, move.x] = 1
+        policy_target = self._setup_policy_target(boardsize, movedata)
 
+        # apply symmetry transformation
         if self.apply_symmetry:
             symmetries = Symmetry.available_symmetries(boardsize)
             picked_symmetry = np.random.choice(symmetries)
             board_input = picked_symmetry.apply_to_array(board_input)
-            policy_target = picked_symmetry.apply_to_array(policy_target)
+            if self.has_pass_move:
+                policy_board = policy_target[:-1].reshape(boardsize)
+                policy_board = picked_symmetry.apply_to_array(policy_board)
+                policy_pass = policy_target[-1:]
+                policy_target = np.concatenate([policy_board.flatten(), policy_pass])
+            else:
+                policy_target = picked_symmetry.apply_to_array(policy_target)
             position = [Move(*picked_symmetry.apply(m.pos, boardsize)) for m in position]
-
-        # append pass target to policy target
-        if self.has_pass_move:
-            pass_target = np.array(1 if move is None else 0, dtype=np.int8)
-            policy_target = np.concatenate([policy_target.flatten(), pass_target])
 
         return {
             # global info
@@ -233,14 +266,13 @@ class PackedBinaryDataset(IterableDataset):
         data_list = []
         current_result = entry.result
         current_position = entry.init_position.copy()
-        for movelist in entry.moves:
-            current_move, current_eval = movelist[0]
+        for movedata in entry.moves:
+            current_move, current_eval = movedata[0]
 
             # random skip data according to sample rate
             if random.random() < self.sample_rate:
                 data = self._prepare_data(current_result, boardsize, entry.rule,
-                                          len(current_position), current_position, current_move,
-                                          current_eval)
+                                          len(current_position), current_position, movedata)
                 data_list.append(data)
 
             current_result = Result.opposite(current_result)
