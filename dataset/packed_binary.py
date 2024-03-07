@@ -120,6 +120,7 @@ class PackedBinaryDataset(IterableDataset):
                  fixed_side_input,
                  has_pass_move=False,
                  value_lambda=0.0,
+                 dynamic_value_lambda=True,
                  multipv_temperature=0.03,
                  use_mate_multipv=False,
                  winrate_model=None,
@@ -135,6 +136,7 @@ class PackedBinaryDataset(IterableDataset):
         self.fixed_side_input = fixed_side_input
         self.has_pass_move = has_pass_move
         self.value_lambda = value_lambda
+        self.dynamic_value_lambda = dynamic_value_lambda
         self.multipv_temperature = multipv_temperature
         self.use_mate_multipv = use_mate_multipv
         self.apply_symmetry = apply_symmetry
@@ -189,10 +191,11 @@ class PackedBinaryDataset(IterableDataset):
         result: Result,
         boardsize: tuple[int, int],
         rule: Rule,
-        ply: int,
+        game_stage: float,
         position: list[Optional[Move]],
         movedata: MoveData,
     ) -> dict:
+        ply = len(position)
         stm_is_black = ply % 2 == 0
         bestmove, eval = movedata[0]
 
@@ -212,11 +215,14 @@ class PackedBinaryDataset(IterableDataset):
             result = Result.opposite(result)
         wld_result = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW],
                               dtype=np.float32)
-        if self.value_lambda == 0.0:
+        if self.value_lambda == 0:
             value_target = wld_result
         else:
+            value_lambda = self.value_lambda
+            if self.dynamic_value_lambda:
+                value_lambda = value_lambda * (1.0 - game_stage)
             wld_eval = wld_result if eval is None else self.winrate_model.eval_to_wld(eval)
-            value_target = wld_result * (1 - self.value_lambda) + wld_eval * self.value_lambda
+            value_target = wld_result * (1 - value_lambda) + wld_eval * value_lambda
 
         # make policy target
         policy_target = self._setup_policy_target(boardsize, movedata)
@@ -259,20 +265,21 @@ class PackedBinaryDataset(IterableDataset):
         # Skip other rules and board sizes
         boardsize = (entry.boardsize, entry.boardsize)
         if str(entry.rule) not in self.rules:
-            return
+            return []
         if boardsize not in self.boardsizes:
-            return
+            return []
 
         data_list = []
         current_result = entry.result
         current_position = entry.init_position.copy()
-        for movedata in entry.moves:
+        for moveidx, movedata in enumerate(entry.moves):
             current_move, current_eval = movedata[0]
+            game_stage = min(max(moveidx / (len(entry.moves) - 1), 0.0), 1.0)
 
             # random skip data according to sample rate
             if random.random() < self.sample_rate:
                 data = self._prepare_data(current_result, boardsize, entry.rule,
-                                          len(current_position), current_position, movedata)
+                                          game_stage, current_position, movedata)
                 data_list.append(data)
 
             current_result = Result.opposite(current_result)
