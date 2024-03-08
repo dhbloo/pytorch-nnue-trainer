@@ -103,10 +103,11 @@ def visualize_entry(fixed_side_input,
     texts = []
     if stm_input is not None:
         texts += [f'stm={stm_input[0].item()}({"white" if stm_input[0] > 0 else "black"})']
-    if value_target is not None:
-        texts += [f'vt={value_target[0].cpu().numpy()}(B/W/D)']
-    if raw_eval is not None and raw_eval[0] == raw_eval[0]:  # raw_eval is not nan
-        texts += [f'eval={raw_eval[0].cpu().numpy()}']
+    with np.printoptions(precision=4, suppress=True):
+        if value_target is not None:
+            texts += [f'vt={value_target[0].cpu().numpy()}(B/W/D)']
+        if raw_eval is not None and raw_eval[0] == raw_eval[0]:  # raw_eval is not nan
+            texts += [f'eval={raw_eval[0].cpu().numpy()}']
     if texts:
         ax.text(0, -0.7, ' '.join(texts))
 
