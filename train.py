@@ -29,6 +29,8 @@ def parse_args_and_init():
     parser.add('--use_cpu', action='store_true', help="Use cpu only")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add('--val_dataset_type', help="Validate Dataset type (If not set, then it's same as train set)")
+    parser.add('--val_dataset_args', type=yaml.safe_load, default={}, help="Extra validate dataset arguments")
     parser.add('--dataloader_args',
                type=yaml.safe_load,
                default={},
@@ -229,11 +231,11 @@ def calc_loss(loss_type,
 
 
 def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  dataloader_args, data_pipelines, model_type, model_args, optim_type, optim_args,
-                  lr_scheduler_type, lr_scheduler_args, init_type, loss_type, loss_args, iterations,
-                  batch_size, num_worker, learning_rate, weight_decay, clip_grad_norm, no_shuffle,
-                  log_interval, show_interval, save_interval, val_interval, avg_loss_interval,
-                  kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, **kwargs):
+                  val_dataset_type, val_dataset_args, dataloader_args, data_pipelines, model_type, 
+                  model_args, optim_type, optim_args, lr_scheduler_type, lr_scheduler_args, init_type, 
+                  loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
+                  clip_grad_norm, no_shuffle, log_interval, show_interval, save_interval, val_interval, 
+                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -253,11 +255,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                                      shuffle=not no_shuffle,
                                      **dataloader_args)
     if val_datas:
-        val_dataset = build_dataset(dataset_type,
+        val_dataset = build_dataset(dataset_type if val_dataset_type is None else val_dataset_type,
                                     val_datas,
                                     shuffle=False,
                                     pipeline_args=data_pipelines,
-                                    **dataset_args)
+                                    **(dataset_args if val_dataset_type is None else val_dataset_args))
         val_loader = build_data_loader(val_dataset,
                                        batch_size,
                                        num_workers=num_worker,
