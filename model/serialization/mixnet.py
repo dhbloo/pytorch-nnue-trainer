@@ -1706,7 +1706,7 @@ class Mix9NetSerializer(BaseSerializer):
         b, w = line == 1, line == 2
 
         line = (b, w)
-        line = np.stack(line, axis=0)[np.newaxis]  # [B=1, C=2 or 3, N, L]
+        line = np.stack(line, axis=0)[np.newaxis]  # [C=2, N, L]
         line = torch.tensor(line, dtype=torch.float32, device=device)
 
         batch_size = self.map_table_export_batch_size
@@ -1718,7 +1718,6 @@ class Mix9NetSerializer(BaseSerializer):
             end = min((i + 1) * batch_size, N)
 
             map = model.mapping(line[:, :, start:end])[0, 0]
-            map = torch.clamp(map, min=-32, max=32)
             map_table.append(map.cpu().numpy())
 
         map_table = np.concatenate(map_table, axis=1)  # [dim_feature, N, L]

@@ -84,6 +84,7 @@ def build_data_loader(dataset,
                       batch_size=1,
                       shuffle=False,
                       shuffle_buffer_size=10000,
+                      num_workers=0,
                       drop_last=True,
                       batch_by_boardsize=False,
                       **kwargs):
@@ -101,8 +102,9 @@ def build_data_loader(dataset,
     dataloader = DataLoader(dataset,
                             batch_size,
                             shuffle=shuffle,
+                            num_workers=num_workers,
                             drop_last=drop_last,
-                            persistent_workers=True,
+                            persistent_workers=(num_workers > 0),
                             **kwargs)
     return dataloader
 

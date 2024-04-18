@@ -37,7 +37,7 @@ class LineEncodingPipeline(BasePipeline):
         return data
 
 
-def get_encoding_usage_flags(line_length):
+def get_encoding_usage_flags(line_length: int) -> np.ndarray:
     """Get encoding usage flags of a encoding map."""
     from line_encoding_cpp import get_total_num_encoding, get_encoding_usage_flag
 
