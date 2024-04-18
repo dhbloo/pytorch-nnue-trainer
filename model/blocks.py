@@ -270,8 +270,16 @@ class Conv2dBlock(nn.Module):
             b = self.conv.bias
             if b is not None:
                 b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
-            x = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation,
-                         self.conv.groups)
+            if self.quant == 'pixel-dwconv':  # pixel-wise quantization in depthwise conv
+                assert self.conv.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
+                x_ = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups)
+                x = F.unfold(x, self.conv.kernel_size, self.conv.dilation, self.conv.padding, self.conv.stride)
+                x = fake_quant(x * w.view(-1)[None, :, None], self.bias_quant_scale, num_bits=self.bias_quant_bits)
+                x = x.reshape(x_.shape[0], x_.shape[1], -1, x_.size(2) * x_.size(3)).sum(2)
+                x = F.fold(x, (x_.size(2), x_.size(3)), (1, 1))
+                x = x + b[None, :, None, None]
+            else:
+                x = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups)
         else:
             x = self.conv(x)
         if not self.activation_first:
@@ -838,8 +846,7 @@ class SwitchConv2dBlock(nn.Module):
             x = x.view(batch_size, -1, x.size(-2), x.size(-1))
         else:
             x = self.conv(x, route_index)
-
-        if self.activation and not self.activation_first:
+        if not self.activation_first and self.activation:
             x = self.activation(x)
         return x
 
