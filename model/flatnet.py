@@ -9,6 +9,7 @@ except ImportError:
 from . import MODELS
 from .blocks import LinearBlock, Conv2dBlock, HashLayer
 from .input import build_input_plane
+from .vq import VectorQuantizer
 from utils.quant_utils import fake_quant
 
 
@@ -1302,3 +1303,155 @@ class FlatSquare7x7NNUEv3(nn.Module):
     def name(self):
         m, f = self.model_size
         return f"flat_square7x7_nnue_v3_{m}m{f}f"
+
+
+@MODELS.register('flat_square7x7_nnue_v4')
+class FlatSquare7x7NNUEv4(nn.Module):
+    def __init__(self,
+                 dim_middle=128,
+                 dim_feature=32,
+                 codebook_size=65536,
+                 input_type='basic-nostm',
+                 value_no_draw=False):
+        super().__init__()
+        self.model_size = (dim_middle, dim_feature)
+        self.value_no_draw = value_no_draw
+        self.input_plane = build_input_plane(input_type)
+        dim_vq = max(512, dim_feature)
+        self.mapping4x4 = self._make_4x4_mapping(dim_middle, dim_vq)
+        self.feature_vq = VectorQuantizer(codebook_size, dim_vq)
+        self.feature_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Mish(inplace=True),
+                LinearBlock(dim_vq, dim_feature, activation="none"),
+            ) for _ in range(3)
+        ])
+
+        # value head
+        dim_vhead = 1 if value_no_draw else 3
+        self.value_linears = nn.ModuleList([
+            LinearBlock(dim_feature * 16, 32, activation="none", quant=True, weight_quant_scale=256),
+            LinearBlock(32, 32, activation="none", quant=True),
+            LinearBlock(32, dim_vhead, activation="none", quant=True),
+        ])
+
+    def _make_4x4_mapping(self, dim_middle, dim_mapping):
+        return nn.Sequential(
+            Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, activation="mish"),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
+        )
+
+    def get_features(self, input_plane, train_progress):
+        chunk_indices = [
+            [
+                [0, 4, 0, 4, 0, False],
+                [0, 4, 3, 7, 1, False],
+                [3, 7, 3, 7, 2, False],
+                [3, 7, 0, 4, 3, False],
+            ],
+            [
+                [0, 4, 1, 5, 0, False],
+                [1, 5, 3, 7, 1, False],
+                [3, 7, 2, 6, 2, False],
+                [2, 6, 0, 4, 3, False],
+                [1, 5, 0, 4, 0, True],
+                [0, 4, 2, 6, 1, True],
+                [2, 6, 3, 7, 2, True],
+                [3, 7, 1, 5, 3, True],
+            ],
+            [
+                [1, 5, 1, 5, 0, False],
+                [1, 5, 2, 6, 1, False],
+                [2, 6, 2, 6, 2, False],
+                [2, 6, 1, 5, 3, False],
+            ],
+        ]
+
+        # allow the first 80% of training to use the pre-quant feature
+        vq_t = min(max(train_progress / 0.8, 0.0), 1.0)
+        features = []
+        vq_losses = []
+        vq_perplexities = []
+        for chunk_idx, chunk_index in enumerate(chunk_indices):
+            for y0, y1, x0, x1, k, t in chunk_index:
+                chunk = torch.rot90(input_plane[:, :, y0:y1, x0:x1], k, (2, 3))
+                if t:
+                    chunk = torch.transpose(chunk, 2, 3)
+                feat = self.mapping4x4(chunk).squeeze(-1).squeeze(-1)
+                feat_vq, _, vq_loss, vq_perplexity = self.feature_vq(feat, vq_t)
+
+                # blend the feat according to the vq_t in [0, 1]
+                feat = vq_t * feat_vq + (1 - vq_t) * feat
+
+                feat = self.feature_heads[chunk_idx](feat)
+                feat = torch.clamp(feat, min=-1, max=127/128)
+                features.append(fake_quant(feat, scale=128))  # int8 quant
+                vq_losses.append(vq_loss)
+                vq_perplexities.append(vq_perplexity)
+        vq_loss = torch.mean(torch.stack(vq_losses), dim=0)
+        vq_perplexity = torch.mean(torch.stack(vq_perplexities), dim=0)
+            
+        return features, vq_loss, vq_perplexity
+
+    def forward(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        _, _, H, W = input_plane.shape
+
+        # get feature sum from chunks
+        features, vq_loss, vq_perplexity = self.get_features(input_plane, data['train_progress'])
+        feature = torch.cat(features, dim=1)
+
+        # value head
+        value = feature  # [B, dim_feature]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            value = layer(value)
+
+        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+
+        aux_losses = {'vq': vq_loss}
+        aux_outputs = {'vq_perplexity': vq_perplexity}
+        return value, policy, aux_losses, aux_outputs
+    
+    def forward_debug_print(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        _, _, H, W = input_plane.shape
+
+        # get feature sum from chunks
+        features_corner, features_middle = self.get_features(input_plane)
+        for i, f_corner in enumerate(features_corner):
+            print(f"feature4x4[{i}]: \n{(f_corner * 128).int()}")
+        for i, f_middle in enumerate(features_middle):
+            print(f"feature4x3[{i}]: \n{(f_middle * 128).int()}")
+        feature_corner = torch.cat(features_corner, dim=1)
+        feature_middle = torch.cat(features_middle, dim=1)
+        feature = feature_corner + feature_middle
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # value head
+        value = feature  # [B, dim_feature]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            print(f"value input{i+1}: \n{(value * 128).int()}")
+            value = layer(value)
+            print(f"value output{i+1}: \n{(value * 128).int()}")
+
+        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        return value, policy
+
+    @property
+    def weight_clipping(self):
+        return [{
+            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
+            'min_weight': -128 / 128,
+            'max_weight': 127 / 128
+        }]
+
+    @property
+    def name(self):
+        m, f = self.model_size
+        return f"flat_square7x7_nnue_v4_{m}m{f}f"
