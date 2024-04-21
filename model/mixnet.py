@@ -760,7 +760,6 @@ class Mix9Net(nn.Module):
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
         self.input_plane = build_input_plane(input_type)
-        # self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
         self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
         self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
 
@@ -816,7 +815,6 @@ class Mix9Net(nn.Module):
         feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
         feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
         feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
-        # feature = self.mapping(input_plane)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
         feature = torch.clamp(feature, min=-16, max=16)  # int16, scale=32, [-16,16]

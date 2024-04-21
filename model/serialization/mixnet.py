@@ -1619,7 +1619,7 @@ class Mix9NetSerializer(BaseSerializer):
     The corresponding C-language struct layout: 
     struct Mix8Weight {
         // 1  mapping layer
-        int16_t mapping[ShapeNum][FeatureDim];
+        int16_t mapping[2][ShapeNum][FeatureDim];
 
         // 2  Depthwise conv
         int16_t feature_dwconv_weight[9][FeatDWConvDim];
@@ -1695,7 +1695,7 @@ class Mix9NetSerializer(BaseSerializer):
               | ((dim_dwconv // 8) << 20)
         return hash
 
-    def _export_map_table(self, model: Mix9Net, device, line):
+    def _export_map_table(self, model: Mix9Net, device, line, mapping_idx):
         """
         Export line -> feature mapping table.
 
@@ -1717,17 +1717,18 @@ class Mix9NetSerializer(BaseSerializer):
             start = i * batch_size
             end = min((i + 1) * batch_size, N)
 
-            map = model.mapping(line[:, :, start:end])[0, 0]
-            map_table.append(map.cpu().numpy())
+            mapping = getattr(model, f'mapping{mapping_idx}')
+            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]
+            map_table.append(feature.cpu().numpy())
 
         map_table = np.concatenate(map_table, axis=1)  # [dim_feature, N, L]
         return map_table
 
-    def _export_feature_map(self, model: Mix9Net, device):
+    def _export_feature_map(self, model: Mix9Net, device, mapping_idx):
         L = self.line_length
         dim_feature = model.model_size[1]
         lines = generate_base3_permutation(L)  # [177147, 11]
-        map_table = self._export_map_table(model, device, lines)  # [dim_feature, 177147, 11]
+        map_table = self._export_map_table(model, device, lines, mapping_idx)  # [dim_feature, 177147, 11]
 
         feature_map = np.zeros((4 * 3**L, dim_feature), dtype=np.float32)  # [708588, dim_feature]
         usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
@@ -1748,14 +1749,14 @@ class Mix9NetSerializer(BaseSerializer):
         for l in range(1, (L + 1) // 2):
             for r in range(1, (L + 1) // 2):
                 lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines)
+                map_table = self._export_map_table(model, device, lines, mapping_idx)
                 idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
                 idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
                 for i in range(idx.shape[0]):
                     feature_map[idx[i]] = map_table[:, i, L // 2 - l]
                     usage_flags[idx[i]] = True
 
-        ascii_hist("feature map", feature_map)
+        ascii_hist(f"feature map {mapping_idx}", feature_map)
         feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=16)
         num_params_clipped = np.sum(feature_map != feature_map_clipped)
         feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)
@@ -1771,16 +1772,20 @@ class Mix9NetSerializer(BaseSerializer):
         ascii_hist("feature dwconv weight", conv_weight)
         ascii_hist("feature dwconv bias", conv_bias)
 
-        conv_weight_clipped = np.clip(conv_weight, a_min=-1, a_max=32767/32768)
+        conv_weight_clipped = np.clip(conv_weight, a_min=-32768/65536, a_max=32767/65536)
         conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
         weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
-        conv_weight_quant = np.clip(np.around(conv_weight_clipped * 32768), -32768, 32767).astype(np.int16)
+        conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
         conv_bias_quant = np.clip(np.around(conv_bias_clipped * 128), -32768, 32767).astype(np.int16)
         print(f"feature dwconv: weight clipped {weight_num_params_clipped}/{conv_weight.size}" +
               f", bias clipped {bias_num_params_clipped}/{conv_bias.size}" +
               f", weight_quant_range = {(conv_weight_quant.min(), conv_weight_quant.max())}" + 
               f", bias_quant_range = {(conv_bias_quant.min(), conv_bias_quant.max())}")
+        
+        # Make sure that the dwconv will not overflow
+        assert np.all(np.abs(conv_weight_clipped).sum(0)/2*16*4*128 < 32767), \
+            f"feature dwconv would overflow! (maxsum={np.abs(conv_weight_clipped).sum(0).max()})"
 
         return conv_weight_quant, conv_bias_quant
 
@@ -1865,7 +1870,8 @@ class Mix9NetSerializer(BaseSerializer):
         )
 
     def serialize(self, out: io.IOBase, model: Mix9Net, device):
-        feature_map, usage_flags = self._export_feature_map(model, device)
+        feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
+        feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
         feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
         policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
             policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
@@ -1875,9 +1881,17 @@ class Mix9NetSerializer(BaseSerializer):
             l3_weight, l3_bias = self._export_value(model)
 
         if self.text_output:
-            print('featuremap', file=out)
-            print(usage_flags.sum(), file=out)
-            for i, (f, used) in enumerate(zip(feature_map.astype('i2'), usage_flags)):
+            print('featuremap1', file=out)
+            print(usage_flags1.sum(), file=out)
+            for i, (f, used) in enumerate(zip(feature_map1.astype('i2'), usage_flags1)):
+                if used:
+                    print(i, end=' ', file=out)
+                    f.tofile(out, sep=' ')
+                    print(file=out)
+
+            print('featuremap2', file=out)
+            print(usage_flags2.sum(), file=out)
+            for i, (f, used) in enumerate(zip(feature_map2.astype('i2'), usage_flags2)):
                 if used:
                     print(i, end=' ', file=out)
                     f.tofile(out, sep=' ')
@@ -1957,8 +1971,9 @@ class Mix9NetSerializer(BaseSerializer):
             o: io.RawIOBase = out
             (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv) = model.model_size
 
-            # int16_t mapping[ShapeNum][FeatureDim];
-            o.write(feature_map.astype('<i2').tobytes())  # (708588, FC)
+            # int16_t mapping[2][ShapeNum][FeatureDim];
+            o.write(feature_map1.astype('<i2').tobytes())  # (708588, FC)
+            o.write(feature_map2.astype('<i2').tobytes())  # (708588, FC)
 
             # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
             # int16_t feature_dwconv_bias[FeatureDWConvDim];
