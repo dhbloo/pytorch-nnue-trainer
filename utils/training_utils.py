@@ -33,12 +33,9 @@ def weights_init(init_type):
                 pass
             else:
                 assert 0, f"Unsupported initialization: {init_type}"
-                
+
             if hasattr(m, 'bias') and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
-
-        if hasattr(m, 'post_init'):
-            m.post_init()
 
     return init_fun
 
@@ -87,6 +84,7 @@ def build_data_loader(dataset,
                       batch_size=1,
                       shuffle=False,
                       shuffle_buffer_size=10000,
+                      num_workers=0,
                       drop_last=True,
                       batch_by_boardsize=False,
                       **kwargs):
@@ -104,8 +102,9 @@ def build_data_loader(dataset,
     dataloader = DataLoader(dataset,
                             batch_size,
                             shuffle=shuffle,
+                            num_workers=num_workers,
                             drop_last=drop_last,
-                            persistent_workers=True,
+                            persistent_workers=(num_workers > 0),
                             **kwargs)
     return dataloader
 
@@ -115,10 +114,22 @@ def weight_clipping(named_parameters, clip_parameters):
     for group in clip_parameters:
         min_weight = group['min_weight']
         max_weight = group['max_weight']
-        for param_name in group['params']:
+        for i, param_name in enumerate(group['params']):
             p = named_parameters[param_name]
             p_data_fp32 = p.data
-            p_data_fp32.clamp_(min_weight, max_weight)
+            if 'virtual_params' in group:
+                virtual_param_name = group['virtual_params'][i]
+                virtual_param = named_parameters[virtual_param_name]
+                virtual_param = virtual_param.repeat(*[
+                    p_data_fp32.shape[i] // virtual_param.shape[i]
+                    for i in range(virtual_param.ndim)
+                ])
+                min_weight_t = p_data_fp32.new_full(p_data_fp32.shape, min_weight) - virtual_param
+                p_data_fp32 = torch.max(p_data_fp32, min_weight_t)
+                max_weight_t = p_data_fp32.new_full(p_data_fp32.shape, max_weight) - virtual_param
+                p_data_fp32 = torch.min(p_data_fp32, max_weight_t)
+            else:
+                p_data_fp32.clamp_(min_weight, max_weight)
             p.data.copy_(p_data_fp32)
 
 
