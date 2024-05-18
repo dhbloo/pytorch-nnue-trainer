@@ -37,10 +37,15 @@ class KatagoNumpyDataset(IterableDataset):
     def is_internal_shuffleable(self):
         return True
 
-    def _unpack_global_feature(self, packed_data):
-        # Channel 5: side to move (black = -1.0, white = 1.0)
-        stm_input = packed_data[:, [5]]
-        return stm_input
+    def _unpack_global_feature(self, packed_data): 
+        if packed_data.shape[1] == 1: 
+            # Channel 0: side to move (black = -1.0, white = 1.0) 
+            stm_input = packed_data[:, [0]].astype(np.int8) 
+        else: 
+            # Original katago feature format: 
+            # Channel 5: komi (black negative, white positive) 
+            stm_input = np.where(packed_data[:, [5]] > 0, 1, -1).astype(np.int8) 
+        return stm_input 
 
     def _unpack_board_feature(self, packed_data):
         length, n_features, n_bytes = packed_data.shape

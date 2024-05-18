@@ -13,7 +13,7 @@ import os
 from dataset import build_dataset
 from model import build_model
 from utils.training_utils import build_lr_scheduler, cross_entropy_with_softlabel, \
-    build_optimizer, weights_init, build_data_loader, weight_clipping
+    build_optimizer, weights_init, build_data_loader, weight_clipping, state_dict_drop_size_unmatched
 from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
 from utils.file_utils import find_latest_model_file
 
@@ -99,6 +99,7 @@ def calc_loss(loss_type,
               kd_T=None,
               kd_alpha=None,
               policy_reg_lambda=None,
+              value_policy_ratio=1,
               ignore_forbidden_point_policy=False,
               **extra_args):
     value_loss_type, policy_loss_type = loss_type.split('+')
@@ -187,7 +188,9 @@ def calc_loss(loss_type,
 
     # ===============================================================
 
-    total_loss = value_loss + policy_loss
+    value_lambda = 2 * value_policy_ratio / (value_policy_ratio + 1)
+    policy_lambda = 2 / (value_policy_ratio + 1)
+    total_loss = value_lambda * value_loss + policy_lambda * policy_loss
     loss_dict = {
         'value_loss': value_loss.detach(),
         'policy_loss': policy_loss.detach(),
@@ -205,6 +208,7 @@ def calc_loss(loss_type,
             data,
             results,
             policy_reg_lambda=policy_reg_lambda,
+            value_policy_ratio=value_policy_ratio,
             ignore_forbidden_point_policy=ignore_forbidden_point_policy,
         )
 
@@ -292,8 +296,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         it, epoch, rows = 0, 0, 0
         if load_from is not None:
             state_dicts = torch.load(load_from, map_location=accelerator.device)
-            missing_keys, unexpected_keys = model.load_state_dict(state_dicts['model'],
-                                                                  strict=False)
+            missing_keys, unexpected_keys = model.load_state_dict(
+                state_dict_drop_size_unmatched(model, state_dicts['model']), strict=False)
             if len(unexpected_keys) > 0:
                 accelerator.print(f"unexpected keys in state_dict: {', '.join(unexpected_keys)}")
             if len(missing_keys) > 0:
