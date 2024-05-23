@@ -81,7 +81,7 @@ def build_dataset(dataset_type,
         if isinstance(boardsize, int):
             boardsizes = [(boardsize, boardsize)]
         else:
-            boardsizes = [(s, s) for s in range(11, 21)]
+            boardsizes = [(s, s) for s in range(9, 21)]
 
     dataset = dataset_cls(file_list=file_list,
                           rules=rules,
