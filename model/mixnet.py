@@ -851,7 +851,7 @@ class Mix9Net(nn.Module):
         feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-16, max=16)  # int16, scale=32, [-16,16]
+        feature = torch.clamp(feature, min=-16, max=511/32)  # int16, scale=32, [-16,16]
         feature = fake_quant(feature, scale=32, num_bits=16)
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]

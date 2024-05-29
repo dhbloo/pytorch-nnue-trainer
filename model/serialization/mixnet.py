@@ -1709,14 +1709,11 @@ class Mix9NetSerializer(BaseSerializer):
             line: shape (N, Length)
         """
         N, L = line.shape
-        b, w = line == 1, line == 2
-
-        line = (b, w)
-        line = np.stack(line, axis=0)[np.newaxis]  # [C=2, N, L]
+        us, opponent = line == 1, line == 2
+        line = np.stack((us, opponent), axis=0)[np.newaxis]  # [1, C=2, N, L]
         line = torch.tensor(line, dtype=torch.float32, device=device)
 
         batch_size = self.map_table_export_batch_size
-
         batch_num = 1 + (N - 1) // batch_size
         map_table = []
         for i in range(batch_num):
@@ -1724,48 +1721,38 @@ class Mix9NetSerializer(BaseSerializer):
             end = min((i + 1) * batch_size, N)
 
             mapping = getattr(model, f'mapping{mapping_idx}')
-            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]
-            map_table.append(feature.cpu().numpy())
+            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]  # [dim_feature, batch, L]
+            feature = torch.permute(feature, (1, 2, 0)).cpu().numpy() # [batch, L, dim_feature]
+            map_table.append(feature)
 
-        map_table = np.concatenate(map_table, axis=1)  # [dim_feature, N, L]
+        map_table = np.concatenate(map_table, axis=0)  # [N, L, dim_feature]
         return map_table
 
     def _export_feature_map(self, model: Mix9Net, device, mapping_idx):
+        # use line encoding to generate feature map
+        from dataset.pipeline.line_encoding import \
+            get_total_num_encoding, \
+            get_encoding_usage_flags, \
+            transform_lines_to_line_encoding
+
         L = self.line_length
         dim_feature = model.model_size[1]
-        lines = generate_base3_permutation(L)  # [177147, 11]
-        map_table = self._export_map_table(model, device, lines, mapping_idx)  # [dim_feature, 177147, 11]
-
-        feature_map = np.zeros((4 * 3**L, dim_feature), dtype=np.float32)  # [708588, dim_feature]
-        usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
-        pow3 = 3**np.arange(L + 1, dtype=np.int64)[:, np.newaxis]  # [11, 1]
-
-        for r in range((L + 1) // 2):
-            idx = np.matmul(lines[:, r:], pow3[:L - r]) + pow3[L + 1 - r:].sum()
-            for i in range(idx.shape[0]):
-                feature_map[idx[i]] = map_table[:, i, L // 2 + r]
-                usage_flags[idx[i]] = True
-
-        for l in range(1, (L + 1) // 2):
-            idx = np.matmul(lines[:, :L - l], pow3[l:-1]) + 2 * pow3[-1] + pow3[:l - 1].sum()
-            for i in range(idx.shape[0]):
-                feature_map[idx[i]] = map_table[:, i, L // 2 - l]
-                usage_flags[idx[i]] = True
-
-        for l in range(1, (L + 1) // 2):
-            for r in range(1, (L + 1) // 2):
-                lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines, mapping_idx)
-                idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
-                idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
-                for i in range(idx.shape[0]):
-                    feature_map[idx[i]] = map_table[:, i, L // 2 - l]
-                    usage_flags[idx[i]] = True
+        num_encoding = get_total_num_encoding(L)
+        usage_flags = get_encoding_usage_flags(L)  # [N] bool, track usage of each feature
+        feature_map = np.zeros((num_encoding, dim_feature), dtype=np.float32)  # [N, dim_feature]
+        
+        # generate line features
+        for l in reversed(range(1, L + 1)):
+            lines = generate_base3_permutation(l)
+            idxs = transform_lines_to_line_encoding(lines, L)  # [n, 11]
+            map_table = self._export_map_table(model, device, lines, mapping_idx)
+            rows = np.arange(idxs.shape[0])[:, None]  # [n, 1]
+            feature_map[idxs, :] = map_table[rows, np.arange(l), :]
 
         ascii_hist(f"feature map {mapping_idx}", feature_map)
-        feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=16)
+        feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=511/32)
         num_params_clipped = np.sum(feature_map != feature_map_clipped)
-        feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)
+        feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)  # [-512, 511]
         print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}, " +
               f": clipped {num_params_clipped}/{feature_map.size}" +
               f", quant_range = {(feature_map_quant.min(), feature_map_quant.max())}")
@@ -1974,9 +1961,33 @@ class Mix9NetSerializer(BaseSerializer):
         else:
             o: io.RawIOBase = out
 
+            # Since each quantized feature is in [-512, 511] range, they only uses 10 bits,
+            # here we write compressed uint64 streams to save space.
+            def write_feature_map_compressed(feature_map, feature_bits=10):
+                feature_map_i16 = feature_map.astype('<i2')  # (442503, FC)
+                feature_map_i16 = feature_map_i16.reshape(-1)  # (442503*FC,)
+                bitmask = np.uint64(2**feature_bits - 1)
+                uint64 = np.uint64(0)
+                bits_used = 0
+                uint64_written = 0
+                for i in range(feature_map_i16.shape[0]):
+                    v = feature_map_i16[i].astype(np.uint64) & bitmask
+                    uint64 |= v << np.uint64(bits_used)
+                    if 64 - bits_used >= feature_bits:
+                        bits_used += feature_bits
+                    else:
+                        o.write(uint64.tobytes())
+                        uint64_written += 1
+                        uint64 = v >> np.uint64(64 - bits_used)
+                        bits_used = feature_bits - (64 - bits_used)
+                if bits_used > 0:
+                    o.write(uint64.tobytes())
+                    uint64_written += 1
+                print(f"write_feature_map_compressed: {feature_map_i16.shape[0]} -> {uint64_written} uint64")
+            
             # int16_t mapping[2][ShapeNum][FeatureDim];
-            o.write(feature_map1.astype('<i2').tobytes())  # (708588, FC)
-            o.write(feature_map2.astype('<i2').tobytes())  # (708588, FC)
+            write_feature_map_compressed(feature_map1)
+            write_feature_map_compressed(feature_map2)
 
             # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
             # int16_t feature_dwconv_bias[FeatureDWConvDim];
