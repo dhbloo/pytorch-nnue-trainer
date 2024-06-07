@@ -78,6 +78,7 @@ def parse_args_and_init():
                type=float,
                default=1.0,
                help="Distillation loss ratio in [0,1] (1 for distillation loss only)")
+    parser.add('--kd_use_train_mode', action='store_true', help="Set teacher to train mode")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -239,7 +240,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   model_args, optim_type, optim_args, lr_scheduler_type, lr_scheduler_args, init_type, 
                   loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
                   clip_grad_norm, no_shuffle, log_interval, show_interval, save_interval, val_interval, 
-                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, **kwargs):
+                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, 
+                  kd_use_train_mode, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -317,7 +319,10 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         accelerator.print(f'Loaded teacher model {kd_model.name} from: {kd_checkpoint}')
 
         kd_model = accelerator.prepare_model(kd_model)
-        kd_model.eval()
+        if kd_use_train_mode:
+            kd_model.train()
+        else:
+            kd_model.eval()
 
         # add kd_T into loss_args dict
         assert kd_T is not None, f"kd_T must be set when knowledge distillation is enabled"

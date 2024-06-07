@@ -1614,7 +1614,7 @@ class Mix8NetSerializer(BaseSerializer):
 @SERIALIZERS.register('mix9')
 class Mix9NetSerializer(BaseSerializer):
     """
-    Mix8Net binary serializer.
+    Mix9Net binary serializer.
 
     The corresponding C++ language struct layout: 
     template <int OutSize, int InSize>
@@ -1859,8 +1859,11 @@ class Mix9NetSerializer(BaseSerializer):
         )
 
     def serialize(self, out: io.IOBase, model: Mix9Net, device):
-        feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
-        feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
+        if model.one_mapping:
+            feature_map0, usage_flags0 = self._export_feature_map(model, device, 0)
+        else:
+            feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
+            feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
         feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
         policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
             policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
@@ -1872,21 +1875,30 @@ class Mix9NetSerializer(BaseSerializer):
         l1_weight, l1_bias, l2_weight, l2_bias, l3_weight, l3_bias = self._export_value(model)
 
         if self.text_output:
-            print('featuremap1', file=out)
-            print(usage_flags1.sum(), file=out)
-            for i, (f, used) in enumerate(zip(feature_map1.astype('i2'), usage_flags1)):
-                if used:
-                    print(i, end=' ', file=out)
-                    f.tofile(out, sep=' ')
-                    print(file=out)
+            if model.one_mapping:
+                print('featuremap0', file=out)
+                print(usage_flags0.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map0.astype('i2'), usage_flags0)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
+            else:
+                print('featuremap1', file=out)
+                print(usage_flags1.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map1.astype('i2'), usage_flags1)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
 
-            print('featuremap2', file=out)
-            print(usage_flags2.sum(), file=out)
-            for i, (f, used) in enumerate(zip(feature_map2.astype('i2'), usage_flags2)):
-                if used:
-                    print(i, end=' ', file=out)
-                    f.tofile(out, sep=' ')
-                    print(file=out)
+                print('featuremap2', file=out)
+                print(usage_flags2.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map2.astype('i2'), usage_flags2)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
 
             print('feature_dwconv_weight', file=out)
             feat_dwconv_weight.astype('i2').tofile(out, sep=' ')
@@ -1985,9 +1997,13 @@ class Mix9NetSerializer(BaseSerializer):
                     uint64_written += 1
                 print(f"write_feature_map_compressed: {feature_map_i16.shape[0]} -> {uint64_written} uint64")
             
-            # int16_t mapping[2][ShapeNum][FeatureDim];
-            write_feature_map_compressed(feature_map1)
-            write_feature_map_compressed(feature_map2)
+            if model.one_mapping:
+                # int16_t mapping[ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map0)
+            else:
+                # int16_t mapping[2][ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map1)
+                write_feature_map_compressed(feature_map2)
 
             # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
             # int16_t feature_dwconv_bias[FeatureDWConvDim];
