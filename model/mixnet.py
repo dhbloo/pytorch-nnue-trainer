@@ -744,6 +744,41 @@ class Mix8Net(nn.Module):
         return f"mix8_{self.input_type}_{f}f{p}p{v}v{q}q{d}d"
 
 
+class StarBlock(nn.Module):
+    def __init__(self, dim_in, dim_out, expand=1):
+        super().__init__()
+        self.up1 = LinearBlock(dim_in, dim_out * 2 * expand, activation='relu', quant=True)
+        self.up2 = LinearBlock(dim_in, dim_out * 2 * expand, activation='none', quant=True)
+        self.down = LinearBlock(dim_out * expand, dim_out, activation='relu', quant=True)
+
+    def forward(self, x):
+        x1 = self.up1(x)
+        x2 = self.up2(x)
+        x1 = fake_quant(x1, scale=128, num_bits=8, floor=True)
+        x2 = fake_quant(x2, scale=128, num_bits=8, floor=True)
+        # i32 dot product of two adjacent pairs of u8 and i8
+        x = (x1 * x2).view(*x.shape[:-1], -1, 2).sum(-1)
+        # clamp to int8, scale=128, [-1,1]
+        x = fake_quant(x, scale=128, num_bits=8, floor=True)
+        x = self.down(x)  # int8 linear layer with signed input
+        return x
+    
+    def forward_debug_print(self, x, name='starblock'):
+        x1 = self.up1(x)
+        x2 = self.up2(x)
+        x1 = fake_quant(x1, scale=128, num_bits=8, floor=True)
+        x2 = fake_quant(x2, scale=128, num_bits=8, floor=True)
+        print(f"{name} up1: \n{(x1*128).int()}")
+        print(f"{name} up2: \n{(x2*128).int()}")
+        # i32 dot product of two adjacent pairs of u8 and i8
+        x = (x1 * x2).view(*x.shape[:-1], -1, 2).sum(-1)
+        x = fake_quant(x, scale=128, num_bits=8, floor=True)
+        print(f"{name} dot2 product: \n{(x*128).int()}")
+        x = self.down(x)  # int8 linear layer with signed input
+        print(f"{name} down: \n{(x*128).int()}")
+        return x
+
+
 @MODELS.register('mix9')
 class Mix9Net(nn.Module):
     def __init__(self,
@@ -752,16 +787,21 @@ class Mix9Net(nn.Module):
                  dim_policy=32,
                  dim_value=64,
                  dim_dwconv=32,
-                 input_type='basicns'):
+                 input_type='basicns',
+                 one_mapping=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
+        self.one_mapping = one_mapping
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
         self.input_plane = build_input_plane(input_type)
-        self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
-        self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+        if one_mapping:
+            self.mapping0 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+        else:
+            self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+            self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
 
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(
@@ -789,11 +829,10 @@ class Mix9Net(nn.Module):
         )
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
-        # value head
-        self.value_corner_linear = LinearBlock(dim_feature, dim_value, activation='relu', quant=True)
-        self.value_edge_linear = LinearBlock(dim_feature, dim_value, activation='relu', quant=True)
-        self.value_center_linear = LinearBlock(dim_feature, dim_value, activation='relu', quant=True)
-        self.value_quad_linear = LinearBlock(dim_value, dim_value, activation='relu', quant=True)
+        self.value_corner = StarBlock(dim_feature, dim_value)
+        self.value_edge = StarBlock(dim_feature, dim_value)
+        self.value_center = StarBlock(dim_feature, dim_value)
+        self.value_quad = StarBlock(dim_value, dim_value)
         self.value_linear = nn.Sequential(
             LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, dim_value, activation='relu', quant=True),
@@ -812,26 +851,30 @@ class Mix9Net(nn.Module):
             -data['stm_input'] if inv_side else data['stm_input']
         })  # [B, 2, H, W]
         # get per-point 4-direction cell features
-        feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
-        feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
-        feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
+        if self.one_mapping:
+            feature = self.mapping0(input_plane)  # [B, 4, dim_feature, H, W]
+        else:
+            feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
+            feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
+            feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-16, max=16)  # int16, scale=32, [-16,16]
+        feature = torch.clamp(feature, min=-16, max=511/32)  # int16, scale=32, [-16,16]
         feature = fake_quant(feature, scale=32, num_bits=16)
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
+        # apply relu activation
+        feature = F.relu(feature)  # [B, dim_feature, H, W] int16, scale=128, [0,16]
 
         # apply feature depth-wise conv
         _, _, _, _, dim_dwconv = self.model_size
-        feat_dwconv = torch.clamp(feature[:, :dim_dwconv], min=0)  # int16, scale=128, [0,16]
+        feat_dwconv = feature[:, :dim_dwconv]  # int16, scale=128, [0,16]
         feat_dwconv = self.feature_dwconv(feat_dwconv * 4)  # [B, dwconv, H, W] relu
         feat_dwconv = fake_quant(feat_dwconv, scale=128, num_bits=16)  # int16, scale=128, [0,9/2*16*4]
 
         # apply activation for direct feature
         feat_direct = feature[:, dim_dwconv:]  # [B, dim_feature-dwconv, H, W] int16, scale=128, [0,16]
-        feat_direct = F.leaky_relu(feat_direct, negative_slope=1/8)  # int16, scale=128, [-2,16]
-        feat_direct = fake_quant(feat_direct, scale=128, num_bits=16, floor=True)  # int16, scale=128, [-2,16]
+        feat_direct = fake_quant(feat_direct, scale=128, num_bits=16)  # int16, scale=128, [0,16]
 
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
@@ -888,17 +931,21 @@ class Mix9Net(nn.Module):
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value head
-        value_00 = fake_quant(self.value_corner_linear(feature_00), floor=True)
-        value_01 = fake_quant(self.value_edge_linear(feature_01), floor=True)
-        value_02 = fake_quant(self.value_corner_linear(feature_02), floor=True)
-        value_10 = fake_quant(self.value_edge_linear(feature_10), floor=True)
-        value_11 = fake_quant(self.value_center_linear(feature_11), floor=True)
-        value_12 = fake_quant(self.value_edge_linear(feature_12), floor=True)
-        value_20 = fake_quant(self.value_corner_linear(feature_20), floor=True)
-        value_21 = fake_quant(self.value_edge_linear(feature_21), floor=True)
-        value_22 = fake_quant(self.value_corner_linear(feature_22), floor=True)
+        value_00 = self.value_corner(feature_00)
+        value_01 = self.value_edge(feature_01)
+        value_02 = self.value_corner(feature_02)
+        value_10 = self.value_edge(feature_10)
+        value_11 = self.value_center(feature_11)
+        value_12 = self.value_edge(feature_12)
+        value_20 = self.value_corner(feature_20)
+        value_21 = self.value_edge(feature_21)
+        value_22 = self.value_corner(feature_22)
 
         def avg4(a, b, c, d):
+            a = fake_quant(a, floor=True)
+            b = fake_quant(b, floor=True)
+            c = fake_quant(c, floor=True)
+            d = fake_quant(d, floor=True)
             ab = fake_quant((a + b + 1/128) / 2, floor=True)
             cd = fake_quant((c + d + 1/128) / 2, floor=True)
             return fake_quant((ab + cd + 1/128) / 2, floor=True)
@@ -907,10 +954,10 @@ class Mix9Net(nn.Module):
         value_q01 = avg4(value_01, value_02, value_11, value_12)
         value_q10 = avg4(value_10, value_11, value_20, value_21)
         value_q11 = avg4(value_11, value_12, value_21, value_22)
-        value_q00 = self.value_quad_linear(value_q00)
-        value_q01 = self.value_quad_linear(value_q01)
-        value_q10 = self.value_quad_linear(value_q10)
-        value_q11 = self.value_quad_linear(value_q11)
+        value_q00 = self.value_quad(value_q00)
+        value_q01 = self.value_quad(value_q01)
+        value_q10 = self.value_quad(value_q10)
+        value_q11 = self.value_quad(value_q11)
 
         value = torch.cat([
             feature_sum,
@@ -990,26 +1037,21 @@ class Mix9Net(nn.Module):
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
 
         # value head
-        value_00 = fake_quant(self.value_corner_linear(feature_00), floor=True)
-        value_01 = fake_quant(self.value_edge_linear(feature_01), floor=True)
-        value_02 = fake_quant(self.value_corner_linear(feature_02), floor=True)
-        value_10 = fake_quant(self.value_edge_linear(feature_10), floor=True)
-        value_11 = fake_quant(self.value_center_linear(feature_11), floor=True)
-        value_12 = fake_quant(self.value_edge_linear(feature_12), floor=True)
-        value_20 = fake_quant(self.value_corner_linear(feature_20), floor=True)
-        value_21 = fake_quant(self.value_edge_linear(feature_21), floor=True)
-        value_22 = fake_quant(self.value_corner_linear(feature_22), floor=True)
-        print(f"value_00: \n{(value_00*128).int()}")
-        print(f"value_01: \n{(value_01*128).int()}")
-        print(f"value_02: \n{(value_02*128).int()}")
-        print(f"value_10: \n{(value_10*128).int()}")
-        print(f"value_11: \n{(value_11*128).int()}")
-        print(f"value_12: \n{(value_12*128).int()}")
-        print(f"value_20: \n{(value_20*128).int()}")
-        print(f"value_21: \n{(value_21*128).int()}")
-        print(f"value_22: \n{(value_22*128).int()}")
+        value_00 = self.value_corner.forward_debug_print(feature_00, "value_00")
+        value_01 = self.value_edge.forward_debug_print(feature_01, "value_01")
+        value_02 = self.value_corner.forward_debug_print(feature_02, "value_02")
+        value_10 = self.value_edge.forward_debug_print(feature_10, "value_10")
+        value_11 = self.value_center.forward_debug_print(feature_11, "value_11")
+        value_12 = self.value_edge.forward_debug_print(feature_12, "value_12")
+        value_20 = self.value_corner.forward_debug_print(feature_20, "value_20")
+        value_21 = self.value_edge.forward_debug_print(feature_21, "value_21")
+        value_22 = self.value_corner.forward_debug_print(feature_22, "value_22")
 
         def avg4(a, b, c, d):
+            a = fake_quant(a, floor=True)
+            b = fake_quant(b, floor=True)
+            c = fake_quant(c, floor=True)
+            d = fake_quant(d, floor=True)
             ab = fake_quant((a + b + 1/128) / 2, floor=True)
             cd = fake_quant((c + d + 1/128) / 2, floor=True)
             return fake_quant((ab + cd + 1/128) / 2, floor=True)
@@ -1022,14 +1064,10 @@ class Mix9Net(nn.Module):
         print(f"value_q01 avg: \n{(value_q01*128).int()}")
         print(f"value_q10 avg: \n{(value_q10*128).int()}")
         print(f"value_q11 avg: \n{(value_q11*128).int()}")
-        value_q00 = self.value_quad_linear(value_q00)
-        value_q01 = self.value_quad_linear(value_q01)
-        value_q10 = self.value_quad_linear(value_q10)
-        value_q11 = self.value_quad_linear(value_q11)
-        print(f"value_q00: \n{(value_q00*128).int()}")
-        print(f"value_q01: \n{(value_q01*128).int()}")
-        print(f"value_q10: \n{(value_q10*128).int()}")
-        print(f"value_q11: \n{(value_q11*128).int()}")
+        value_q00 = self.value_quad.forward_debug_print(value_q00, "value_q00")
+        value_q01 = self.value_quad.forward_debug_print(value_q01, "value_q01")
+        value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
+        value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
 
         value = torch.cat([
             feature_sum,
@@ -1052,10 +1090,18 @@ class Mix9Net(nn.Module):
             'max_weight': 32767 / 65536
         },
         {
-            'params': ['value_corner_linear.fc.weight', 
-                       'value_edge_linear.fc.weight',
-                       'value_center_linear.fc.weight', 
-                       'value_quad_linear.fc.weight',
+            'params': ['value_corner.up1.fc.weight', 
+                       'value_corner.up2.fc.weight', 
+                       'value_corner.down.fc.weight', 
+                       'value_edge.up1.fc.weight', 
+                       'value_edge.up2.fc.weight', 
+                       'value_edge.down.fc.weight', 
+                       'value_center.up1.fc.weight', 
+                       'value_center.up2.fc.weight', 
+                       'value_center.down.fc.weight', 
+                       'value_quad.up1.fc.weight', 
+                       'value_quad.up2.fc.weight', 
+                       'value_quad.down.fc.weight', 
                        'value_linear.0.fc.weight',
                        'value_linear.1.fc.weight',
                        'value_linear.2.fc.weight',

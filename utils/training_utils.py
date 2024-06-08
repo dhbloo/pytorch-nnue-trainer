@@ -227,3 +227,17 @@ class BatchByBoardSizeDataset(IterableDataset):
                     break  # discard last incomplete batch for all board size
         except GeneratorExit:
             pass
+        
+        
+def state_dict_drop_size_unmatched(model : torch.nn.Module, loaded_state_dict : dict) -> dict:
+    """
+    Drop key and values from loaded_state_dict that have shape
+    unmatched with the current model's parameters.
+    This will not drop other unmatched keys.
+    """
+    current_model_dict = model.state_dict()
+    new_state_dict = {}
+    for k, v in loaded_state_dict.items():
+        if k not in current_model_dict or current_model_dict[k].size() == v.size():
+            new_state_dict[k] = v
+    return new_state_dict

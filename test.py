@@ -10,6 +10,7 @@ import os
 
 from dataset import build_dataset
 from model import build_model
+from train import calc_loss
 from utils.training_utils import build_data_loader
 from utils.misc_utils import add_dict_to, seed_everything
 
@@ -24,6 +25,7 @@ def parse_args_and_init():
                nargs='+',
                required=True,
                help="Test dataset file or directory paths")
+    parser.add('--do_cross_eval', action='store_true', help="Use the dataset to do cross eval check")
     parser.add('--use_cpu', action='store_true', help="Use cpu only")
     parser.add('--dataset_type', required=True, help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
@@ -36,6 +38,7 @@ def parse_args_and_init():
     parser.add('--batch_size', type=int, default=128, help="Batch size")
     parser.add('--num_worker', type=int, default=8, help="Num of dataloader workers")
     parser.add('--seed', type=int, default=42, help="Random seed")
+    parser.add('--max_batches', type=int, help="Test the amount of batches only")
 
     args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
@@ -56,7 +59,8 @@ def top_k_accuracy(policy, policy_target, k):
     return move_correct_count / k / len(topkmoves)
 
 
-def calc_metric(data, value, policy):
+def calc_metric(data, results, do_cross_eval):
+    value, policy, *retvals = results
     value_target = data['value_target']
     policy_target = data['policy_target']
 
@@ -69,9 +73,14 @@ def calc_metric(data, value, policy):
         value = value[:, 0]
         value_target = value_target[:, 0] - value_target[:, 1]
         value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
-
+        
     # calc metrics
     metrics = {}
+    
+    # 0. losses
+    _, losses_ce_ce, _ = calc_loss("CE+CE", data, results)
+    for k, v in losses_ce_ce.items():
+        metrics[f'lossCE_{k}'] = v.item()
 
     # 1. bestmove accuracy
     bestmove_eq = torch.argmax(policy, dim=1) == torch.argmax(policy_target, dim=1)
@@ -110,12 +119,19 @@ def calc_metric(data, value, policy):
     winrate_acc = torch.sum(winrate_correct) / winrate_correct.size(0)
     metrics['winrate_acc'] = winrate_acc.item()
     metrics['winrate_mse'] = winrate_mse.item()
+    
+    # cross eval. compute absolute and relative error
+    if do_cross_eval:
+        metrics['value_abserr_mean'] = torch.abs(value - value_target).mean().item()
+        metrics['value_abserr_max'] = torch.abs(value - value_target).max().item()
+        metrics['value_relerr_mean'] = (torch.abs(value - value_target) / (torch.abs(value)+1e-4)).mean().item()
+        metrics['value_relerr_max'] = (torch.abs(value - value_target) / (torch.abs(value)+1e-4)).max().item()
 
     return metrics
 
 
-def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args, model_type,
-         model_args, batch_size, num_worker, **kwargs):
+def test(checkpoint, do_cross_eval, use_cpu, datas, dataset_type, dataset_args, dataloader_args,
+         model_type, model_args, batch_size, num_worker, max_batches, **kwargs):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f'Checkpoint {checkpoint} must be a valid file')
     rundir = os.path.dirname(checkpoint)
@@ -152,10 +168,12 @@ def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args
     with torch.no_grad():
         model.eval()
         for data in tqdm(test_loader, disable=not accelerator.is_local_main_process):
-            value, policy, *retvals = model(data)
-            metrics = calc_metric(data, value, policy)
+            results = model(data)
+            metrics = calc_metric(data, results, do_cross_eval)
             add_dict_to(metric_dict, metrics)
             num_batches += 1
+            if max_batches is not None and num_batches >= max_batches:
+                break
 
     # convert metrics floats to tensor
     for k, loss in metric_dict.items():
@@ -176,7 +194,16 @@ def test(checkpoint, use_cpu, datas, dataset_type, dataset_args, dataloader_args
         num_entries = num_batches * batch_size
         # log test results
         with open(log_filename, 'w') as log:
-            json_text = json.dumps(metric_dict)
+            log_dict = {
+                'test_datas': datas,
+                'dataset_type': dataset_type,
+                'dataset_args': dataset_args,
+                'use_cpu': use_cpu,
+                'do_cross_eval': do_cross_eval,
+                'num_entries': num_entries,
+                'metrics': metric_dict,
+            }
+            json_text = json.dumps(log_dict, indent=4)
             log.writelines([json_text, '\n'])
         print(f"Test finished with {num_entries} entries, in {elasped:.2f}s.")
         print("Metrics:")

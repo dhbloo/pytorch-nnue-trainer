@@ -1614,10 +1614,21 @@ class Mix8NetSerializer(BaseSerializer):
 @SERIALIZERS.register('mix9')
 class Mix9NetSerializer(BaseSerializer):
     """
-    Mix8Net binary serializer.
+    Mix9Net binary serializer.
 
-    The corresponding C-language struct layout: 
-    struct Mix8Weight {
+    The corresponding C++ language struct layout: 
+    template <int OutSize, int InSize>
+    struct StarBlockWeight
+    {
+        int8_t  value_corner_up1_weight[(OutSize * 2) * InSize];
+        int32_t value_corner_up1_bias[(OutSize * 2)];
+        int8_t  value_corner_up2_weight[(OutSize * 2) * InSize];
+        int32_t value_corner_up2_bias[(OutSize * 2)];
+        int8_t  value_corner_down_weight[OutSize * OutSize];
+        int32_t value_corner_down_bias[OutSize];
+    };
+    
+    struct Mix9Weight {
         // 1  mapping layer
         int16_t mapping[2][ShapeNum][FeatureDim];
 
@@ -1632,19 +1643,14 @@ class Mix9NetSerializer(BaseSerializer):
             int8_t  policy_pwconv_layer_l2_weight[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim) * (PolicyDim * 2)];
             int32_t policy_pwconv_layer_l2_bias[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim)];
             
-            // 4  Group Value MLP (layer 1,2)
-            int8_t  value_corner_weight[ValueDim * FeatureDim];
-            int32_t value_corner_bias[ValueDim];
-            int8_t  value_edge_weight[ValueDim * FeatureDim];
-            int32_t value_edge_bias[ValueDim];
-            int8_t  value_center_weight[ValueDim * FeatureDim];
-            int32_t value_center_bias[ValueDim];
-            int8_t  value_quad_weight[ValueDim * ValueDim];
-            int32_t value_quad_bias[ValueDim];
+            // 4  Value Group MLP (layer 1,2)
+            StarBlockWeight<ValueDim, FeatureDim> value_corner;
+            StarBlockWeight<ValueDim, FeatureDim> value_edge;
+            StarBlockWeight<ValueDim, FeatureDim> value_center;
+            StarBlockWeight<ValueDim, ValueDim>   value_quad;
 
             // 5  Value MLP (layer 1,2,3)
-            int8_t  value_l1_weight_global[ValueDim * FeatureDim];
-            int8_t  value_l1_weight_group[ValueDim * (ValueDim * 4)];
+            int8_t  value_l1_weight[ValueDim * (FeatureDim + ValueDim * 4)];
             int32_t value_l1_bias[ValueDim];
             int8_t  value_l2_weight[ValueDim * ValueDim];
             int32_t value_l2_bias[ValueDim];
@@ -1703,14 +1709,11 @@ class Mix9NetSerializer(BaseSerializer):
             line: shape (N, Length)
         """
         N, L = line.shape
-        b, w = line == 1, line == 2
-
-        line = (b, w)
-        line = np.stack(line, axis=0)[np.newaxis]  # [C=2, N, L]
+        us, opponent = line == 1, line == 2
+        line = np.stack((us, opponent), axis=0)[np.newaxis]  # [1, C=2, N, L]
         line = torch.tensor(line, dtype=torch.float32, device=device)
 
         batch_size = self.map_table_export_batch_size
-
         batch_num = 1 + (N - 1) // batch_size
         map_table = []
         for i in range(batch_num):
@@ -1718,48 +1721,38 @@ class Mix9NetSerializer(BaseSerializer):
             end = min((i + 1) * batch_size, N)
 
             mapping = getattr(model, f'mapping{mapping_idx}')
-            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]
-            map_table.append(feature.cpu().numpy())
+            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]  # [dim_feature, batch, L]
+            feature = torch.permute(feature, (1, 2, 0)).cpu().numpy() # [batch, L, dim_feature]
+            map_table.append(feature)
 
-        map_table = np.concatenate(map_table, axis=1)  # [dim_feature, N, L]
+        map_table = np.concatenate(map_table, axis=0)  # [N, L, dim_feature]
         return map_table
 
     def _export_feature_map(self, model: Mix9Net, device, mapping_idx):
+        # use line encoding to generate feature map
+        from dataset.pipeline.line_encoding import \
+            get_total_num_encoding, \
+            get_encoding_usage_flags, \
+            transform_lines_to_line_encoding
+
         L = self.line_length
         dim_feature = model.model_size[1]
-        lines = generate_base3_permutation(L)  # [177147, 11]
-        map_table = self._export_map_table(model, device, lines, mapping_idx)  # [dim_feature, 177147, 11]
-
-        feature_map = np.zeros((4 * 3**L, dim_feature), dtype=np.float32)  # [708588, dim_feature]
-        usage_flags = np.zeros(4 * 3**L, dtype=np.int8)  # [708588], track usage of each feature
-        pow3 = 3**np.arange(L + 1, dtype=np.int64)[:, np.newaxis]  # [11, 1]
-
-        for r in range((L + 1) // 2):
-            idx = np.matmul(lines[:, r:], pow3[:L - r]) + pow3[L + 1 - r:].sum()
-            for i in range(idx.shape[0]):
-                feature_map[idx[i]] = map_table[:, i, L // 2 + r]
-                usage_flags[idx[i]] = True
-
-        for l in range(1, (L + 1) // 2):
-            idx = np.matmul(lines[:, :L - l], pow3[l:-1]) + 2 * pow3[-1] + pow3[:l - 1].sum()
-            for i in range(idx.shape[0]):
-                feature_map[idx[i]] = map_table[:, i, L // 2 - l]
-                usage_flags[idx[i]] = True
-
-        for l in range(1, (L + 1) // 2):
-            for r in range(1, (L + 1) // 2):
-                lines = generate_base3_permutation(L - l - r)
-                map_table = self._export_map_table(model, device, lines, mapping_idx)
-                idx_offset = 3 * pow3[-1] + pow3[:l - 1].sum() + pow3[L + 1 - r:-1].sum()
-                idx = np.matmul(lines, pow3[l:L - r]) + idx_offset
-                for i in range(idx.shape[0]):
-                    feature_map[idx[i]] = map_table[:, i, L // 2 - l]
-                    usage_flags[idx[i]] = True
+        num_encoding = get_total_num_encoding(L)
+        usage_flags = get_encoding_usage_flags(L)  # [N] bool, track usage of each feature
+        feature_map = np.zeros((num_encoding, dim_feature), dtype=np.float32)  # [N, dim_feature]
+        
+        # generate line features
+        for l in reversed(range(1, L + 1)):
+            lines = generate_base3_permutation(l)
+            idxs = transform_lines_to_line_encoding(lines, L)  # [n, 11]
+            map_table = self._export_map_table(model, device, lines, mapping_idx)
+            rows = np.arange(idxs.shape[0])[:, None]  # [n, 1]
+            feature_map[idxs, :] = map_table[rows, np.arange(l), :]
 
         ascii_hist(f"feature map {mapping_idx}", feature_map)
-        feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=16)
+        feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=511/32)
         num_params_clipped = np.sum(feature_map != feature_map_clipped)
-        feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)
+        feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)  # [-512, 511]
         print(f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}, " +
               f": clipped {num_params_clipped}/{feature_map.size}" +
               f", quant_range = {(feature_map_quant.min(), feature_map_quant.max())}")
@@ -1817,27 +1810,31 @@ class Mix9NetSerializer(BaseSerializer):
             policy_output_bias,
         )
 
+    def _export_star_block(self, model: Mix9Net, prefix: str):
+        block = getattr(model, prefix)
+        up1_weight = block.up1.fc.weight.cpu().numpy()
+        up1_bias = block.up1.fc.bias.cpu().numpy()
+        up2_weight = block.up2.fc.weight.cpu().numpy()
+        up2_bias = block.up2.fc.bias.cpu().numpy()
+        down_weight = block.down.fc.weight.cpu().numpy()
+        down_bias = block.down.fc.bias.cpu().numpy()
+        ascii_hist(f"{prefix}: up1 weight", up1_weight)
+        ascii_hist(f"{prefix}: up1 bias", up1_bias)
+        ascii_hist(f"{prefix}: up2 weight", up2_weight)
+        ascii_hist(f"{prefix}: up2 bias", up2_bias)
+        ascii_hist(f"{prefix}: down weight", down_weight)
+        ascii_hist(f"{prefix}: down bias", down_bias)
+        
+        return (
+            np.clip(np.around(up1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(up1_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(up2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(up2_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+            np.clip(np.around(down_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(down_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+        )
+
     def _export_value(self, model: Mix9Net):
-        # group value layer 1: 3x3 group
-        corner_weight = model.value_corner_linear.fc.weight.cpu().numpy()
-        corner_bias = model.value_corner_linear.fc.bias.cpu().numpy()
-        edge_weight = model.value_edge_linear.fc.weight.cpu().numpy()
-        edge_bias = model.value_edge_linear.fc.bias.cpu().numpy()
-        center_weight = model.value_center_linear.fc.weight.cpu().numpy()
-        center_bias = model.value_center_linear.fc.bias.cpu().numpy()
-        ascii_hist("value: corner linear weight", corner_weight)
-        ascii_hist("value: corner linear bias", corner_bias)
-        ascii_hist("value: edge linear weight", edge_weight)
-        ascii_hist("value: edge linear bias", edge_bias)
-        ascii_hist("value: center linear weight", center_weight)
-        ascii_hist("value: center linear bias", center_bias)
-
-        # group value layer 2: quadrant group
-        quad_weight = model.value_quad_linear.fc.weight.cpu().numpy()
-        quad_bias = model.value_quad_linear.fc.bias.cpu().numpy()
-        ascii_hist("value: quad linear weight", quad_weight)
-        ascii_hist("value: quad linear bias", quad_bias)
-
         # value layers
         l1_weight = model.value_linear[0].fc.weight.cpu().numpy()
         l1_bias = model.value_linear[0].fc.bias.cpu().numpy()
@@ -1853,14 +1850,6 @@ class Mix9NetSerializer(BaseSerializer):
         ascii_hist("value: linear3 bias", l3_bias)
 
         return (
-            np.clip(np.around(corner_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(corner_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(np.around(edge_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(edge_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(np.around(center_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(center_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(np.around(quad_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(quad_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
             np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
             np.clip(np.around(l1_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
             np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
@@ -1870,32 +1859,46 @@ class Mix9NetSerializer(BaseSerializer):
         )
 
     def serialize(self, out: io.IOBase, model: Mix9Net, device):
-        feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
-        feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
+        if model.one_mapping:
+            feature_map0, usage_flags0 = self._export_feature_map(model, device, 0)
+        else:
+            feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
+            feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
         feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
         policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
             policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
             policy_output_weight, policy_output_bias = self._export_policy_pwconv(model)
-        corner_weight, corner_bias, edge_weight, edge_bias, center_weight, center_bias, \
-            quad_weight, quad_bias, l1_weight, l1_bias, l2_weight, l2_bias, \
-            l3_weight, l3_bias = self._export_value(model)
+        corner_weights = self._export_star_block(model, 'value_corner')
+        edge_weights = self._export_star_block(model, 'value_edge')
+        center_weights = self._export_star_block(model, 'value_center')
+        quad_weights = self._export_star_block(model, 'value_quad')
+        l1_weight, l1_bias, l2_weight, l2_bias, l3_weight, l3_bias = self._export_value(model)
 
         if self.text_output:
-            print('featuremap1', file=out)
-            print(usage_flags1.sum(), file=out)
-            for i, (f, used) in enumerate(zip(feature_map1.astype('i2'), usage_flags1)):
-                if used:
-                    print(i, end=' ', file=out)
-                    f.tofile(out, sep=' ')
-                    print(file=out)
+            if model.one_mapping:
+                print('featuremap0', file=out)
+                print(usage_flags0.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map0.astype('i2'), usage_flags0)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
+            else:
+                print('featuremap1', file=out)
+                print(usage_flags1.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map1.astype('i2'), usage_flags1)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
 
-            print('featuremap2', file=out)
-            print(usage_flags2.sum(), file=out)
-            for i, (f, used) in enumerate(zip(feature_map2.astype('i2'), usage_flags2)):
-                if used:
-                    print(i, end=' ', file=out)
-                    f.tofile(out, sep=' ')
-                    print(file=out)
+                print('featuremap2', file=out)
+                print(usage_flags2.sum(), file=out)
+                for i, (f, used) in enumerate(zip(feature_map2.astype('i2'), usage_flags2)):
+                    if used:
+                        print(i, end=' ', file=out)
+                        f.tofile(out, sep=' ')
+                        print(file=out)
 
             print('feature_dwconv_weight', file=out)
             feat_dwconv_weight.astype('i2').tofile(out, sep=' ')
@@ -1916,31 +1919,31 @@ class Mix9NetSerializer(BaseSerializer):
             print('policy_pwconv_layer_l2_bias', file=out)
             policy_pwconv_layer_l2_bias.astype('i4').tofile(out, sep=' ')
             print(file=out)
-
-            print('value_corner_weight', file=out)
-            corner_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_corner_bias', file=out)
-            corner_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('value_edge_weight', file=out)
-            edge_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_edge_bias', file=out)
-            edge_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('value_center_weight', file=out)
-            center_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_center_bias', file=out)
-            center_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('value_quad_weight', file=out)
-            quad_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_quad_bias', file=out)
-            quad_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
+            
+            def print_star_block(name, weights):
+                print(f'{name}_up1_weight', file=out)
+                weights[0].astype('i1').tofile(out, sep=' ')
+                print(file=out)
+                print(f'{name}_up1_bias', file=out)
+                weights[1].astype('i4').tofile(out, sep=' ')
+                print(file=out)
+                print(f'{name}_up2_weight', file=out)
+                weights[2].astype('i1').tofile(out, sep=' ')
+                print(file=out)
+                print(f'{name}_up2_bias', file=out)
+                weights[3].astype('i4').tofile(out, sep=' ')
+                print(file=out)
+                print(f'{name}_down_weight', file=out)
+                weights[4].astype('i1').tofile(out, sep=' ')
+                print(file=out)
+                print(f'{name}_down_bias', file=out)
+                weights[5].astype('i4').tofile(out, sep=' ')
+                print(file=out)
+                
+            print_star_block('value_corner', corner_weights)
+            print_star_block('value_edge', edge_weights)
+            print_star_block('value_center', center_weights)
+            print_star_block('value_quad', quad_weights)
 
             print('value_l1_weight', file=out)
             l1_weight.astype('i1').tofile(out, sep=' ')
@@ -1969,11 +1972,38 @@ class Mix9NetSerializer(BaseSerializer):
             print(file=out)
         else:
             o: io.RawIOBase = out
-            (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv) = model.model_size
 
-            # int16_t mapping[2][ShapeNum][FeatureDim];
-            o.write(feature_map1.astype('<i2').tobytes())  # (708588, FC)
-            o.write(feature_map2.astype('<i2').tobytes())  # (708588, FC)
+            # Since each quantized feature is in [-512, 511] range, they only uses 10 bits,
+            # here we write compressed uint64 streams to save space.
+            def write_feature_map_compressed(feature_map, feature_bits=10):
+                feature_map_i16 = feature_map.astype('<i2')  # (442503, FC)
+                feature_map_i16 = feature_map_i16.reshape(-1)  # (442503*FC,)
+                bitmask = np.uint64(2**feature_bits - 1)
+                uint64 = np.uint64(0)
+                bits_used = 0
+                uint64_written = 0
+                for i in range(feature_map_i16.shape[0]):
+                    v = feature_map_i16[i].astype(np.uint64) & bitmask
+                    uint64 |= v << np.uint64(bits_used)
+                    if 64 - bits_used >= feature_bits:
+                        bits_used += feature_bits
+                    else:
+                        o.write(uint64.tobytes())
+                        uint64_written += 1
+                        uint64 = v >> np.uint64(64 - bits_used)
+                        bits_used = feature_bits - (64 - bits_used)
+                if bits_used > 0:
+                    o.write(uint64.tobytes())
+                    uint64_written += 1
+                print(f"write_feature_map_compressed: {feature_map_i16.shape[0]} -> {uint64_written} uint64")
+            
+            if model.one_mapping:
+                # int16_t mapping[ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map0)
+            else:
+                # int16_t mapping[2][ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map1)
+                write_feature_map_compressed(feature_map2)
 
             # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
             # int16_t feature_dwconv_bias[FeatureDWConvDim];
@@ -1989,32 +2019,30 @@ class Mix9NetSerializer(BaseSerializer):
             o.write(policy_pwconv_layer_l2_weight.astype('<i1').tobytes())
             o.write(policy_pwconv_layer_l2_bias.astype('<i4').tobytes())
 
-            # int8_t  value_corner_weight[ValueDim * FeatureDim];
-            # int32_t value_corner_bias[ValueDim];
-            # int8_t  value_edge_weight[ValueDim * FeatureDim];
-            # int32_t value_edge_bias[ValueDim];
-            # int8_t  value_center_weight[ValueDim * FeatureDim];
-            # int32_t value_center_bias[ValueDim];
-            # int8_t  value_quad_weight[ValueDim * ValueDim];
-            # int32_t value_quad_bias[ValueDim];
-            o.write(corner_weight.astype('<i1').tobytes())
-            o.write(corner_bias.astype('<i4').tobytes())
-            o.write(edge_weight.astype('<i1').tobytes())
-            o.write(edge_bias.astype('<i4').tobytes())
-            o.write(center_weight.astype('<i1').tobytes())
-            o.write(center_bias.astype('<i4').tobytes())
-            o.write(quad_weight.astype('<i1').tobytes())
-            o.write(quad_bias.astype('<i4').tobytes())
+            # StarBlockWeight<ValueDim, FeatureDim> value_corner;
+            # StarBlockWeight<ValueDim, FeatureDim> value_edge;
+            # StarBlockWeight<ValueDim, FeatureDim> value_center;
+            # StarBlockWeight<ValueDim, ValueDim>   value_quad;
+            def write_star_block(weights):
+                o.write(weights[0].astype('<i1').tobytes())
+                o.write(weights[1].astype('<i4').tobytes())
+                o.write(weights[2].astype('<i1').tobytes())
+                o.write(weights[3].astype('<i4').tobytes())
+                o.write(weights[4].astype('<i1').tobytes())
+                o.write(weights[5].astype('<i4').tobytes())
+                
+            write_star_block(corner_weights)
+            write_star_block(edge_weights)
+            write_star_block(center_weights)
+            write_star_block(quad_weights)
 
-            # int8_t  value_l1_weight_global[ValueDim * FeatureDim];
-            # int8_t  value_l1_weight_group[ValueDim * (ValueDim * 4)];
+            # int8_t  value_l1_weight[ValueDim * (FeatureDim + ValueDim * 4)];
             # int32_t value_l1_bias[ValueDim];
             # int8_t  value_l2_weight[ValueDim * ValueDim];
             # int32_t value_l2_bias[ValueDim];
             # int8_t  value_l3_weight[4 * ValueDim];
             # int32_t value_l3_bias[4];
-            o.write(l1_weight[:, :dim_feature].astype('<i1').tobytes())
-            o.write(l1_weight[:, dim_feature:].astype('<i1').tobytes())
+            o.write(l1_weight.astype('<i1').tobytes())
             o.write(l1_bias.astype('<i4').tobytes())
             o.write(l2_weight.astype('<i1').tobytes())
             o.write(l2_bias.astype('<i4').tobytes())

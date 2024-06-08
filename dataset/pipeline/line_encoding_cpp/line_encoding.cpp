@@ -99,19 +99,20 @@ private:
     {
         for (int i = 0; i < length; i++)
         {
+            int line_idx = length - 1 - i;
             switch ((key >> (2 * i)) & 0b11)
             {
             case 0b00:
-                line[i] = WALL;
+                line[line_idx] = WALL;
                 break;
             case 0b01:
-                line[i] = SELF;
+                line[line_idx] = SELF;
                 break;
             case 0b10:
-                line[i] = OPPO;
+                line[line_idx] = OPPO;
                 break;
             case 0b11:
-                line[i] = EMPTY;
+                line[line_idx] = EMPTY;
                 break;
             }
         }
@@ -168,7 +169,7 @@ private:
         assert(0 <= left && left <= half);
         assert(0 <= right && right <= half);
 
-        if (left == half && right == left)
+        if (left == half && right == half)
             return 0;
         else if (right == half) // (left < half)
         {
@@ -201,10 +202,10 @@ private:
     }
 };
 
-std::vector<LineEncodingTable> EncodingTables;
+static std::vector<LineEncodingTable> EncodingTables;
 
 /// Gets existing encoding table or create a new one.
-const LineEncodingTable &get_line_encoding_table(int length)
+static const LineEncodingTable &get_line_encoding_table(int length)
 {
     for (const auto &table : EncodingTables)
     {
@@ -220,10 +221,11 @@ const LineEncodingTable &get_line_encoding_table(int length)
     return EncodingTables.emplace_back(length);
 }
 
-/// Right logical shift function that supports negetive shamt.
-inline uint64_t right_shift(uint64_t x, int shamt)
+/// Rotate right with the given shift amount.
+inline uint64_t rotate_right(uint64_t x, int shamt)
 {
-    return shamt < 0 ? x << (-shamt) : x >> shamt;
+    shamt &= 63;
+    return (x << (64 - shamt)) | (x >> shamt);
 }
 
 /// Get the total number of line encoding of the line length.
@@ -232,7 +234,7 @@ int get_total_num_encoding(int line_length)
     return LineEncodingTable::max_encoding(line_length) + 1;
 }
 
-/// Get the usage flags of each line encoding
+/// Get the usage flags of each line encoding.
 /// @param usage_flags_output usage flags output numpy array, must be initialized to zero.
 void get_encoding_usage_flag(
     py::array_t<int8_t, py::array::c_style | py::array::forcecast> usage_flags_output,
@@ -252,8 +254,8 @@ void get_encoding_usage_flag(
     }
 }
 
-/// Transform a board input numpy array to 4 direction line encoding output numpy array
-/// @param board_input Board numpy array of shape [2, H, W].
+/// Transform a board input numpy array to 4 direction line encoding output numpy array.
+/// @param board_input Board numpy array of shape [2, H, W]. First/second channel is self/oppo.
 /// @param line_encoding_output Line encoding numpy array of shape [4, H, W].
 /// @param line_length The length of line to encode.
 /// @param raw_code Whether to output raw bit code instead of line encoding.
@@ -276,6 +278,8 @@ void transform_board_to_line_encoding(
         throw std::invalid_argument("line_encoding shape incorrect, must be [4,H,W]");
     if (H > MAX_BOARD_SIZE || W > MAX_BOARD_SIZE)
         throw std::invalid_argument("board size must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
+    if (line_length % 2 == 0)
+        throw std::invalid_argument("the line length must be an odd number");
     if (raw_code && line_length > 15)
         throw std::invalid_argument("the maximum line length for raw code is 15");
 
@@ -308,10 +312,10 @@ void transform_board_to_line_encoding(
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
         {
-            uint64_t key0 = right_shift(bit_key0[y], 2 * (x - half));
-            uint64_t key1 = right_shift(bit_key1[x], 2 * (y - half));
-            uint64_t key2 = right_shift(bit_key2[x + y], 2 * (x - half));
-            uint64_t key3 = right_shift(bit_key3[MAX_BOARD_SIZE - 1 - x + y], 2 * (x - half));
+            uint64_t key0 = rotate_right(bit_key0[y], 2 * (x - half));
+            uint64_t key1 = rotate_right(bit_key1[x], 2 * (y - half));
+            uint64_t key2 = rotate_right(bit_key2[x + y], 2 * (x - half));
+            uint64_t key3 = rotate_right(bit_key3[MAX_BOARD_SIZE - 1 - x + y], 2 * (x - half));
 
             if (raw_code)
             {
@@ -331,6 +335,57 @@ void transform_board_to_line_encoding(
         }
 }
 
+/// Transform batched lines numpy array to line encoding output numpy array.
+/// @param lines_input Lines numpy array of shape [N, L]. Elements are in {0,1,2} for empty/self/oppo.
+/// @param line_encodings_output Line encoding numpy array of shape [N, L].
+/// @param line_length The length of line to encode.
+void transform_lines_to_line_encoding(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> lines_input,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encodings_output,
+    int line_length)
+{
+    constexpr int MAX_BOARD_SIZE = 32;
+
+    auto lines = lines_input.unchecked<2>();
+    auto line_encodings = line_encodings_output.mutable_unchecked<2>();
+    int N = (int)lines.shape(0), L = (int)lines.shape(1);
+
+    // Check input legality
+    if (L > MAX_BOARD_SIZE)
+        throw std::invalid_argument("input length must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
+    if (line_encodings.shape(0) != N || line_encodings.shape(1) != L)
+        throw std::invalid_argument("line_encodings shape incorrect, must be [N, L]");
+    if (line_length % 2 == 0)
+        throw std::invalid_argument("the line length must be an odd number");
+
+    const auto &encoding_table = get_line_encoding_table(line_length);
+    const int half = line_length / 2;
+
+    // Iterate over all lines
+    for (int n = 0; n < N; n++)
+    {
+        // Initialize bit key to 0b00 (WALL).
+        uint64_t bit_key = 0; // [RIGHT(MSB) - LEFT(LSB)]
+
+        // Set bits in bit key
+        for (int x = 0; x < L; x++)
+        {
+            bool is_self = lines(n, x) == 1;
+            bool is_oppo = lines(n, x) == 2;
+            uint64_t cell_bits = is_self ? 0b01 : is_oppo ? 0b10 : 0b11;
+            bit_key |= cell_bits << (2 * x);
+        }
+
+        // Query line encoding table for each pos
+        for (int x = 0; x < L; x++)
+        {
+            uint64_t key = rotate_right(bit_key, 2 * (x - half));
+            line_encodings(n, x) = encoding_table[key];
+        }
+    }
+}
+
+
 using namespace py::literals;
 
 PYBIND11_MODULE(line_encoding_cpp, m)
@@ -345,4 +400,8 @@ PYBIND11_MODULE(line_encoding_cpp, m)
           "line_encoding_output"_a,
           "line_length"_a,
           "raw_code"_a = false);
+    m.def("transform_lines_to_line_encoding", &transform_lines_to_line_encoding,
+          "lines_input"_a,
+          "line_encodings_output"_a,
+          "line_length"_a);
 }
