@@ -57,6 +57,7 @@ def parse_args_and_init():
     parser.add('--loss_args', type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add('--iterations', type=int, default=1000000, help="Num iterations")
     parser.add('--batch_size', type=int, default=128, help="Batch size")
+    parser.add('--grad_accum_steps', type=int, default=1, help="Num steps to accumulate gradient")
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
     parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
     parser.add('--clip_grad_norm', type=float, help="Gradient clipping max norm")
@@ -241,9 +242,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
                   clip_grad_norm, no_shuffle, log_interval, show_interval, save_interval, val_interval, 
                   avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, 
-                  kd_use_train_mode, **kwargs):
+                  kd_use_train_mode, grad_accum_steps, **kwargs):
     # use accelerator
-    accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
+    accelerator = Accelerator(cpu=use_cpu, 
+                              dispatch_batches=False, 
+                              gradient_accumulation_steps=grad_accum_steps)
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
@@ -347,13 +350,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     while not stop_training:
         epoch += 1
         for data in train_loader:
-            it += 1
             rows += batch_size
-            if it > iterations:
+            if it >= iterations:
                 stop_training = True
                 break
-            data['train_iter'] = it
-            data['train_progress'] = it / iterations
+            data['train_iter'] = it + 1
+            data['train_progress'] = (it + 1) / iterations
 
             # evaulate teacher model for knowledge distillation
             with torch.no_grad():
@@ -366,19 +368,25 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 weight_clipping(unwarpped_model.named_parameters(), clip_parameters)
 
             # model update
-            optimizer.zero_grad()
-            results = model(data)
-            loss, loss_dict, aux_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
-            accelerator.backward(loss)
+            with accelerator.accumulate(model):
+                results = model(data)
+                loss, loss_dict, aux_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
+                accelerator.backward(loss)
 
-            # apply gradient clipping if needed
-            if clip_grad_norm is not None:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+                if accelerator.sync_gradients:
+                    # apply gradient clipping if needed
+                    if clip_grad_norm is not None:
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
 
-            optimizer.step()
-            lr_scheduler.step()
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    lr_scheduler.step()
+                else:
+                    # continue accumulate gradients of the next batch
+                    continue
 
             # update running average loss
+            it += 1
             loss_dict = accelerator.gather(loss_dict)
             aux_dict = accelerator.gather(aux_dict)
             for metric_dict in [loss_dict, aux_dict]:
@@ -416,7 +424,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         'rows': rows,
                         'elasped_seconds': elasped,
                         'it/s': speed,
-                        'entry/s': speed * batch_size,
+                        'entry/s': speed * batch_size * grad_accum_steps,
                         'lr': lr_scheduler.get_last_lr()[0],
                     }, it)
                 print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]" +
