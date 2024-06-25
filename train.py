@@ -352,7 +352,6 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             if it > iterations:
                 stop_training = True
                 break
-            data['train_iter'] = it
             data['train_progress'] = it / iterations
 
             # evaulate teacher model for knowledge distillation

@@ -20,11 +20,12 @@ class VectorQuantizer(nn.Module):
         self.inv_temperature = 1.0 / temperature
         self.embedding = nn.Embedding(codebook_size, dim_feature)
 
-    def forward(self, z : torch.Tensor, beta_modifier=1):
+    def forward(self, z : torch.Tensor, beta_multiplier=1):
         """
         Get the quantized version z_q of the continuous input z.
         Args:
             z: A continuous tensor of shape (..., dim_feature).
+            beta_multiplier: The weight multiplier on the commitment loss.
         Returns:
             z_q: A quantized tensor of shape (..., dim_feature).
             indices: Indices of the closest embedding, long tensor of shape (...).
@@ -47,7 +48,7 @@ class VectorQuantizer(nn.Module):
         # compute VQ-VAE loss
         loss_embed = (z_q - z.detach()).square().mean()
         loss_commitment = (z_q.detach() - z).square().mean()
-        loss = loss_embed + self.beta * beta_modifier * loss_commitment
+        loss = loss_embed + self.beta * beta_multiplier * loss_commitment
 
         # preserve gradients
         z_q = z + (z_q - z).detach()

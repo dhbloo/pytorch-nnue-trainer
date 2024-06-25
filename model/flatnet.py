@@ -1372,7 +1372,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
         ]
 
         # allow the first 80% of training to use the pre-quant feature
-        vq_t = min(max(train_progress / 0.8, 0.0), 1.0)
+        vq_t = 1.0 if train_progress is None else min(max(train_progress / 0.8, 0.0), 1.0)
         features = []
         vq_losses = []
         vq_perplexities = []
@@ -1382,7 +1382,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
                 if t:
                     chunk = torch.transpose(chunk, 2, 3)
                 feat = self.mapping4x4(chunk).squeeze(-1).squeeze(-1)
-                feat_vq, _, vq_loss, vq_perplexity = self.feature_vq(feat, vq_t)
+                feat_vq, _, vq_loss, vq_perplexity = self.feature_vq(feat, beta_multiplier=vq_t)
 
                 # blend the feat according to the vq_t in [0, 1]
                 feat = vq_t * feat_vq + (1 - vq_t) * feat
@@ -1402,7 +1402,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
         _, _, H, W = input_plane.shape
 
         # get feature sum from chunks
-        features, vq_loss, vq_perplexity = self.get_features(input_plane, data['train_progress'])
+        features, vq_loss, vq_perplexity = self.get_features(input_plane, data.get('train_progress', None))
         feature = torch.cat(features, dim=1)
 
         # value head
