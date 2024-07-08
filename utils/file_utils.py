@@ -61,3 +61,23 @@ def find_latest_model_file(dirname, prefix, ext='.pth'):
 
     model_list.sort()
     return model_list[-1]
+
+
+def get_iteration_from_model_filename(model_name):
+    """
+    Get iteration number from model name.
+
+    Returns:
+        The iteration number. None if not exists.
+    """
+    if model_name is None:
+        return None
+    
+    model_name = os.path.basename(model_name)
+    model_name = os.path.splitext(model_name)[0]
+
+    parts = model_name.split('_')
+    for part in reversed(parts):
+        if part.isdigit():
+            return int(part)
+    return None

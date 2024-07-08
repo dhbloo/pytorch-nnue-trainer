@@ -23,9 +23,10 @@ def add_dict_to(total_dict, dict_to_add):
             total_dict[k] = v
 
 
-def log_value_dict(tb_logger, tag, value_dict, it):
+def log_value_dict(tb_logger, tag, value_dict, it, rows):
     for name, value in value_dict.items():
         tb_logger.add_scalar(f'{tag}/{name}', value, it)
+        tb_logger.add_scalar(f'{tag}_rows/{name}', value, rows)
 
 
 class Register:

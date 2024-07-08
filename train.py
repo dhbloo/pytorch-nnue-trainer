@@ -15,7 +15,7 @@ from model import build_model
 from utils.training_utils import build_lr_scheduler, cross_entropy_with_softlabel, \
     build_optimizer, weights_init, build_data_loader, weight_clipping, state_dict_drop_size_unmatched
 from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
-from utils.file_utils import find_latest_model_file
+from utils.file_utils import find_latest_model_file, get_iteration_from_model_filename
 
 
 def parse_args_and_init():
@@ -64,9 +64,11 @@ def parse_args_and_init():
     parser.add('--seed', type=int, default=42, help="Random seed")
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
     parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
-    parser.add('--save_interval', type=int, default=10000, help="Num iterations to save snapshot")
-    parser.add('--val_interval', type=int, default=25000, help="Num iterations to do validation")
+    parser.add('--save_interval', type=int, default=50000, help="Num iterations to save snapshot")
+    parser.add('--val_interval', type=int, default=50000, help="Num iterations to do validation")
     parser.add('--avg_loss_interval', type=int, default=2500, help="Num iterations to average loss")
+    parser.add('--temp_save_interval', type=int, default=5000, 
+               help="Num iterations to save a temporary snapshot (removed when there is newer one)")
     parser.add('--kd_model_type', help="Knowledge distillation model type")
     parser.add('--kd_model_args',
                type=yaml.safe_load,
@@ -240,8 +242,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   model_args, optim_type, optim_args, lr_scheduler_type, lr_scheduler_args, init_type, 
                   loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
                   clip_grad_norm, no_shuffle, log_interval, show_interval, save_interval, val_interval, 
-                  avg_loss_interval, kd_model_type, kd_model_args, kd_checkpoint, kd_T, kd_alpha, 
-                  kd_use_train_mode, **kwargs):
+                  avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, kd_checkpoint, 
+                  kd_T, kd_alpha, kd_use_train_mode, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -348,7 +350,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         epoch += 1
         for data in train_loader:
             it += 1
-            rows += batch_size
+            rows += batch_size * accelerator.num_processes
             if it > iterations:
                 stop_training = True
                 break
@@ -390,9 +392,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
             # logging
             if it % log_interval == 0 and accelerator.is_local_main_process:
-                log_value_dict(tb_logger, 'train', loss_dict, it)
+                log_value_dict(tb_logger, 'train', loss_dict, it, rows)
                 if aux_dict:
-                    log_value_dict(tb_logger, 'train_aux', aux_dict, it)
+                    log_value_dict(tb_logger, 'train_aux', aux_dict, it, rows)
                 with open(log_filename, 'a') as log:
                     json_text = json.dumps({
                         'it': it,
@@ -417,7 +419,7 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         'it/s': speed,
                         'entry/s': speed * batch_size,
                         'lr': lr_scheduler.get_last_lr()[0],
-                    }, it)
+                    }, it, rows)
                 print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]" +
                       f" total: {loss_dict['total_loss']:.4f}," +
                       f" value: {loss_dict['value_loss']:.4f}," +
@@ -426,7 +428,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 last_time = time.time()
 
             # snapshot saving
-            if it % save_interval == 0 and accelerator.is_local_main_process:
+            if (it % save_interval == 0 or it % temp_save_interval == 0) \
+                and accelerator.is_local_main_process:
+                # get latest snapshot filename
+                last_snapshot_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
+
+                # save snapshot at current iteration
                 snapshot_filename = os.path.join(rundir, f"ckpt_{model_name}_{it:08d}.pth")
                 torch.save(
                     {
@@ -436,6 +443,12 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         "model": accelerator.get_state_dict(model),
                         "optimizer": optimizer.state_dict(),
                     }, snapshot_filename)
+                
+                # remove last temporary snapshot if it's not a snapshot iteration
+                if last_snapshot_filename is not None:
+                    last_snapshot_iter = get_iteration_from_model_filename(last_snapshot_filename)
+                    if last_snapshot_iter is None or last_snapshot_iter % save_interval != 0:
+                        os.remove(last_snapshot_filename)
 
             # validation
             if it % val_interval == 0 and val_loader is not None:
@@ -476,9 +489,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                     val_elasped = time.time() - val_start_time
                     num_val_entries = num_val_batches * batch_size
                     # log validation results
-                    log_value_dict(tb_logger, 'validation', val_loss_dict, it)
+                    log_value_dict(tb_logger, 'validation', val_loss_dict, it, rows)
                     if val_aux_dict:
-                        log_value_dict(tb_logger, 'validation_aux', val_aux_dict, it)
+                        log_value_dict(tb_logger, 'validation_aux', val_aux_dict, it, rows)
                     with open(log_filename, 'a') as log:
                         json_text = json.dumps({
                             'it': it,
