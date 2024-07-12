@@ -123,7 +123,8 @@ def export_onnx(output, model, **kwargs):
     print(f"Onnx model has been written to {output}.")
 
 
-def export_serialization(output, output_type, model_type, model, export_args, use_cpu, **kwargs):
+def export_serialization(output, output_type, model_type, model, export_args, use_cpu, 
+                         no_header=False, **kwargs):
     serializer = build_serializer(model_type, **export_args)
     device = torch.device('cuda' if not use_cpu and torch.cuda.is_available() else 'cpu')
     model.to(device)
@@ -144,7 +145,7 @@ def export_serialization(output, output_type, model_type, model, export_args, us
 
     with open_output(output) as f:
         # serialize header for binary weight format
-        if serializer.needs_header:
+        if serializer.needs_header and not no_header:
             MAGIC = zlib.crc32(b'gomoku network weight version 1')  # 0xacd8cc6a
             arch_hash = serializer.arch_hash(model) & 0xffffffff
             rule_mask = serializer.rule_mask(model) & 0xffffffff
@@ -188,8 +189,12 @@ def export(checkpoint, output, export_type, model_type, model_args, **kwargs):
         export_onnx(output, model, **kwargs)
     elif export_type == "serialization":
         export_serialization(output, 'raw', model_type, model, **kwargs)
+    elif export_type == "serialization-noheader":
+        export_serialization(output, 'raw', model_type, model, **kwargs, no_header=True)
     elif export_type == "serialization-lz4":
         export_serialization(output, 'lz4', model_type, model, **kwargs)
+    elif export_type == "serialization-lz4-noheader":
+        export_serialization(output, 'lz4', model_type, model, **kwargs, no_header=True)
     else:
         assert 0, f"Unsupported export: {export_type}"
 

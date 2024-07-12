@@ -788,11 +788,13 @@ class Mix9Net(nn.Module):
                  dim_value=64,
                  dim_dwconv=32,
                  input_type='basicns',
-                 one_mapping=False):
+                 one_mapping=False,
+                 no_star_block=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
         self.one_mapping = one_mapping
+        self.no_star_block = no_star_block
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
@@ -829,10 +831,16 @@ class Mix9Net(nn.Module):
         )
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
-        self.value_corner = StarBlock(dim_feature, dim_value)
-        self.value_edge = StarBlock(dim_feature, dim_value)
-        self.value_center = StarBlock(dim_feature, dim_value)
-        self.value_quad = StarBlock(dim_value, dim_value)
+        if no_star_block:
+            self.value_corner = LinearBlock(dim_feature, dim_value, quant=True)
+            self.value_edge = LinearBlock(dim_feature, dim_value, quant=True)
+            self.value_center = LinearBlock(dim_feature, dim_value, quant=True)
+            self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
+        else:
+            self.value_corner = StarBlock(dim_feature, dim_value)
+            self.value_edge = StarBlock(dim_feature, dim_value)
+            self.value_center = StarBlock(dim_feature, dim_value)
+            self.value_quad = StarBlock(dim_value, dim_value)
         self.value_linear = nn.Sequential(
             LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, dim_value, activation='relu', quant=True),
@@ -1037,15 +1045,35 @@ class Mix9Net(nn.Module):
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
 
         # value head
-        value_00 = self.value_corner.forward_debug_print(feature_00, "value_00")
-        value_01 = self.value_edge.forward_debug_print(feature_01, "value_01")
-        value_02 = self.value_corner.forward_debug_print(feature_02, "value_02")
-        value_10 = self.value_edge.forward_debug_print(feature_10, "value_10")
-        value_11 = self.value_center.forward_debug_print(feature_11, "value_11")
-        value_12 = self.value_edge.forward_debug_print(feature_12, "value_12")
-        value_20 = self.value_corner.forward_debug_print(feature_20, "value_20")
-        value_21 = self.value_edge.forward_debug_print(feature_21, "value_21")
-        value_22 = self.value_corner.forward_debug_print(feature_22, "value_22")
+        if self.no_star_block:
+            value_00 = fake_quant(self.value_corner(feature_00), floor=True)
+            value_01 = fake_quant(self.value_edge(feature_01), floor=True)
+            value_02 = fake_quant(self.value_corner(feature_02), floor=True)
+            value_10 = fake_quant(self.value_edge(feature_10), floor=True)
+            value_11 = fake_quant(self.value_center(feature_11), floor=True)
+            value_12 = fake_quant(self.value_edge(feature_12), floor=True)
+            value_20 = fake_quant(self.value_corner(feature_20), floor=True)
+            value_21 = fake_quant(self.value_edge(feature_21), floor=True)
+            value_22 = fake_quant(self.value_corner(feature_22), floor=True)
+            print(f"value_00: \n{(value_00*128).int()}")
+            print(f"value_01: \n{(value_01*128).int()}")
+            print(f"value_02: \n{(value_02*128).int()}")
+            print(f"value_10: \n{(value_10*128).int()}")
+            print(f"value_11: \n{(value_11*128).int()}")
+            print(f"value_12: \n{(value_12*128).int()}")
+            print(f"value_20: \n{(value_20*128).int()}")
+            print(f"value_21: \n{(value_21*128).int()}")
+            print(f"value_22: \n{(value_22*128).int()}")
+        else:
+            value_00 = self.value_corner.forward_debug_print(feature_00, "value_00")
+            value_01 = self.value_edge.forward_debug_print(feature_01, "value_01")
+            value_02 = self.value_corner.forward_debug_print(feature_02, "value_02")
+            value_10 = self.value_edge.forward_debug_print(feature_10, "value_10")
+            value_11 = self.value_center.forward_debug_print(feature_11, "value_11")
+            value_12 = self.value_edge.forward_debug_print(feature_12, "value_12")
+            value_20 = self.value_corner.forward_debug_print(feature_20, "value_20")
+            value_21 = self.value_edge.forward_debug_print(feature_21, "value_21")
+            value_22 = self.value_corner.forward_debug_print(feature_22, "value_22")
 
         def avg4(a, b, c, d):
             a = fake_quant(a, floor=True)
@@ -1064,10 +1092,21 @@ class Mix9Net(nn.Module):
         print(f"value_q01 avg: \n{(value_q01*128).int()}")
         print(f"value_q10 avg: \n{(value_q10*128).int()}")
         print(f"value_q11 avg: \n{(value_q11*128).int()}")
-        value_q00 = self.value_quad.forward_debug_print(value_q00, "value_q00")
-        value_q01 = self.value_quad.forward_debug_print(value_q01, "value_q01")
-        value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
-        value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
+
+        if self.no_star_block:
+            value_q00 = fake_quant(self.value_quad(value_q00), floor=True)
+            value_q01 = fake_quant(self.value_quad(value_q01), floor=True)
+            value_q10 = fake_quant(self.value_quad(value_q10), floor=True)
+            value_q11 = fake_quant(self.value_quad(value_q11), floor=True)
+            print(f"value_q00: \n{(value_q00*128).int()}")
+            print(f"value_q01: \n{(value_q01*128).int()}")
+            print(f"value_q10: \n{(value_q10*128).int()}")
+            print(f"value_q11: \n{(value_q11*128).int()}")
+        else:
+            value_q00 = self.value_quad.forward_debug_print(value_q00, "value_q00")
+            value_q01 = self.value_quad.forward_debug_print(value_q01, "value_q01")
+            value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
+            value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
 
         value = torch.cat([
             feature_sum,
@@ -1084,24 +1123,21 @@ class Mix9Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
+        if self.no_star_block:
+            value_group_weights = ['value_corner.fc.weight', 'value_edge.fc.weight', 'value_center.fc.weight', 'value_quad.fc.weight']
+        else:
+            value_group_weights = ['value_corner.up1.fc.weight', 'value_corner.up2.fc.weight', 'value_corner.down.fc.weight',
+                                   'value_edge.up1.fc.weight', 'value_edge.up2.fc.weight', 'value_edge.down.fc.weight',
+                                   'value_center.up1.fc.weight', 'value_center.up2.fc.weight', 'value_center.down.fc.weight',
+                                   'value_quad.up1.fc.weight', 'value_quad.up2.fc.weight', 'value_quad.down.fc.weight']
+
         return [{
             'params': ['feature_dwconv.conv.weight'],
             'min_weight': -32768 / 65536,
             'max_weight': 32767 / 65536
         },
         {
-            'params': ['value_corner.up1.fc.weight', 
-                       'value_corner.up2.fc.weight', 
-                       'value_corner.down.fc.weight', 
-                       'value_edge.up1.fc.weight', 
-                       'value_edge.up2.fc.weight', 
-                       'value_edge.down.fc.weight', 
-                       'value_center.up1.fc.weight', 
-                       'value_center.up2.fc.weight', 
-                       'value_center.down.fc.weight', 
-                       'value_quad.up1.fc.weight', 
-                       'value_quad.up2.fc.weight', 
-                       'value_quad.down.fc.weight', 
+            'params': [*value_group_weights,
                        'value_linear.0.fc.weight',
                        'value_linear.1.fc.weight',
                        'value_linear.2.fc.weight',

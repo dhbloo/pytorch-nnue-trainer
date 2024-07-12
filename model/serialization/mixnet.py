@@ -1663,6 +1663,47 @@ class Mix9NetSerializer(BaseSerializer):
             char  __padding_to_64bytes_1[44];
         } buckets[NumHeadBucket];
     };
+
+    If no_star_block is enabled, then the struct layout will be:
+    struct Mix9Weight {
+        // 1  mapping layer
+        int16_t mapping[2][ShapeNum][FeatureDim];
+
+        // 2  Depthwise conv
+        int16_t feature_dwconv_weight[9][FeatDWConvDim];
+        int16_t feature_dwconv_bias[FeatDWConvDim];
+
+        struct HeadBucket {
+            // 3  Policy dynamic pointwise conv
+            int8_t  policy_pwconv_layer_l1_weight[(PolicyDim * 2) * FeatureDim];
+            int32_t policy_pwconv_layer_l1_bias[PolicyDim * 2];
+            int8_t  policy_pwconv_layer_l2_weight[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim) * (PolicyDim * 2)];
+            int32_t policy_pwconv_layer_l2_bias[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim)];
+            
+            // 4  Value Group MLP (layer 1,2)
+            int8_t  value_corner_weight[ValueDim * FeatureDim];
+            int32_t value_corner_bias[ValueDim];
+            int8_t  value_edge_weight[ValueDim * FeatureDim];
+            int32_t value_edge_bias[ValueDim];
+            int8_t  value_center_weight[ValueDim * FeatureDim];
+            int32_t value_center_bias[ValueDim];
+            int8_t  value_quad_weight[ValueDim * ValueDim];
+            int32_t value_quad_bias[ValueDim];
+
+            // 5  Value MLP (layer 1,2,3)
+            int8_t  value_l1_weight[ValueDim * (FeatureDim + ValueDim * 4)];
+            int32_t value_l1_bias[ValueDim];
+            int8_t  value_l2_weight[ValueDim * ValueDim];
+            int32_t value_l2_bias[ValueDim];
+            int8_t  value_l3_weight[4 * ValueDim];
+            int32_t value_l3_bias[4];
+
+            // 6  Policy output linear
+            float policy_output_weight[16];
+            float policy_output_bias;
+            char  __padding_to_64bytes_1[44];
+        } buckets[NumHeadBucket];
+    };
     """
     def __init__(self,
                  rule='freestyle',
@@ -1834,6 +1875,18 @@ class Mix9NetSerializer(BaseSerializer):
             np.clip(np.around(down_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
         )
 
+    def _export_linear(self, model: Mix9Net, prefix: str):
+        block = getattr(model, prefix)
+        weight = block.fc.weight.cpu().numpy()
+        bias = block.fc.bias.cpu().numpy()
+        ascii_hist(f"{prefix}: weight", weight)
+        ascii_hist(f"{prefix}: bias", bias)
+
+        return (
+            np.clip(np.around(weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+        )
+
     def _export_value(self, model: Mix9Net):
         # value layers
         l1_weight = model.value_linear[0].fc.weight.cpu().numpy()
@@ -1868,10 +1921,16 @@ class Mix9NetSerializer(BaseSerializer):
         policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
             policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
             policy_output_weight, policy_output_bias = self._export_policy_pwconv(model)
-        corner_weights = self._export_star_block(model, 'value_corner')
-        edge_weights = self._export_star_block(model, 'value_edge')
-        center_weights = self._export_star_block(model, 'value_center')
-        quad_weights = self._export_star_block(model, 'value_quad')
+        if model.no_star_block:
+            corner_weight, corner_bias = self._export_linear(model, 'value_corner')
+            edge_weight, edge_bias = self._export_linear(model, 'value_edge')
+            center_weight, center_bias = self._export_linear(model, 'value_center')
+            quad_weight, quad_bias = self._export_linear(model, 'value_quad')
+        else:
+            corner_weights = self._export_star_block(model, 'value_corner')
+            edge_weights = self._export_star_block(model, 'value_edge')
+            center_weights = self._export_star_block(model, 'value_center')
+            quad_weights = self._export_star_block(model, 'value_quad')
         l1_weight, l1_bias, l2_weight, l2_bias, l3_weight, l3_bias = self._export_value(model)
 
         if self.text_output:
@@ -1907,62 +1966,51 @@ class Mix9NetSerializer(BaseSerializer):
             feat_dwconv_bias.astype('i2').tofile(out, sep=' ')
             print(file=out)
 
-            print('policy_pwconv_layer_l1_weight', file=out)
-            policy_pwconv_layer_l1_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('policy_pwconv_layer_l1_bias', file=out)
-            policy_pwconv_layer_l1_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('policy_pwconv_layer_l2_weight', file=out)
-            policy_pwconv_layer_l2_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('policy_pwconv_layer_l2_bias', file=out)
-            policy_pwconv_layer_l2_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            
-            def print_star_block(name, weights):
-                print(f'{name}_up1_weight', file=out)
-                weights[0].astype('i1').tofile(out, sep=' ')
+            def print_linear_block(name, weight, bias):
+                print(f'{name}_weight', file=out)
+                weight.astype('i1').tofile(out, sep=' ')
                 print(file=out)
-                print(f'{name}_up1_bias', file=out)
-                weights[1].astype('i4').tofile(out, sep=' ')
+                print(f'{name}_bias', file=out)
+                bias.astype('i4').tofile(out, sep=' ')
                 print(file=out)
-                print(f'{name}_up2_weight', file=out)
-                weights[2].astype('i1').tofile(out, sep=' ')
-                print(file=out)
-                print(f'{name}_up2_bias', file=out)
-                weights[3].astype('i4').tofile(out, sep=' ')
-                print(file=out)
-                print(f'{name}_down_weight', file=out)
-                weights[4].astype('i1').tofile(out, sep=' ')
-                print(file=out)
-                print(f'{name}_down_bias', file=out)
-                weights[5].astype('i4').tofile(out, sep=' ')
-                print(file=out)
-                
-            print_star_block('value_corner', corner_weights)
-            print_star_block('value_edge', edge_weights)
-            print_star_block('value_center', center_weights)
-            print_star_block('value_quad', quad_weights)
 
-            print('value_l1_weight', file=out)
-            l1_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_l1_bias', file=out)
-            l1_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('value_l2_weight', file=out)
-            l2_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_l2_bias', file=out)
-            l2_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
-            print('value_l3_weight', file=out)
-            l3_weight.astype('i1').tofile(out, sep=' ')
-            print(file=out)
-            print('value_l3_bias', file=out)
-            l3_bias.astype('i4').tofile(out, sep=' ')
-            print(file=out)
+            print_linear_block('policy_pwconv_layer_l1', policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias)
+            print_linear_block('policy_pwconv_layer_l2', policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias)
+
+            if model.no_star_block:
+                print_linear_block('value_corner', corner_weight, corner_bias)
+                print_linear_block('value_edge', edge_weight, edge_bias)
+                print_linear_block('value_center', center_weight, center_bias)
+                print_linear_block('value_quad', quad_weight, quad_bias)
+            else:
+                def print_star_block(name, weights):
+                    print(f'{name}_up1_weight', file=out)
+                    weights[0].astype('i1').tofile(out, sep=' ')
+                    print(file=out)
+                    print(f'{name}_up1_bias', file=out)
+                    weights[1].astype('i4').tofile(out, sep=' ')
+                    print(file=out)
+                    print(f'{name}_up2_weight', file=out)
+                    weights[2].astype('i1').tofile(out, sep=' ')
+                    print(file=out)
+                    print(f'{name}_up2_bias', file=out)
+                    weights[3].astype('i4').tofile(out, sep=' ')
+                    print(file=out)
+                    print(f'{name}_down_weight', file=out)
+                    weights[4].astype('i1').tofile(out, sep=' ')
+                    print(file=out)
+                    print(f'{name}_down_bias', file=out)
+                    weights[5].astype('i4').tofile(out, sep=' ')
+                    print(file=out)
+                    
+                print_star_block('value_corner', corner_weights)
+                print_star_block('value_edge', edge_weights)
+                print_star_block('value_center', center_weights)
+                print_star_block('value_quad', quad_weights)
+
+            print_linear_block('value_l1', l1_weight, l1_bias)
+            print_linear_block('value_l2', l2_weight, l2_bias)
+            print_linear_block('value_l3', l3_weight, l3_bias)
 
             print('policy_output_weight', file=out)
             policy_output_weight.astype('f4').tofile(out, sep=' ')
@@ -2019,22 +2067,40 @@ class Mix9NetSerializer(BaseSerializer):
             o.write(policy_pwconv_layer_l2_weight.astype('<i1').tobytes())
             o.write(policy_pwconv_layer_l2_bias.astype('<i4').tobytes())
 
-            # StarBlockWeight<ValueDim, FeatureDim> value_corner;
-            # StarBlockWeight<ValueDim, FeatureDim> value_edge;
-            # StarBlockWeight<ValueDim, FeatureDim> value_center;
-            # StarBlockWeight<ValueDim, ValueDim>   value_quad;
-            def write_star_block(weights):
-                o.write(weights[0].astype('<i1').tobytes())
-                o.write(weights[1].astype('<i4').tobytes())
-                o.write(weights[2].astype('<i1').tobytes())
-                o.write(weights[3].astype('<i4').tobytes())
-                o.write(weights[4].astype('<i1').tobytes())
-                o.write(weights[5].astype('<i4').tobytes())
-                
-            write_star_block(corner_weights)
-            write_star_block(edge_weights)
-            write_star_block(center_weights)
-            write_star_block(quad_weights)
+            if model.no_star_block:
+                # int8_t  value_corner_weight[ValueDim * FeatureDim];
+                # int32_t value_corner_bias[ValueDim];
+                # int8_t  value_edge_weight[ValueDim * FeatureDim];
+                # int32_t value_edge_bias[ValueDim];
+                # int8_t  value_center_weight[ValueDim * FeatureDim];
+                # int32_t value_center_bias[ValueDim];
+                # int8_t  value_quad_weight[ValueDim * ValueDim];
+                # int32_t value_quad_bias[ValueDim];
+                o.write(corner_weight.astype('<i1').tobytes())
+                o.write(corner_bias.astype('<i4').tobytes())
+                o.write(edge_weight.astype('<i1').tobytes())
+                o.write(edge_bias.astype('<i4').tobytes())
+                o.write(center_weight.astype('<i1').tobytes())
+                o.write(center_bias.astype('<i4').tobytes())
+                o.write(quad_weight.astype('<i1').tobytes())
+                o.write(quad_bias.astype('<i4').tobytes())
+            else:
+                # StarBlockWeight<ValueDim, FeatureDim> value_corner;
+                # StarBlockWeight<ValueDim, FeatureDim> value_edge;
+                # StarBlockWeight<ValueDim, FeatureDim> value_center;
+                # StarBlockWeight<ValueDim, ValueDim>   value_quad;
+                def write_star_block(weights):
+                    o.write(weights[0].astype('<i1').tobytes())
+                    o.write(weights[1].astype('<i4').tobytes())
+                    o.write(weights[2].astype('<i1').tobytes())
+                    o.write(weights[3].astype('<i4').tobytes())
+                    o.write(weights[4].astype('<i1').tobytes())
+                    o.write(weights[5].astype('<i4').tobytes())
+                    
+                write_star_block(corner_weights)
+                write_star_block(edge_weights)
+                write_star_block(center_weights)
+                write_star_block(quad_weights)
 
             # int8_t  value_l1_weight[ValueDim * (FeatureDim + ValueDim * 4)];
             # int32_t value_l1_bias[ValueDim];
