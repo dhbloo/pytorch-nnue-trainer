@@ -1160,7 +1160,6 @@ class MixS1Net(nn.Module):
                  dim_middle=128,
                  dim_middle_square=512,
                  dim_feature=64,
-                 dim_feature_square=32,
                  dim_policy=32,
                  dim_value=64,
                  dim_dwconv=32,
@@ -1168,8 +1167,7 @@ class MixS1Net(nn.Module):
                  one_mapping=False,
                  no_star_block=False):
         super().__init__()
-        self.model_size = (dim_middle, dim_middle_square,
-                           dim_feature, dim_feature_square,
+        self.model_size = (dim_middle, dim_middle_square, dim_feature, 
                            dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
         self.one_mapping = one_mapping
@@ -1184,7 +1182,7 @@ class MixS1Net(nn.Module):
             self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
             self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
 
-        self.mapping4x4 = self._make_4x4_mapping(dim_middle_square, dim_feature_square) 
+        self.mapping4x4 = self._make_4x4_mapping(dim_middle_square, dim_feature)
 
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(
@@ -1205,10 +1203,9 @@ class MixS1Net(nn.Module):
         )
 
         # policy head (point-wise conv)
-        dim_valuesum = dim_feature + dim_feature_square
         dim_pm = self.policy_middle_dim = 16
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_valuesum, dim_policy * 2, activation='relu', quant=True),
+            LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
             LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
         )
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
@@ -1225,7 +1222,7 @@ class MixS1Net(nn.Module):
             self.value_center = StarBlock(dim_feature, dim_value)
             self.value_quad = StarBlock(dim_value, dim_value)
         self.value_linear = nn.Sequential(
-            LinearBlock(dim_valuesum + 4 * dim_value, dim_value, activation='relu', quant=True),
+            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, 3, activation='none', quant=True),
         )
@@ -1269,7 +1266,7 @@ class MixS1Net(nn.Module):
         feature = F.relu(feature)  # [B, dim_feature, H, W] int16, scale=128, [0,16]
 
         # apply feature depth-wise conv
-        _, _, _, _, _, _, dim_dwconv = self.model_size
+        _, _, _, _, _, dim_dwconv = self.model_size
         feat_dwconv = feature[:, :dim_dwconv]  # int16, scale=128, [0,16]
         feat_dwconv = self.feature_dwconv(feat_dwconv * 4)  # [B, dwconv, H, W] relu
         feat_dwconv = fake_quant(feat_dwconv, scale=128, num_bits=16)  # int16, scale=128, [0,9/2*16*4]
@@ -1280,25 +1277,26 @@ class MixS1Net(nn.Module):
 
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
-        # get 4x4 mapping feature 
-        feat4x4 = self.mapping4x4(input_plane)  # [B, dim_feature_square, H-3, W-3]
+        # get 4x4 mapping feature
+        feat4x4 = self.mapping4x4(input_plane)  # [B, dim_feature, H-3, W-3]
         feat4x4 = torch.clamp(feat4x4, min=-16, max=16)  # [-16,16]
         feat4x4 = fake_quant(feat4x4, scale=128, num_bits=16)  # int16, scale=128, [-16,16]
 
-        return feature, feat4x4
+        feat_avg4x4 = F.pad(feat4x4, (3, 3, 3, 3))  # [B, dim_feature, H+3, W+3]
+        feat_avg4x4 = F.avg_pool2d(feat_avg4x4, kernel_size=4, stride=1)  # [B, dim_feature, H, W]
+        feature = torch.relu(feature + feat_avg4x4)  # [B, dim_feature, H, W]
+
+        return feature
 
     def forward(self, data):
-        _, _, _, _, dim_policy, _, _ = self.model_size
+        _, _, _, dim_policy, _, _ = self.model_size
 
         # get feature from single side
-        feature, feat4x4 = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value feature accumulator
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
-        feat4x4_sum = torch.sum(feat4x4, dim=(2, 3))  # [B, dim_feature]
-        feat4x4_sum = fake_quant(feat4x4_sum / 128, scale=128, num_bits=32, floor=True)  # srai 7
-        feature_sum = torch.cat([feature_sum, feat4x4_sum], dim=1)  # [B, dim_feature + dim_feature_square]
 
         # value feature accumulator of nine groups
         B, _, H, W = feature.shape
@@ -1378,23 +1376,17 @@ class MixS1Net(nn.Module):
         return value, policy
 
     def forward_debug_print(self, data):
-        _, _, _, _, dim_policy, _, _ = self.model_size
+        _, _, _, dim_policy, _, _ = self.model_size
 
         # get feature from single side
-        feature, feat4x4 = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
         print(f"feature after dwconv at (0,0): \n{(feature[..., 0, 0]*128).int()}")
-        print(f"feature 4x4 at (0,0): \n{(feat4x4[..., 0, 0]*128).int()}")
 
         # value feature accumulator
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
         print(f"feature sum before scale: \n{(feature_sum*128).int()}")
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
         print(f"feature sum: \n{(feature_sum*128).int()}")
-        feat4x4_sum = torch.sum(feat4x4, dim=(2, 3))  # [B, dim_feature]
-        print(f"feature 4x4 sum before scale: \n{(feat4x4_sum*128).int()}")
-        feat4x4_sum = fake_quant(feat4x4_sum / 128, scale=128, num_bits=32, floor=True)  # srai 7
-        print(f"feature 4x4 sum: \n{(feat4x4_sum*128).int()}")
-        feature_sum = torch.cat([feature_sum, feat4x4_sum], dim=1)  # [B, dim_feature + dim_feature_square]
 
         # value feature accumulator of nine groups
         B, _, H, W = feature.shape
@@ -1557,6 +1549,6 @@ class MixS1Net(nn.Module):
 
     @property
     def name(self):
-        _, _, f, fs, p, v, d = self.model_size
-        return f"mixs1_{self.input_type}_{f}f{fs}fs{p}p{v}v{d}d"
+        _, _, f, p, v, d = self.model_size
+        return f"mixs1_{self.input_type}_{f}f{p}p{v}v{d}d"
 
