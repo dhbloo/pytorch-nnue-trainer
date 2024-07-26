@@ -1262,6 +1262,16 @@ class MixS1Net(nn.Module):
         feature = fake_quant(feature, scale=32, num_bits=16)
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
+
+        # get 4x4 mapping feature
+        feat4x4 = self.mapping4x4(input_plane)  # [B, dim_feature, H-3, W-3]
+        feat4x4 = torch.clamp(feat4x4, min=-16, max=16)  # [-16,16]
+        feat4x4 = fake_quant(feat4x4, scale=128, num_bits=16)  # int16, scale=128, [-16,16]
+
+        feat_avg4x4 = F.pad(feat4x4, (3, 3, 3, 3))  # [B, dim_feature, H+3, W+3]
+        feat_avg4x4 = F.avg_pool2d(feat_avg4x4, kernel_size=4, stride=1)  # [B, dim_feature, H, W]
+        feature = feature + feat_avg4x4  # [B, dim_feature, H, W]
+
         # apply relu activation
         feature = F.relu(feature)  # [B, dim_feature, H, W] int16, scale=128, [0,16]
 
@@ -1276,16 +1286,7 @@ class MixS1Net(nn.Module):
         feat_direct = fake_quant(feat_direct, scale=128, num_bits=16)  # int16, scale=128, [0,16]
 
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
-
-        # get 4x4 mapping feature
-        feat4x4 = self.mapping4x4(input_plane)  # [B, dim_feature, H-3, W-3]
-        feat4x4 = torch.clamp(feat4x4, min=-16, max=16)  # [-16,16]
-        feat4x4 = fake_quant(feat4x4, scale=128, num_bits=16)  # int16, scale=128, [-16,16]
-
-        feat_avg4x4 = F.pad(feat4x4, (3, 3, 3, 3))  # [B, dim_feature, H+3, W+3]
-        feat_avg4x4 = F.avg_pool2d(feat_avg4x4, kernel_size=4, stride=1)  # [B, dim_feature, H, W]
-        feature = torch.relu(feature + feat_avg4x4)  # [B, dim_feature, H, W]
-
+        
         return feature
 
     def forward(self, data):
