@@ -1704,6 +1704,72 @@ class Mix9NetSerializer(BaseSerializer):
             char  __padding_to_64bytes_1[44];
         } buckets[NumHeadBucket];
     };
+
+    If no_dynamic_pwconv is enabled, then the struct layout will be:
+    struct Mix9Weight {
+        // 1  mapping layer
+        int16_t mapping[2][ShapeNum][FeatureDim];
+
+        // 2  Depthwise conv
+        int16_t feature_dwconv_weight[9][FeatDWConvDim];
+        int16_t feature_dwconv_bias[FeatDWConvDim];
+
+        struct HeadBucket {
+            // 3  Policy pointwise conv
+            int16_t policy_pwconv_weight[PolicyPWConvDim * PolicyDim];
+            int32_t policy_pwconv_bias[PolicyPWConvDim];
+            
+            // 4  Value Group MLP (layer 1,2)
+            StarBlockWeight<ValueDim, FeatureDim> value_corner;
+            StarBlockWeight<ValueDim, FeatureDim> value_edge;
+            StarBlockWeight<ValueDim, FeatureDim> value_center;
+            StarBlockWeight<ValueDim, ValueDim>   value_quad;
+
+            // 5  Value MLP (layer 1,2,3)
+            int8_t  value_l1_weight[ValueDim * (FeatureDim + ValueDim * 4)];
+            int32_t value_l1_bias[ValueDim];
+            int8_t  value_l2_weight[ValueDim * ValueDim];
+            int32_t value_l2_bias[ValueDim];
+            int8_t  value_l3_weight[4 * ValueDim];
+            int32_t value_l3_bias[4];
+
+            // 6  Policy output linear
+            float policy_output_weight[16];
+            float policy_output_bias;
+            char  __padding_to_64bytes_1[44];
+        } buckets[NumHeadBucket];
+    };
+
+    If no_value_group is enabled, then the struct layout will be:
+    struct Mix9Weight {
+        // 1  mapping layer
+        int16_t mapping[2][ShapeNum][FeatureDim];
+
+        // 2  Depthwise conv
+        int16_t feature_dwconv_weight[9][FeatDWConvDim];
+        int16_t feature_dwconv_bias[FeatDWConvDim];
+
+        struct HeadBucket {
+            // 3  Policy dynamic pointwise conv
+            int8_t  policy_pwconv_layer_l1_weight[(PolicyDim * 2) * FeatureDim];
+            int32_t policy_pwconv_layer_l1_bias[PolicyDim * 2];
+            int8_t  policy_pwconv_layer_l2_weight[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim) * (PolicyDim * 2)];
+            int32_t policy_pwconv_layer_l2_bias[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim)];
+
+            // 4  Value MLP (layer 1,2,3)
+            int8_t  value_l1_weight[ValueDim * FeatureDim];
+            int32_t value_l1_bias[ValueDim];
+            int8_t  value_l2_weight[ValueDim * ValueDim];
+            int32_t value_l2_bias[ValueDim];
+            int8_t  value_l3_weight[4 * ValueDim];
+            int32_t value_l3_bias[4];
+
+            // 5  Policy output linear
+            float policy_output_weight[16];
+            float policy_output_bias;
+            char  __padding_to_64bytes_1[44];
+        } buckets[NumHeadBucket];
+    };
     """
     def __init__(self,
                  rule='freestyle',
@@ -1824,17 +1890,21 @@ class Mix9NetSerializer(BaseSerializer):
         return conv_weight_quant, conv_bias_quant
 
     def _export_policy_pwconv(self, model: Mix9Net):
-        # policy pw conv dynamic weight layer 1
-        l1_weight = model.policy_pwconv_weight_linear[0].fc.weight.cpu().numpy()
-        l1_bias = model.policy_pwconv_weight_linear[0].fc.bias.cpu().numpy()
-        ascii_hist("policy pwconv layer l1 weight", l1_weight)
-        ascii_hist("policy pwconv layer l1 bias", l1_bias)
+        if model.no_dynamic_pwconv:
+            dwconv_weight = model.policy_pwconv.conv.weight.cpu().squeeze().numpy()  # [PolicyPWConvDim, FeatureDim]
+            dwconv_bias = model.policy_pwconv.conv.bias.cpu().numpy()  # [PolicyPWConvDim]
+        else:
+            # policy pw conv dynamic weight layer 1
+            l1_weight = model.policy_pwconv_weight_linear[0].fc.weight.cpu().numpy()
+            l1_bias = model.policy_pwconv_weight_linear[0].fc.bias.cpu().numpy()
+            ascii_hist("policy pwconv layer l1 weight", l1_weight)
+            ascii_hist("policy pwconv layer l1 bias", l1_bias)
 
-        # policy pw conv dynamic weight layer 2
-        l2_weight = model.policy_pwconv_weight_linear[1].fc.weight.cpu().numpy()
-        l2_bias = model.policy_pwconv_weight_linear[1].fc.bias.cpu().numpy()
-        ascii_hist("policy pwconv layer l2 weight", l2_weight)
-        ascii_hist("policy pwconv layer l2 bias", l2_bias)
+            # policy pw conv dynamic weight layer 2
+            l2_weight = model.policy_pwconv_weight_linear[1].fc.weight.cpu().numpy()
+            l2_bias = model.policy_pwconv_weight_linear[1].fc.bias.cpu().numpy()
+            ascii_hist("policy pwconv layer l2 weight", l2_weight)
+            ascii_hist("policy pwconv layer l2 bias", l2_bias)
 
         # policy PReLU activation
         policy_output_weight = model.policy_output.weight.cpu().squeeze().numpy()
@@ -1842,14 +1912,22 @@ class Mix9NetSerializer(BaseSerializer):
         ascii_hist("policy output weight", policy_output_weight)
         ascii_hist("policy output bias", policy_output_bias)
 
-        return (
-            np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
-            policy_output_weight / (128 * 128 * 128),
-            policy_output_bias,
-        )
+        if model.no_dynamic_pwconv:
+            return (
+                np.clip(np.around(dwconv_weight * (128 * 128)), -32768, 32767).astype(np.int8),
+                np.clip(np.around(dwconv_bias * (128 * 128 * 128)), -2**31, 2**31 - 1).astype(np.int32),
+                policy_output_weight / (128 * 128 * 128),
+                policy_output_bias,
+            )
+        else:
+            return (
+                np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
+                np.clip(np.around(l1_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+                np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
+                np.clip(np.around(l2_bias * 128 * 128), -2**31, 2**31 - 1).astype(np.int32),
+                policy_output_weight / (128 * 128 * 128),
+                policy_output_bias,
+            )
 
     def _export_star_block(self, model: Mix9Net, prefix: str):
         block = getattr(model, prefix)
@@ -1918,10 +1996,16 @@ class Mix9NetSerializer(BaseSerializer):
             feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
             feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
         feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
-        policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
-            policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
-            policy_output_weight, policy_output_bias = self._export_policy_pwconv(model)
-        if model.no_star_block:
+        if model.no_dynamic_pwconv:
+            policy_pwconv_weight, policy_pwconv_bias, \
+                policy_output_weight, policy_output_bias = self._export_policy_pwconv(model)
+        else:
+            policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias, \
+                policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias, \
+                policy_output_weight, policy_output_bias = self._export_policy_pwconv(model)
+        if model.no_value_group:
+            pass
+        elif model.no_star_block:
             corner_weight, corner_bias = self._export_linear(model, 'value_corner')
             edge_weight, edge_bias = self._export_linear(model, 'value_edge')
             center_weight, center_bias = self._export_linear(model, 'value_center')
@@ -1974,10 +2058,15 @@ class Mix9NetSerializer(BaseSerializer):
                 bias.astype('i4').tofile(out, sep=' ')
                 print(file=out)
 
-            print_linear_block('policy_pwconv_layer_l1', policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias)
-            print_linear_block('policy_pwconv_layer_l2', policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias)
+            if model.no_dynamic_pwconv:
+                print_linear_block('policy_pwconv', policy_pwconv_weight, policy_pwconv_bias)
+            else:
+                print_linear_block('policy_pwconv_layer_l1', policy_pwconv_layer_l1_weight, policy_pwconv_layer_l1_bias)
+                print_linear_block('policy_pwconv_layer_l2', policy_pwconv_layer_l2_weight, policy_pwconv_layer_l2_bias)
 
-            if model.no_star_block:
+            if model.no_value_group:
+                pass
+            elif model.no_star_block:
                 print_linear_block('value_corner', corner_weight, corner_bias)
                 print_linear_block('value_edge', edge_weight, edge_bias)
                 print_linear_block('value_center', center_weight, center_bias)
@@ -2058,16 +2147,24 @@ class Mix9NetSerializer(BaseSerializer):
             o.write(feat_dwconv_weight.astype('<i2').tobytes())
             o.write(feat_dwconv_bias.astype('<i2').tobytes())
 
-            # int8_t  policy_pwconv_layer_l1_weight[(PolicyDim * 2) * FeatureDim];
-            # int32_t policy_pwconv_layer_l1_bias[PolicyDim * 2];
-            # int8_t  policy_pwconv_layer_l2_weight[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim) * (PolicyDim * 2)];
-            # int32_t policy_pwconv_layer_l2_bias[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim)];
-            o.write(policy_pwconv_layer_l1_weight.astype('<i1').tobytes())
-            o.write(policy_pwconv_layer_l1_bias.astype('<i4').tobytes())
-            o.write(policy_pwconv_layer_l2_weight.astype('<i1').tobytes())
-            o.write(policy_pwconv_layer_l2_bias.astype('<i4').tobytes())
+            if model.no_dynamic_pwconv:
+                # int16_t policy_pwconv_weight[PolicyPWConvDim * PolicyDim];
+                # int32_t policy_pwconv_bias[PolicyPWConvDim];
+                o.write(policy_pwconv_weight.astype('<i2').tobytes())
+                o.write(policy_pwconv_bias.astype('<i4').tobytes())
+            else:
+                # int8_t  policy_pwconv_layer_l1_weight[(PolicyDim * 2) * FeatureDim];
+                # int32_t policy_pwconv_layer_l1_bias[PolicyDim * 2];
+                # int8_t  policy_pwconv_layer_l2_weight[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim) * (PolicyDim * 2)];
+                # int32_t policy_pwconv_layer_l2_bias[(PolicyPWConvDim * PolicyDim + PolicyPWConvDim)];
+                o.write(policy_pwconv_layer_l1_weight.astype('<i1').tobytes())
+                o.write(policy_pwconv_layer_l1_bias.astype('<i4').tobytes())
+                o.write(policy_pwconv_layer_l2_weight.astype('<i1').tobytes())
+                o.write(policy_pwconv_layer_l2_bias.astype('<i4').tobytes())
 
-            if model.no_star_block:
+            if model.no_value_group:
+                pass
+            elif model.no_star_block:
                 # int8_t  value_corner_weight[ValueDim * FeatureDim];
                 # int32_t value_corner_bias[ValueDim];
                 # int8_t  value_edge_weight[ValueDim * FeatureDim];

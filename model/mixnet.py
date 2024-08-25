@@ -797,12 +797,16 @@ class Mix9Net(nn.Module):
                  dim_dwconv=32,
                  input_type='basicns',
                  one_mapping=False,
-                 no_star_block=False):
+                 no_star_block=False,
+                 no_dynamic_pwconv=False,
+                 no_value_group=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
         self.one_mapping = one_mapping
         self.no_star_block = no_star_block
+        self.no_dynamic_pwconv = no_dynamic_pwconv
+        self.no_value_group = no_value_group
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
@@ -833,27 +837,51 @@ class Mix9Net(nn.Module):
 
         # policy head (point-wise conv)
         dim_pm = self.policy_middle_dim = 16
-        self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
-            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
-        )
+        if no_dynamic_pwconv:
+            self.policy_pwconv = Conv2dBlock(
+                dim_policy,
+                dim_pm,
+                ks=1,
+                st=1,
+                activation='relu',
+                quant=True,
+                input_quant_scale=128,
+                input_quant_bits=16,
+                weight_quant_scale=128*128,
+                weight_quant_bits=16,
+                bias_quant_scale=128*128*128,
+                bias_quant_bits=32,
+            )
+        else:
+            self.policy_pwconv_weight_linear = nn.Sequential(
+                LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
+                LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
+            )
+
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
-        if no_star_block:
-            self.value_corner = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_edge = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_center = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
+        if no_value_group:
+            self.value_linear = nn.Sequential(
+                LinearBlock(dim_feature, dim_value, activation='relu', quant=True),
+                LinearBlock(dim_value, dim_value, activation='relu', quant=True),
+                LinearBlock(dim_value, 3, activation='none', quant=True),
+            )
         else:
-            self.value_corner = StarBlock(dim_feature, dim_value)
-            self.value_edge = StarBlock(dim_feature, dim_value)
-            self.value_center = StarBlock(dim_feature, dim_value)
-            self.value_quad = StarBlock(dim_value, dim_value)
-        self.value_linear = nn.Sequential(
-            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, 3, activation='none', quant=True),
-        )
+            if no_star_block:
+                self.value_corner = LinearBlock(dim_feature, dim_value, quant=True)
+                self.value_edge = LinearBlock(dim_feature, dim_value, quant=True)
+                self.value_center = LinearBlock(dim_feature, dim_value, quant=True)
+                self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
+            else:
+                self.value_corner = StarBlock(dim_feature, dim_value)
+                self.value_edge = StarBlock(dim_feature, dim_value)
+                self.value_center = StarBlock(dim_feature, dim_value)
+                self.value_quad = StarBlock(dim_value, dim_value)
+            self.value_linear = nn.Sequential(
+                LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
+                LinearBlock(dim_value, dim_value, activation='relu', quant=True),
+                LinearBlock(dim_value, 3, activation='none', quant=True),
+            )
 
     def custom_init(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
@@ -901,85 +929,92 @@ class Mix9Net(nn.Module):
 
         # get feature from single side
         feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        B, _, H, W = feature.shape
 
-        # value feature accumulator
+        # global feature accumulator
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
 
-        # value feature accumulator of nine groups
-        B, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-
         # policy head
-        dim_pm = self.policy_middle_dim
-        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
-        pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-        pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
-        policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-        ], 1)
-        pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
-        policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+        if self.no_dynamic_pwconv:
+            policy = self.policy_pwconv(feature[:, :dim_policy])  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+        else:
+            dim_pm = self.policy_middle_dim
+            pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
+            pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+            pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
+            policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
+            policy = torch.cat([
+                F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                        weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                        groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
+            ], 1)
+            pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+            policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
-        # value head
-        value_00 = self.value_corner(feature_00)
-        value_01 = self.value_edge(feature_01)
-        value_02 = self.value_corner(feature_02)
-        value_10 = self.value_edge(feature_10)
-        value_11 = self.value_center(feature_11)
-        value_12 = self.value_edge(feature_12)
-        value_20 = self.value_corner(feature_20)
-        value_21 = self.value_edge(feature_21)
-        value_22 = self.value_corner(feature_22)
+        if self.no_value_group:
+            value = self.value_linear(feature_sum)
+        else:
+            # value feature accumulator of nine groups
+            H0, W0 = 0, 0
+            H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+            H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+            H3, W3 = H, W
+            feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
 
-        def avg4(a, b, c, d):
-            a = fake_quant(a, floor=True)
-            b = fake_quant(b, floor=True)
-            c = fake_quant(c, floor=True)
-            d = fake_quant(d, floor=True)
-            ab = fake_quant((a + b + 1/128) / 2, floor=True)
-            cd = fake_quant((c + d + 1/128) / 2, floor=True)
-            return fake_quant((ab + cd + 1/128) / 2, floor=True)
+            # value head
+            value_00 = self.value_corner(feature_00)
+            value_01 = self.value_edge(feature_01)
+            value_02 = self.value_corner(feature_02)
+            value_10 = self.value_edge(feature_10)
+            value_11 = self.value_center(feature_11)
+            value_12 = self.value_edge(feature_12)
+            value_20 = self.value_corner(feature_20)
+            value_21 = self.value_edge(feature_21)
+            value_22 = self.value_corner(feature_22)
 
-        value_q00 = avg4(value_00, value_01, value_10, value_11)
-        value_q01 = avg4(value_01, value_02, value_11, value_12)
-        value_q10 = avg4(value_10, value_11, value_20, value_21)
-        value_q11 = avg4(value_11, value_12, value_21, value_22)
-        value_q00 = self.value_quad(value_q00)
-        value_q01 = self.value_quad(value_q01)
-        value_q10 = self.value_quad(value_q10)
-        value_q11 = self.value_quad(value_q11)
+            def avg4(a, b, c, d):
+                a = fake_quant(a, floor=True)
+                b = fake_quant(b, floor=True)
+                c = fake_quant(c, floor=True)
+                d = fake_quant(d, floor=True)
+                ab = fake_quant((a + b + 1/128) / 2, floor=True)
+                cd = fake_quant((c + d + 1/128) / 2, floor=True)
+                return fake_quant((ab + cd + 1/128) / 2, floor=True)
 
-        value = torch.cat([
-            feature_sum,
-            value_q00, value_q01, value_q10, value_q11,
-        ], 1)  # [B, dim_feature + dim_value * 4]
-        value = self.value_linear(value)
+            value_q00 = avg4(value_00, value_01, value_10, value_11)
+            value_q01 = avg4(value_01, value_02, value_11, value_12)
+            value_q10 = avg4(value_10, value_11, value_20, value_21)
+            value_q11 = avg4(value_11, value_12, value_21, value_22)
+            value_q00 = self.value_quad(value_q00)
+            value_q01 = self.value_quad(value_q01)
+            value_q10 = self.value_quad(value_q10)
+            value_q11 = self.value_quad(value_q11)
+
+            value = torch.cat([
+                feature_sum,
+                value_q00, value_q01, value_q10, value_q11,
+            ], 1)  # [B, dim_feature + dim_value * 4]
+            value = self.value_linear(value)
 
         return value, policy
 
@@ -988,142 +1023,153 @@ class Mix9Net(nn.Module):
 
         # get feature from single side
         feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        B, _, H, W = feature.shape
         print(f"feature after dwconv at (0,0): \n{(feature[..., 0, 0]*128).int()}")
 
-        # value feature accumulator
+        # global feature accumulator
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
         print(f"feature sum before scale: \n{(feature_sum*128).int()}")
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
         print(f"feature sum: \n{(feature_sum*128).int()}")
 
-        # value feature accumulator of nine groups
-        B, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        print(f"feature 00 sum: \n{(feature_00*128).int()}")
-        print(f"feature 01 sum: \n{(feature_01*128).int()}")
-        print(f"feature 02 sum: \n{(feature_02*128).int()}")
-        print(f"feature 10 sum: \n{(feature_10*128).int()}")
-        print(f"feature 11 sum: \n{(feature_11*128).int()}")
-        print(f"feature 12 sum: \n{(feature_12*128).int()}")
-        print(f"feature 20 sum: \n{(feature_20*128).int()}")
-        print(f"feature 21 sum: \n{(feature_21*128).int()}")
-        print(f"feature 22 sum: \n{(feature_22*128).int()}")
-
         # policy head
-        dim_pm = self.policy_middle_dim
-        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
-        print(f"policy pwconv output: \n{(pwconv_output*128*128).int()}")
-        pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-        pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
-        print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
-        policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-        ], 1)
-        print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
-        pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
-        print(f"policy pwconv bias: \n{(pwconv_bias.flatten(1, -1)*128*128*128).int()}")
-        policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
-        print(f"policy pwconv output at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
+        if self.no_dynamic_pwconv:
+            policy = self.policy_pwconv(feature[:, :dim_policy])  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+            print(f"policy pwconv output at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
+        else:
+            dim_pm = self.policy_middle_dim
+            pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
+            print(f"policy pwconv output: \n{(pwconv_output*128*128).int()}")
+            pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+            pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
+            print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
+            policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
+            print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
+            policy = torch.cat([
+                F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
+                        weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
+                        groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
+            ], 1)
+            print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
+            pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+            print(f"policy pwconv bias: \n{(pwconv_bias.flatten(1, -1)*128*128*128).int()}")
+            policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+            print(f"policy pwconv output at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
         policy = self.policy_output(policy)  # [B, 1, H, W]
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
 
-        # value head
-        if self.no_star_block:
-            value_00 = fake_quant(self.value_corner(feature_00), floor=True)
-            value_01 = fake_quant(self.value_edge(feature_01), floor=True)
-            value_02 = fake_quant(self.value_corner(feature_02), floor=True)
-            value_10 = fake_quant(self.value_edge(feature_10), floor=True)
-            value_11 = fake_quant(self.value_center(feature_11), floor=True)
-            value_12 = fake_quant(self.value_edge(feature_12), floor=True)
-            value_20 = fake_quant(self.value_corner(feature_20), floor=True)
-            value_21 = fake_quant(self.value_edge(feature_21), floor=True)
-            value_22 = fake_quant(self.value_corner(feature_22), floor=True)
-            print(f"value_00: \n{(value_00*128).int()}")
-            print(f"value_01: \n{(value_01*128).int()}")
-            print(f"value_02: \n{(value_02*128).int()}")
-            print(f"value_10: \n{(value_10*128).int()}")
-            print(f"value_11: \n{(value_11*128).int()}")
-            print(f"value_12: \n{(value_12*128).int()}")
-            print(f"value_20: \n{(value_20*128).int()}")
-            print(f"value_21: \n{(value_21*128).int()}")
-            print(f"value_22: \n{(value_22*128).int()}")
+        if self.no_value_group:
+            value = feature_sum  # [B, dim_feature]
+            print(f"value feature input: \n{(value*128).int()}")
+            for i, linear in enumerate(self.value_linear):
+                value = linear(value)
+                print(f"value feature after layer {i}: \n{(value*128).int()}")
         else:
-            value_00 = self.value_corner.forward_debug_print(feature_00, "value_00")
-            value_01 = self.value_edge.forward_debug_print(feature_01, "value_01")
-            value_02 = self.value_corner.forward_debug_print(feature_02, "value_02")
-            value_10 = self.value_edge.forward_debug_print(feature_10, "value_10")
-            value_11 = self.value_center.forward_debug_print(feature_11, "value_11")
-            value_12 = self.value_edge.forward_debug_print(feature_12, "value_12")
-            value_20 = self.value_corner.forward_debug_print(feature_20, "value_20")
-            value_21 = self.value_edge.forward_debug_print(feature_21, "value_21")
-            value_22 = self.value_corner.forward_debug_print(feature_22, "value_22")
+            # value feature accumulator of nine groups
+            H0, W0 = 0, 0
+            H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+            H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+            H3, W3 = H, W
+            feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+            feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+            feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+            feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            print(f"feature 00 sum: \n{(feature_00*128).int()}")
+            print(f"feature 01 sum: \n{(feature_01*128).int()}")
+            print(f"feature 02 sum: \n{(feature_02*128).int()}")
+            print(f"feature 10 sum: \n{(feature_10*128).int()}")
+            print(f"feature 11 sum: \n{(feature_11*128).int()}")
+            print(f"feature 12 sum: \n{(feature_12*128).int()}")
+            print(f"feature 20 sum: \n{(feature_20*128).int()}")
+            print(f"feature 21 sum: \n{(feature_21*128).int()}")
+            print(f"feature 22 sum: \n{(feature_22*128).int()}")
 
-        def avg4(a, b, c, d):
-            a = fake_quant(a, floor=True)
-            b = fake_quant(b, floor=True)
-            c = fake_quant(c, floor=True)
-            d = fake_quant(d, floor=True)
-            ab = fake_quant((a + b + 1/128) / 2, floor=True)
-            cd = fake_quant((c + d + 1/128) / 2, floor=True)
-            return fake_quant((ab + cd + 1/128) / 2, floor=True)
+            # value head
+            if self.no_star_block:
+                value_00 = fake_quant(self.value_corner(feature_00), floor=True)
+                value_01 = fake_quant(self.value_edge(feature_01), floor=True)
+                value_02 = fake_quant(self.value_corner(feature_02), floor=True)
+                value_10 = fake_quant(self.value_edge(feature_10), floor=True)
+                value_11 = fake_quant(self.value_center(feature_11), floor=True)
+                value_12 = fake_quant(self.value_edge(feature_12), floor=True)
+                value_20 = fake_quant(self.value_corner(feature_20), floor=True)
+                value_21 = fake_quant(self.value_edge(feature_21), floor=True)
+                value_22 = fake_quant(self.value_corner(feature_22), floor=True)
+                print(f"value_00: \n{(value_00*128).int()}")
+                print(f"value_01: \n{(value_01*128).int()}")
+                print(f"value_02: \n{(value_02*128).int()}")
+                print(f"value_10: \n{(value_10*128).int()}")
+                print(f"value_11: \n{(value_11*128).int()}")
+                print(f"value_12: \n{(value_12*128).int()}")
+                print(f"value_20: \n{(value_20*128).int()}")
+                print(f"value_21: \n{(value_21*128).int()}")
+                print(f"value_22: \n{(value_22*128).int()}")
+            else:
+                value_00 = self.value_corner.forward_debug_print(feature_00, "value_00")
+                value_01 = self.value_edge.forward_debug_print(feature_01, "value_01")
+                value_02 = self.value_corner.forward_debug_print(feature_02, "value_02")
+                value_10 = self.value_edge.forward_debug_print(feature_10, "value_10")
+                value_11 = self.value_center.forward_debug_print(feature_11, "value_11")
+                value_12 = self.value_edge.forward_debug_print(feature_12, "value_12")
+                value_20 = self.value_corner.forward_debug_print(feature_20, "value_20")
+                value_21 = self.value_edge.forward_debug_print(feature_21, "value_21")
+                value_22 = self.value_corner.forward_debug_print(feature_22, "value_22")
 
-        value_q00 = avg4(value_00, value_01, value_10, value_11)
-        value_q01 = avg4(value_01, value_02, value_11, value_12)
-        value_q10 = avg4(value_10, value_11, value_20, value_21)
-        value_q11 = avg4(value_11, value_12, value_21, value_22)
-        print(f"value_q00 avg: \n{(value_q00*128).int()}")
-        print(f"value_q01 avg: \n{(value_q01*128).int()}")
-        print(f"value_q10 avg: \n{(value_q10*128).int()}")
-        print(f"value_q11 avg: \n{(value_q11*128).int()}")
+            def avg4(a, b, c, d):
+                a = fake_quant(a, floor=True)
+                b = fake_quant(b, floor=True)
+                c = fake_quant(c, floor=True)
+                d = fake_quant(d, floor=True)
+                ab = fake_quant((a + b + 1/128) / 2, floor=True)
+                cd = fake_quant((c + d + 1/128) / 2, floor=True)
+                return fake_quant((ab + cd + 1/128) / 2, floor=True)
 
-        if self.no_star_block:
-            value_q00 = fake_quant(self.value_quad(value_q00), floor=True)
-            value_q01 = fake_quant(self.value_quad(value_q01), floor=True)
-            value_q10 = fake_quant(self.value_quad(value_q10), floor=True)
-            value_q11 = fake_quant(self.value_quad(value_q11), floor=True)
-            print(f"value_q00: \n{(value_q00*128).int()}")
-            print(f"value_q01: \n{(value_q01*128).int()}")
-            print(f"value_q10: \n{(value_q10*128).int()}")
-            print(f"value_q11: \n{(value_q11*128).int()}")
-        else:
-            value_q00 = self.value_quad.forward_debug_print(value_q00, "value_q00")
-            value_q01 = self.value_quad.forward_debug_print(value_q01, "value_q01")
-            value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
-            value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
+            value_q00 = avg4(value_00, value_01, value_10, value_11)
+            value_q01 = avg4(value_01, value_02, value_11, value_12)
+            value_q10 = avg4(value_10, value_11, value_20, value_21)
+            value_q11 = avg4(value_11, value_12, value_21, value_22)
+            print(f"value_q00 avg: \n{(value_q00*128).int()}")
+            print(f"value_q01 avg: \n{(value_q01*128).int()}")
+            print(f"value_q10 avg: \n{(value_q10*128).int()}")
+            print(f"value_q11 avg: \n{(value_q11*128).int()}")
 
-        value = torch.cat([
-            feature_sum,
-            value_q00, value_q01, value_q10, value_q11,
-        ], 1)  # [B, dim_feature + dim_value * 4]
-        print(f"value feature input: \n{(value*128).int()}")
-        for i, linear in enumerate(self.value_linear):
-            value = linear(value)
-            print(f"value feature after layer {i}: \n{(value*128).int()}")
+            if self.no_star_block:
+                value_q00 = fake_quant(self.value_quad(value_q00), floor=True)
+                value_q01 = fake_quant(self.value_quad(value_q01), floor=True)
+                value_q10 = fake_quant(self.value_quad(value_q10), floor=True)
+                value_q11 = fake_quant(self.value_quad(value_q11), floor=True)
+                print(f"value_q00: \n{(value_q00*128).int()}")
+                print(f"value_q01: \n{(value_q01*128).int()}")
+                print(f"value_q10: \n{(value_q10*128).int()}")
+                print(f"value_q11: \n{(value_q11*128).int()}")
+            else:
+                value_q00 = self.value_quad.forward_debug_print(value_q00, "value_q00")
+                value_q01 = self.value_quad.forward_debug_print(value_q01, "value_q01")
+                value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
+                value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
+
+            value = torch.cat([
+                feature_sum,
+                value_q00, value_q01, value_q10, value_q11,
+            ], 1)  # [B, dim_feature + dim_value * 4]
+            print(f"value feature input: \n{(value*128).int()}")
+            for i, linear in enumerate(self.value_linear):
+                value = linear(value)
+                print(f"value feature after layer {i}: \n{(value*128).int()}")
 
         return value, policy
 
@@ -1131,29 +1177,46 @@ class Mix9Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        if self.no_star_block:
+        if self.no_value_group:
+            value_group_weights = []
+        elif self.no_star_block:
             value_group_weights = ['value_corner.fc.weight', 'value_edge.fc.weight', 'value_center.fc.weight', 'value_quad.fc.weight']
         else:
             value_group_weights = ['value_corner.up1.fc.weight', 'value_corner.up2.fc.weight', 'value_corner.down.fc.weight',
                                    'value_edge.up1.fc.weight', 'value_edge.up2.fc.weight', 'value_edge.down.fc.weight',
                                    'value_center.up1.fc.weight', 'value_center.up2.fc.weight', 'value_center.down.fc.weight',
                                    'value_quad.up1.fc.weight', 'value_quad.up2.fc.weight', 'value_quad.down.fc.weight']
+            
+        weight_clipping_list = [
+            {
+                'params': ['feature_dwconv.conv.weight'],
+                'min_weight': -32768 / 65536,
+                'max_weight': 32767 / 65536
+            },
+            {
+                'params': [*value_group_weights,
+                           'value_linear.0.fc.weight',
+                           'value_linear.1.fc.weight',
+                           'value_linear.2.fc.weight'],
+                'min_weight': -128 / 128,
+                'max_weight': 127 / 128
+            },
+        ]
 
-        return [{
-            'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -32768 / 65536,
-            'max_weight': 32767 / 65536
-        },
-        {
-            'params': [*value_group_weights,
-                       'value_linear.0.fc.weight',
-                       'value_linear.1.fc.weight',
-                       'value_linear.2.fc.weight',
-                       'policy_pwconv_weight_linear.0.fc.weight',
-                       'policy_pwconv_weight_linear.1.fc.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        if self.no_dynamic_pwconv:
+            weight_clipping_list.append({
+                'params': ['policy_pwconv.conv.weight'],
+                'min_weight': -32768 / (128*128),
+                'max_weight': 32767 / (128*128)
+            })
+        else:
+            weight_clipping_list.append({
+                'params': ['policy_pwconv_weight_linear.0.fc.weight', 'policy_pwconv_weight_linear.1.fc.weight'],
+                'min_weight': -128 / 128,
+                'max_weight': 127 / 128
+            })
+
+        return weight_clipping_list
 
     @property
     def name(self):
