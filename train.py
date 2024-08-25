@@ -143,54 +143,91 @@ def calc_loss(loss_type,
         if value_target.size(1) == 1:
             value_target = value_target[:, 0]   # squeeze value channel dim
         else:
-            value_target = value_target[:, 0] - value_target[:, 1]
-            value_target = (value_target + 1) / 2  # normalize [-1, 1] to [0, 1]
+            value_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2  # in [0, 1]
 
     # ===============================================================
     # value loss
-    if value_loss_type == 'CE':
-        if value.ndim == 1:
-            value_loss = (F.binary_cross_entropy_with_logits(value, value_target) -
-                          F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target))
+    def get_value_loss(value: torch.Tensor):
+        if value_loss_type == 'CE':
+            if value.ndim == 1:
+                return (F.binary_cross_entropy_with_logits(value, value_target) -
+                        F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target))
+            else:
+                return cross_entropy_with_softlabel(value, value_target, adjust=True)
+        elif value_loss_type == 'MSE':
+            if value.ndim == 1:
+                return F.mse_loss(torch.sigmoid(value), value_target)
+            else:
+                value = torch.softmax(value, dim=1)  # [B, 3]
+                winrate = (value[:, 0] - value[:, 1] + 1) / 2
+                winrate_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2
+                return F.mse_loss(winrate, winrate_target)
         else:
-            value_loss = cross_entropy_with_softlabel(value, value_target, adjust=True)
-    elif value_loss_type == 'MSE':
-        if value.ndim == 1:
-            value_loss = F.mse_loss(torch.sigmoid(value), value_target)
-        else:
-            value = torch.softmax(value, dim=1)  # [B, 3]
-            winrate = (value[:, 0] - value[:, 1] + 1) / 2
-            winrate_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2
-            value_loss = F.mse_loss(winrate, winrate_target)
-    else:
-        assert 0, f"Unsupported value loss: {value_loss_type}"
+            assert 0, f"Unsupported value loss: {value_loss_type}"
 
     # ===============================================================
     # policy loss
+    def get_policy_loss(policy: torch.Tensor):
+        # check if there is loss weight for policy at each empty cells
+        if ignore_forbidden_point_policy:
+            forbidden_point = torch.flatten(data['forbidden_point'], start_dim=1)  # [B, H*W]
+            policy_loss_weight = 1.0 - forbidden_point.float()  # [B, H*W]
+        else:
+            policy_loss_weight = None
 
-    # check if there is loss weight for policy at each empty cells
-    if ignore_forbidden_point_policy:
-        forbidden_point = torch.flatten(data['forbidden_point'], start_dim=1)  # [B, H*W]
-        policy_loss_weight = 1.0 - forbidden_point.float()  # [B, H*W]
-    else:
-        policy_loss_weight = None
+        if policy_loss_type == 'CE':
+            return cross_entropy_with_softlabel(policy,
+                                                policy_target,
+                                                adjust=True,
+                                                weight=policy_loss_weight)
+        elif policy_loss_type == 'MSE':
+            policy_softmaxed = torch.softmax(policy, dim=1)
+            policy_loss = F.mse_loss(policy_softmaxed, policy_target, size_average='none')
+            if policy_loss_weight is not None:
+                policy_loss = policy_loss * policy_loss_weight
+            return torch.mean(policy_loss)
+        else:
+            assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
-    if policy_loss_type == 'CE':
-        policy_loss = cross_entropy_with_softlabel(policy,
-                                                   policy_target,
-                                                   adjust=True,
-                                                   weight=policy_loss_weight)
-    elif policy_loss_type == 'MSE':
-        policy_softmaxed = torch.softmax(policy, dim=1)
-        policy_loss = F.mse_loss(policy_softmaxed, policy_target, size_average='none')
-        if policy_loss_weight is not None:
-            policy_loss = policy_loss * policy_loss_weight
-        policy_loss = torch.mean(policy_loss)
-    else:
-        assert 0, f"Unsupported policy loss: {policy_loss_type}"
+    # ===============================================================
+    # value uncertainty loss
+    def get_value_uncertainty_gt(value: torch.Tensor):
+        # stop gradient for value
+        value = value.detach()
+
+        if value.ndim == 1:
+            winrate = torch.sigmoid(value)  # [B]
+            winrate_target = value_target   # [B]
+        else:
+            value = torch.softmax(value, dim=1)  # [B, 3]
+            # compute winrate in [0, 1] from 3-tuple value
+            winrate = (value[:, 0] - value[:, 1] + 1) / 2  # [B]
+            winrate_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2  # [B]
+
+        # compute value uncertainty (uncertainty = |winrate - winrate_target|^2)
+        uncertainty_gt = torch.square(winrate - winrate_target)  # [B]
+        return uncertainty_gt
+
+    def get_value_uncertainty_loss(uncertainty: torch.Tensor, value: torch.Tensor):
+        uncertainty_gt = get_value_uncertainty_gt(value)
+        uncertainty_loss = F.huber_loss(uncertainty, uncertainty_gt)  # [B]
+        return uncertainty_loss
+    
+    def get_value_relative_uncertainty_loss(relative_uncertainty: torch.Tensor,
+                                            value_smallnet: torch.Tensor,
+                                            value_largenet: torch.Tensor):
+        uncertainty_gt_smallnet = get_value_uncertainty_gt(value_smallnet)
+        uncertainty_gt_largenet = get_value_uncertainty_gt(value_largenet)
+        relative_uncertainty_gt = torch.where(uncertainty_gt_largenet < uncertainty_gt_smallnet, 
+                                              uncertainty_gt_largenet / uncertainty_gt_smallnet, 
+                                              1.0)
+        relative_uncertainty_loss = F.mse_loss(relative_uncertainty, relative_uncertainty_gt)
+        return relative_uncertainty_loss
 
     # ===============================================================
 
+    value_loss = get_value_loss(value)
+    policy_loss = get_policy_loss(policy)
     value_lambda = 2 * value_policy_ratio / (value_policy_ratio + 1)
     policy_lambda = 2 / (value_policy_ratio + 1)
     total_loss = value_lambda * value_loss + policy_lambda * policy_loss
@@ -203,6 +240,30 @@ def calc_loss(loss_type,
         policy_reg = torch.mean(policy).square()
         total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict['policy_reg'] = policy_reg.detach()
+
+    if aux_losses is not None:
+        for aux_loss_name, aux_loss in aux_losses.items():
+            # use pre-defined loss terms if aux_loss is a tuple of (string, inputs)
+            if isinstance(aux_loss, tuple) and len(aux_loss) == 2:
+                aux_loss_type, aux_loss_input = aux_loss
+                if aux_loss_type == 'value_loss':
+                    aux_loss = get_value_loss(aux_loss_input)
+                elif aux_loss_type == 'policy_loss':
+                    aux_loss = get_policy_loss(aux_loss_input)
+                elif aux_loss_type == 'value_uncertainty_loss':
+                    aux_loss = get_value_uncertainty_loss(*aux_loss_input)
+                elif aux_loss_type == 'value_relative_uncertainty_loss':
+                    aux_loss = get_value_relative_uncertainty_loss(*aux_loss_input)
+                else:
+                    assert 0, f"Unsupported predefined aux loss: {aux_loss}"
+
+            if f'{aux_loss_name}_lambda' in extra_args:
+                aux_loss_weight = float(extra_args[f'{aux_loss_name}_lambda'])
+            else:
+                aux_loss_weight = 1.0
+
+            total_loss += aux_loss * aux_loss_weight
+            loss_dict[f'{aux_loss_name}_loss'] = aux_loss.detach()
 
     if kd_results is not None:
         # also get a true loss from real data
@@ -220,13 +281,6 @@ def calc_loss(loss_type,
         kd_loss_dict = {'kd_' + k: v for k, v in loss_dict.items()}
         loss_dict = real_loss_dict
         loss_dict.update(kd_loss_dict)
-
-    if aux_losses is not None:
-        for aux_loss_name, aux_loss in aux_losses.items():
-            if f'{aux_loss_name}_lambda' in extra_args:
-                aux_loss = aux_loss * float(extra_args[f'{aux_loss_name}_lambda'])
-            total_loss += aux_loss
-            loss_dict[f'{aux_loss_name}_loss'] = aux_loss.detach()
 
     aux_outputs_dict = {}
     if aux_outputs is not None:
