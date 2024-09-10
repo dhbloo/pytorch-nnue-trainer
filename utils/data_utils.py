@@ -7,8 +7,8 @@ class Result(Enum):
     DRAW = 1
     WIN = 2
 
-    def opposite(r):
-        return Result(2 - r.value)
+    def opposite(self) -> "Result":
+        return Result(2 - self.value)
 
 
 class Rule(Enum):
@@ -22,9 +22,8 @@ class Rule(Enum):
 
 
 class Move():
-    def __init__(self, x=None, y=None, pos=None):
-        assert pos is not None or (x is not None and y is not None)
-        self.x, self.y = (pos if pos else (x, y))
+    def __init__(self, x: int, y: int):
+        self.x, self.y = x, y
 
     @property
     def pos(self):
@@ -51,7 +50,8 @@ class Symmetry(Enum):
     FLIP_XY = 6  # (x, y) -> (y, x)
     FLIP_YX = 7  # (x, y) -> (s - y, s - x)
 
-    def available_symmetries(boardsize, symmetry_type="default"):
+    @staticmethod
+    def available_symmetries(boardsize : tuple[int, int], symmetry_type="default") -> list["Symmetry"]:
         sx, sy = boardsize
         if symmetry_type == "default":
             if sx == sy:
@@ -69,6 +69,7 @@ class Symmetry(Enum):
             return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_XY, Symmetry.FLIP_YX]
         else:
             assert 0, f"unsupported symmetry_type: {symmetry_type}"
+            return []
 
     def apply_to_move(self, move : Move, boardsize: tuple[int, int]) -> Move:
         """Apply symmetry transformation to a move (x, y)"""

@@ -25,6 +25,7 @@ def parse_args_and_init():
     parser.add('--model_type', required=True, help="Model type")
     parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add('-d', '--datas', nargs='+', help="Test dataset file or directory paths")
+    parser.add('--train_datas', nargs='+', help="Training dataset file or directory paths (Can be used when data is not specified)")
     parser.add('--dataset_type', help="Dataset type")
     parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
     parser.add('--dataloader_args',
@@ -40,8 +41,12 @@ def parse_args_and_init():
     return args
 
 
-def get_sample_data(datas, dataset_type, dataset_args, dataloader_args, batch_size=1, **kwargs):
+def get_sample_data(datas, dataset_type, dataset_args, dataloader_args, batch_size=1, train_datas=None, **kwargs):
     # load dataset
+    if datas is None:
+        if train_datas is None:
+            raise RuntimeError("Either datas or train_datas must be specified.")
+        datas = train_datas
     dataset = build_dataset(dataset_type, datas, shuffle=False, **dataset_args)
     loader = build_data_loader(dataset,
                                batch_size=batch_size,
@@ -73,54 +78,110 @@ def export_jit(output, model, **kwargs):
     print(f"Jit model has been written to {output}")
 
 
-def export_onnx(output, model, **kwargs):
-    class ONNXModelWrapper(torch.nn.Module):
-        def __init__(self, model) -> None:
+def export_onnx(output, model, export_args, **kwargs):
+    import onnx
+    class OnnxModelIOv1(torch.nn.Module):
+        def __init__(self, warpped_model):
             super().__init__()
-            self.model = model
+            self.warpped_model = warpped_model
 
-        def forward(self, board_size, board_input, stm_input):
-            value, policy = self.model({
-                'board_size': board_size,
-                'board_input': board_input,
-                'stm_input': stm_input,
-            })
-            return value, policy
+        def get_onnx_model_version(self) -> int:
+            return 1
 
-    model = ONNXModelWrapper(model)
+        def get_input_names(self):
+            return ['board_input', 'global_input']
+        
+        def get_output_names(self):
+            return ['value', 'policy']
+        
+        def get_dynamic_axes(self):
+            return {
+                'board_input': {0: 'batch_size', 2: 'board_height', 3: 'board_width'},
+                'global_input': {0: 'batch_size'},
+                'value': {0: 'batch_size'},
+                'policy': {0: 'batch_size', 1: 'board_height', 2: 'board_width'}
+            }
+        
+        def get_model_inputs(self, data):
+            boardInputNCHW = data['board_input']
+            globalInputNC = data['stm_input']
+            assert boardInputNCHW.ndim == 4, f"boardInputNCHW.shape={boardInputNCHW.shape}"
+            assert globalInputNC.ndim == 2, f"globalInputNC.shape={globalInputNC.shape}"
+            assert boardInputNCHW.shape[0] == globalInputNC.shape[0]
+            return (boardInputNCHW, globalInputNC)
+        
+        def get_data_from_model_inputs(self, boardInputNCHW, globalInputNC):
+            return {
+                'board_input': boardInputNCHW,
+                'stm_input': globalInputNC,
+            }
+        
+        def get_model_outputs(self, *retvals):
+            value, policy = retvals
+            assert value.ndim == 2 and value.shape[1] == 3, f"value.shape={value.shape}"
+            assert policy.ndim == 3, f"policy.shape={policy.shape}"
+            assert value.shape[0] == policy.shape[0]
+            return (value, policy)
+
+        def forward(self, *inputs):
+            input_data = self.get_data_from_model_inputs(*inputs)
+            retvals = self.warpped_model(input_data)
+            return self.get_model_outputs(*retvals)
+
+    model = OnnxModelIOv1(model)
     model.eval()
-    data = get_sample_data(**kwargs)
-    args = (
-        data['board_size'],
-        data['board_input'],
-        data['stm_input'],
-    )
+    sampled_data = get_sample_data(**kwargs)
+    args = model.get_model_inputs(sampled_data)
     torch.onnx.export(model,
                       args,
                       output,
                       export_params=True,
-                      opset_version=11,
                       do_constant_folding=True,
-                      input_names=['board_size', 'board_input', 'stm_input'],
-                      output_names=['value', 'policy'],
-                      dynamic_axes={
-                          'board_size': {
-                              0: 'batch_size'
-                          },
-                          'board_input': {
-                              0: 'batch_size'
-                          },
-                          'stm_input': {
-                              0: 'batch_size'
-                          },
-                          'value': {
-                              0: 'batch_size'
-                          },
-                          'policy': {
-                              0: 'batch_size'
-                          },
-                      })
-    print(f"Onnx model has been written to {output}.")
+                      input_names=model.get_input_names(),
+                      output_names=model.get_output_names(),
+                      dynamic_axes=model.get_dynamic_axes())
+
+    # Set onnx model IO version number
+    def get_rules(export_args):
+        if 'rule' in export_args:
+            rules = [export_args['rule']]
+        elif 'rule_list' in export_args:
+            rules = export_args['rule_list']
+            assert isinstance(rules, list), f"rules={rules}"
+        else:
+            rules = ['freestyle', 'standard', 'renju']
+        return rules
+
+    def get_boardsizes(export_args):
+        if 'board_size' in export_args:
+            boardsizes = [export_args['board_size']]
+        elif 'min_board_size' in export_args and 'max_board_size' in export_args:
+            boardsizes = list(range(export_args['min_board_size'], export_args['max_board_size']+1))
+        elif 'board_size_list' in export_args:
+            boardsizes = export_args['board_size_list']
+            assert isinstance(boardsizes, list), f"boardsizes={boardsizes}"
+        else:
+            boardsizes = list(range(1, 32+1))
+        return boardsizes
+
+    def make_model_version(version: int, rules, boardsizes):
+        rule_mask = 0
+        if 'freestyle' in rules: rule_mask |= 1
+        if 'standard' in rules: rule_mask |= 2
+        if 'renju' in rules: rule_mask |= 4
+        boardsize_mask = 0
+        for board_size in boardsizes:
+            assert 1 <= board_size <= 32
+            boardsize_mask |= 1 << (board_size - 1)
+        return (version << 48) | (rule_mask << 32) | boardsize_mask
+
+    version_number = model.get_onnx_model_version()
+    supported_rules = get_rules(export_args)
+    supported_boardsizes = get_boardsizes(export_args)
+    onnx_model = onnx.load(output)
+    onnx_model.model_version = make_model_version(version_number, supported_rules, supported_boardsizes)
+    onnx.save(onnx_model, output)
+    print(f"Onnx model (ver={version_number}, rules={supported_rules}, boardsizes={supported_boardsizes}) has been written to {output}.")
 
 
 def export_serialization(output, output_type, model_type, model, export_args, use_cpu, 

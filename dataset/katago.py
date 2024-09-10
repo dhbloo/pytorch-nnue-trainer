@@ -48,12 +48,12 @@ class KatagoNumpyDataset(IterableDataset):
     def _unpack_global_feature(self, packed_data): 
         if packed_data.shape[1] == 1: 
             # Channel 0: side to move (black = -1.0, white = 1.0) 
-            stm_input = packed_data[:, [0]].astype(np.int8) 
+            stm_input = packed_data[:, [0]].astype(np.float32) 
         else: 
             # Original katago feature format: 
             # Channel 5: komi (black negative, white positive) 
-            stm_input = np.where(packed_data[:, [5]] > 0, 1, -1).astype(np.int8) 
-        return stm_input 
+            stm_input = np.where(packed_data[:, [5]] > 0, 1, -1).astype(np.float32)
+        return stm_input
 
     def _unpack_board_feature(self, packed_data, dims=[1, 2]):
         length, n_features, n_bytes = packed_data.shape
@@ -233,9 +233,9 @@ class ProcessedKatagoNumpyDataset(Dataset):
         board_size = np.array(self.boardsize, dtype=np.int8)
         board_input = self.data_dict['bf'][index].astype(np.int8)
         if 'gf' in self.data_dict:
-            stm_input = self.data_dict['gf'][index].astype(np.int8)
+            stm_input = self.data_dict['gf'][index].astype(np.float32)
         else:
-            stm_input = np.array([0], dtype=np.int8)
+            stm_input = np.array([0], dtype=np.float32)
         value_target = self.data_dict['vt'][index].astype(np.float32)
 
         if 'pt' in self.data_dict:

@@ -48,7 +48,7 @@ class MoveData():
     def __len__(self):
         return len(self.moves)
 
-    def _append_entry_move(self, entry_move: EntryMove) -> bool:
+    def _append_entry_move(self, entry_move: EntryMove):
         """
         Returns true if the move is the last move in the movelist.
         No further entry move should be appended after this.

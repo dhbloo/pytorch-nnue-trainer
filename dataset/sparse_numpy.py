@@ -37,7 +37,7 @@ class SparseNumpyDataset(IterableDataset):
 
     def _unpack_global_feature(self, packed_data):
         # Channel 0: side to move (black = -1.0, white = 1.0)
-        stm_input = packed_data[:, [0]]
+        stm_input = packed_data[:, [0]].astype(np.float32)
         return stm_input
 
     def _unpack_board_input(self, packed_data):
@@ -116,7 +116,7 @@ class SparseNumpyDataset(IterableDataset):
         data['board_size'] = np.array(data['board_size'], dtype=np.int8)
 
         # Flip side when stm is white
-        if self.fixed_side_input and data['stm_input'] == 1:
+        if self.fixed_side_input and data['stm_input'] > 0:
             data['board_input'] = np.flip(data['board_input'], axis=0).copy()
             data['sparse_feature_input'] = np.take(data['sparse_feature_input'],
                                                    [4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10],
