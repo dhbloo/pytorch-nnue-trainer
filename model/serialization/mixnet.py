@@ -1914,7 +1914,7 @@ class Mix9NetSerializer(BaseSerializer):
 
         if model.no_dynamic_pwconv:
             return (
-                np.clip(np.around(dwconv_weight * (128 * 128)), -32768, 32767).astype(np.int8),
+                np.clip(np.around(dwconv_weight * (128 * 128)), -32768, 32767).astype(np.int16),
                 np.clip(np.around(dwconv_bias * (128 * 128 * 128)), -2**31, 2**31 - 1).astype(np.int32),
                 policy_output_weight / (128 * 128 * 128),
                 policy_output_bias,
