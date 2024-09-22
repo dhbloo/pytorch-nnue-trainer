@@ -1276,20 +1276,20 @@ class Mix10Net(nn.Module):
 
         # value head small
         self.value_linear_small = nn.Sequential(
-            LinearBlock(dim_feature, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, dim_value, activation='relu', quant=True),
+            LinearBlock(dim_feature, dim_feature, activation='relu', quant=True),
+            LinearBlock(dim_feature, dim_feature, activation='relu', quant=True),
         )
-        self.value_small_output = LinearBlock(dim_value, 4, activation='none', quant=True)
+        self.value_small_output = LinearBlock(dim_feature, 4, activation='none', quant=True)
 
         # value head large
-        self.value_gate = LinearBlock(dim_value, dim_feature, activation='none', quant=True)
+        self.value_gate = LinearBlock(dim_feature, dim_feature, activation='none', quant=True)
         self.value_corner = LinearBlock(dim_value, dim_value, quant=True)
         self.value_edge = LinearBlock(dim_value, dim_value, quant=True)
         self.value_center = LinearBlock(dim_value, dim_value, quant=True)
         self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
 
         self.value_linear_large = nn.Sequential(
-            LinearBlock(dim_value + 4 * dim_value, dim_value, activation='relu', quant=True),
+            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, 4, activation='none', quant=True),
         )
@@ -1335,7 +1335,11 @@ class Mix10Net(nn.Module):
 
         return feature
     
-    def value_head_small(self, feature_sum):
+    def value_head_small(self, feature):
+        # global feature accumulator
+        feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
+        feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
+
         # (shared) small value head
         value_small_feature = self.value_linear_small(feature_sum)
 
@@ -1346,7 +1350,7 @@ class Mix10Net(nn.Module):
 
         return value, relative_uncertainty, value_small_feature
     
-    def value_head_large(self, feature, feature_sum, value_small_feature):
+    def value_head_large(self, feature, value_small_feature):
         B, _, H, W = feature.shape
 
         # value feature accumulator of nine groups
@@ -1384,15 +1388,15 @@ class Mix10Net(nn.Module):
             x = fake_quant(x, scale=128, num_bits=8, floor=True)
             return x
 
-        feature_00 = mul_u8_i8(feature_00, feature_mod)  # [B, dim_feature]
-        feature_01 = mul_u8_i8(feature_01, feature_mod)  # [B, dim_feature]
-        feature_02 = mul_u8_i8(feature_02, feature_mod)  # [B, dim_feature]
-        feature_10 = mul_u8_i8(feature_10, feature_mod)  # [B, dim_feature]
-        feature_11 = mul_u8_i8(feature_11, feature_mod)  # [B, dim_feature]
-        feature_12 = mul_u8_i8(feature_12, feature_mod)  # [B, dim_feature]
-        feature_20 = mul_u8_i8(feature_20, feature_mod)  # [B, dim_feature]
-        feature_21 = mul_u8_i8(feature_21, feature_mod)  # [B, dim_feature]
-        feature_22 = mul_u8_i8(feature_22, feature_mod)  # [B, dim_feature]
+        feature_00 = mul_u8_i8(feature_00, feature_mod)  # [B, dim_value]
+        feature_01 = mul_u8_i8(feature_01, feature_mod)  # [B, dim_value]
+        feature_02 = mul_u8_i8(feature_02, feature_mod)  # [B, dim_value]
+        feature_10 = mul_u8_i8(feature_10, feature_mod)  # [B, dim_value]
+        feature_11 = mul_u8_i8(feature_11, feature_mod)  # [B, dim_value]
+        feature_12 = mul_u8_i8(feature_12, feature_mod)  # [B, dim_value]
+        feature_20 = mul_u8_i8(feature_20, feature_mod)  # [B, dim_value]
+        feature_21 = mul_u8_i8(feature_21, feature_mod)  # [B, dim_value]
+        feature_22 = mul_u8_i8(feature_22, feature_mod)  # [B, dim_value]
         value_00 = self.value_corner(feature_00)
         value_01 = self.value_edge(feature_01)
         value_02 = self.value_corner(feature_02)
@@ -1430,11 +1434,11 @@ class Mix10Net(nn.Module):
         uncertainty = value_and_uncertainty[:, 3]  # [B]
         return value, uncertainty
     
-    def policy_head(self, feature, feature_sum):
+    def policy_head(self, feature, value_small_feature):
         _, _, dim_policy, _, _ = self.model_size
         B, _, H, W = feature.shape
         dim_pm = self.policy_middle_dim
-        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
+        pwconv_output = self.policy_pwconv_weight_linear(value_small_feature)  # [B, dim_pm * dim_policy + dim_pm]
         pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
         pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
         pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
@@ -1454,18 +1458,14 @@ class Mix10Net(nn.Module):
         # get feature from single side
         feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
-        # global feature accumulator
-        feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
-        feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
-
         # value head
-        value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature_sum)
-        value_large, value_large_uncertainty = self.value_head_large(feature, feature_sum, value_small_feature)
+        value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
+        value_large, value_large_uncertainty = self.value_head_large(feature, value_small_feature)
         value_large_uncertainty = F.softplus(value_large_uncertainty, threshold=10)
         value_relative_uncertainty = F.sigmoid(value_relative_uncertainty)
 
         # policy head
-        policy = self.policy_head(feature, feature_sum)
+        policy = self.policy_head(feature, value_small_feature)
 
         aux_losses = {
             'value_small': ('value_loss', value_small),
