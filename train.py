@@ -60,6 +60,7 @@ def parse_args_and_init():
     parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
     parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
     parser.add('--clip_grad_norm', type=float, help="Gradient clipping max norm")
+    parser.add('--clip_grad_value', type=float, help="Gradient clipping max value")
     parser.add('--no_shuffle', action='store_true', help="Do not shuffle dataset")
     parser.add('--seed', type=int, default=42, help="Random seed")
     parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
@@ -295,9 +296,9 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   val_dataset_type, val_dataset_args, dataloader_args, data_pipelines, model_type, 
                   model_args, optim_type, optim_args, lr_scheduler_type, lr_scheduler_args, init_type, 
                   loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
-                  clip_grad_norm, no_shuffle, log_interval, show_interval, save_interval, val_interval, 
-                  avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, kd_checkpoint, 
-                  kd_T, kd_alpha, kd_use_train_mode, **kwargs):
+                  clip_grad_norm, clip_grad_value, no_shuffle, log_interval, show_interval, save_interval,
+                  val_interval, avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, 
+                  kd_checkpoint, kd_T, kd_alpha, kd_use_train_mode, **kwargs):
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
 
@@ -429,6 +430,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             # apply gradient clipping if needed
             if clip_grad_norm is not None:
                 accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+            if clip_grad_value is not None:
+                accelerator.clip_grad_value_(model.parameters(), clip_value=clip_grad_value)
 
             optimizer.step()
             lr_scheduler.step()

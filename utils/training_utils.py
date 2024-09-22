@@ -47,6 +47,13 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
                           betas=(kwargs.get('beta1', 0.9), kwargs.get('beta2', 0.999)),
                           eps=1e-8,
                           weight_decay=weight_decay)
+    elif optim_type == 'adamw-ams':
+        opt = optim.AdamW(parameters,
+                          lr=lr,
+                          betas=(kwargs.get('beta1', 0.9), kwargs.get('beta2', 0.999)),
+                          eps=1e-8,
+                          weight_decay=weight_decay,
+                          amsgrad=True)
     elif optim_type == 'sgd':
         opt = optim.SGD(parameters, lr=lr, momentum=0, dampening=0, weight_decay=weight_decay)
     elif optim_type == 'sgd_momentum':
