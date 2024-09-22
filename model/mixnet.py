@@ -1233,13 +1233,11 @@ class Mix10Net(nn.Module):
                  dim_value=64,
                  dim_dwconv=32,
                  input_type='basicns',
-                 one_mapping=False,
-                 no_star_block=False):
+                 one_mapping=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
         self.one_mapping = one_mapping
-        self.no_star_block = no_star_block
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
@@ -1278,23 +1276,20 @@ class Mix10Net(nn.Module):
 
         # value head small
         self.value_linear_small = nn.Sequential(
-            LinearBlock(dim_feature, dim_value, activation='none', quant=True),
-            LinearBlock(dim_value, 4, activation='none', quant=True),
+            LinearBlock(dim_feature, dim_value, activation='relu', quant=True),
+            LinearBlock(dim_value, dim_value, activation='relu', quant=True),
         )
+        self.value_small_output = LinearBlock(dim_value, 4, activation='none', quant=True)
 
         # value head large
-        if no_star_block:
-            self.value_corner = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_edge = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_center = LinearBlock(dim_feature, dim_value, quant=True)
-            self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
-        else:
-            self.value_corner = StarBlock(dim_feature, dim_value)
-            self.value_edge = StarBlock(dim_feature, dim_value)
-            self.value_center = StarBlock(dim_feature, dim_value)
-            self.value_quad = StarBlock(dim_value, dim_value)
+        self.value_gate = LinearBlock(dim_value, dim_feature, activation='none', quant=True)
+        self.value_corner = LinearBlock(dim_value, dim_value, quant=True)
+        self.value_edge = LinearBlock(dim_value, dim_value, quant=True)
+        self.value_center = LinearBlock(dim_value, dim_value, quant=True)
+        self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
+
         self.value_linear_large = nn.Sequential(
-            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
+            LinearBlock(dim_value + 4 * dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, dim_value, activation='relu', quant=True),
             LinearBlock(dim_value, 4, activation='none', quant=True),
         )
@@ -1341,12 +1336,17 @@ class Mix10Net(nn.Module):
         return feature
     
     def value_head_small(self, feature_sum):
-        value_and_rel_uncertainty = self.value_linear_small(feature_sum)  # [B, 4]
+        # (shared) small value head
+        value_small_feature = self.value_linear_small(feature_sum)
+
+        # small value output head
+        value_and_rel_uncertainty = self.value_small_output(value_small_feature)  # [B, 4]
         value = value_and_rel_uncertainty[:, :3]  # [B, 3]
         relative_uncertainty = value_and_rel_uncertainty[:, 3]  # [B]
-        return value, relative_uncertainty
+
+        return value, relative_uncertainty, value_small_feature
     
-    def value_head_large(self, feature, feature_sum):
+    def value_head_large(self, feature, feature_sum, value_small_feature):
         B, _, H, W = feature.shape
 
         # value feature accumulator of nine groups
@@ -1374,6 +1374,25 @@ class Mix10Net(nn.Module):
         feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
 
         # value head
+        feature_mod = self.value_gate(value_small_feature)
+        feature_mod = fake_quant(feature_mod, scale=128, num_bits=8, floor=True)
+
+        def mul_u8_i8(x1, x2):
+            # i32 dot product of two adjacent pairs of u8 and i8
+            x = (x1 * x2).view(*x1.shape[:-1], -1, 2).sum(-1)
+            # clamp to int8, scale=128, [-1,1]
+            x = fake_quant(x, scale=128, num_bits=8, floor=True)
+            return x
+
+        feature_00 = mul_u8_i8(feature_00, feature_mod)  # [B, dim_feature]
+        feature_01 = mul_u8_i8(feature_01, feature_mod)  # [B, dim_feature]
+        feature_02 = mul_u8_i8(feature_02, feature_mod)  # [B, dim_feature]
+        feature_10 = mul_u8_i8(feature_10, feature_mod)  # [B, dim_feature]
+        feature_11 = mul_u8_i8(feature_11, feature_mod)  # [B, dim_feature]
+        feature_12 = mul_u8_i8(feature_12, feature_mod)  # [B, dim_feature]
+        feature_20 = mul_u8_i8(feature_20, feature_mod)  # [B, dim_feature]
+        feature_21 = mul_u8_i8(feature_21, feature_mod)  # [B, dim_feature]
+        feature_22 = mul_u8_i8(feature_22, feature_mod)  # [B, dim_feature]
         value_00 = self.value_corner(feature_00)
         value_01 = self.value_edge(feature_01)
         value_02 = self.value_corner(feature_02)
@@ -1403,7 +1422,7 @@ class Mix10Net(nn.Module):
         value_q11 = self.value_quad(value_q11)
 
         value = torch.cat([
-            feature_sum,
+            value_small_feature,
             value_q00, value_q01, value_q10, value_q11,
         ], 1)  # [B, dim_feature + dim_value * 4]
         value_and_uncertainty = self.value_linear_large(value)  # [B, 4]
@@ -1440,8 +1459,8 @@ class Mix10Net(nn.Module):
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
 
         # value head
-        value_small, value_relative_uncertainty = self.value_head_small(feature_sum)
-        value_large, value_large_uncertainty = self.value_head_large(feature, feature_sum)
+        value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature_sum)
+        value_large, value_large_uncertainty = self.value_head_large(feature, feature_sum, value_small_feature)
         value_large_uncertainty = F.softplus(value_large_uncertainty, threshold=10)
         value_relative_uncertainty = F.sigmoid(value_relative_uncertainty)
 
@@ -1469,21 +1488,17 @@ class Mix10Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        if self.no_star_block:
-            value_group_weights = ['value_corner.fc.weight', 'value_edge.fc.weight', 'value_center.fc.weight', 'value_quad.fc.weight']
-        else:
-            value_group_weights = ['value_corner.up1.fc.weight', 'value_corner.up2.fc.weight', 'value_corner.down.fc.weight',
-                                   'value_edge.up1.fc.weight', 'value_edge.up2.fc.weight', 'value_edge.down.fc.weight',
-                                   'value_center.up1.fc.weight', 'value_center.up2.fc.weight', 'value_center.down.fc.weight',
-                                   'value_quad.up1.fc.weight', 'value_quad.up2.fc.weight', 'value_quad.down.fc.weight']
-
         return [{
             'params': ['feature_dwconv.conv.weight'],
             'min_weight': -32768 / 65536,
             'max_weight': 32767 / 65536
         },
         {
-            'params': [*value_group_weights,
+            'params': ['value_gate.fc.weight',
+                       'value_corner.fc.weight', 
+                       'value_edge.fc.weight', 
+                       'value_center.fc.weight', 
+                       'value_quad.fc.weight',
                        'value_linear_small.0.fc.weight',
                        'value_linear_small.1.fc.weight',
                        'value_linear_large.0.fc.weight',
