@@ -16,7 +16,7 @@ def parse_args_and_init():
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
     parser.add('-p', '--checkpoint', required=True, help="Model checkpoint file to test")
-    parser.add('-o', '--output', required=True, help="Output filename")
+    parser.add('-o', '--output', help="Output filename")
     parser.add('--export_type', required=True, help="Export type")
     parser.add('--export_args',
                type=yaml.safe_load,
@@ -39,6 +39,12 @@ def parse_args_and_init():
     print('-' * 60)
 
     return args
+
+
+def get_default_output_filename(checkpoint, ext):
+    checkpoint_dir, checkpoint_filename = os.path.split(checkpoint)
+    checkpoint_name, checkpoint_ext = os.path.splitext(checkpoint_filename)
+    return os.path.join(checkpoint_dir, f"{checkpoint_name}_export.{ext}")
 
 
 def get_sample_data(datas, dataset_type, dataset_args, dataloader_args, batch_size=1, train_datas=None, **kwargs):
@@ -184,7 +190,7 @@ def export_onnx(output, model, export_args, **kwargs):
     print(f"Onnx model (ver={version_number}, rules={supported_rules}, boardsizes={supported_boardsizes}) has been written to {output}.")
 
 
-def export_serialization(output, output_type, model_type, model, export_args, use_cpu, 
+def export_binary(output, output_type, model_type, model, export_args, use_cpu, 
                          no_header=False, **kwargs):
     serializer = build_serializer(model_type, **export_args)
     device = torch.device('cuda' if not use_cpu and torch.cuda.is_available() else 'cpu')
@@ -243,19 +249,26 @@ def export(checkpoint, output, export_type, model_type, model_args, **kwargs):
     model.eval()
 
     if export_type == "pytorch":
+        output = output or get_default_output_filename(checkpoint, 'pth')
         export_pytorch(output, model)
     elif export_type == "jit":
+        output = output or get_default_output_filename(checkpoint, 'pt')
         export_jit(output, model, **kwargs)
     elif export_type == "onnx":
+        output = output or get_default_output_filename(checkpoint, 'onnx')
         export_onnx(output, model, **kwargs)
-    elif export_type == "serialization":
-        export_serialization(output, 'raw', model_type, model, **kwargs)
-    elif export_type == "serialization-noheader":
-        export_serialization(output, 'raw', model_type, model, **kwargs, no_header=True)
-    elif export_type == "serialization-lz4":
-        export_serialization(output, 'lz4', model_type, model, **kwargs)
-    elif export_type == "serialization-lz4-noheader":
-        export_serialization(output, 'lz4', model_type, model, **kwargs, no_header=True)
+    elif export_type == "bin":
+        output = output or get_default_output_filename(checkpoint, 'bin')
+        export_binary(output, 'raw', model_type, model, **kwargs)
+    elif export_type == "bin-noheader":
+        output = output or get_default_output_filename(checkpoint, 'bin')
+        export_binary(output, 'raw', model_type, model, **kwargs, no_header=True)
+    elif export_type == "bin-lz4":
+        output = output or get_default_output_filename(checkpoint, 'bin.lz4')
+        export_binary(output, 'lz4', model_type, model, **kwargs)
+    elif export_type == "bin-lz4-noheader":
+        output = output or get_default_output_filename(checkpoint, 'bin.lz4')
+        export_binary(output, 'lz4', model_type, model, **kwargs, no_header=True)
     else:
         assert 0, f"Unsupported export: {export_type}"
 

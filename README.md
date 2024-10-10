@@ -96,17 +96,19 @@ Export to ONNX:
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type onnx -d <path to dataset>
 ```
 
-Export to (lz4 compressed) serialized binary to be used in Rapfi:
+Export to (lz4 compressed) serialized binary that can be loaded in Rapfi:
 
 ```bash
-python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type serialization-lz4 --export_args "{[extra export options]...}"
+python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type bin-lz4 --export_args "{[extra export options]...}"
 ```
 
 Note that some NNUE serializer requires specifying exporting arguments, such as rule (options are `freestyle`, `standard`, `renju`), board size (usually a number between 5 and 22), etc. For example, to export a binary network file of `mix7` NNUE for Renju rule and 15x15 board size, you can run the following command:
 
 ```bash
-python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type serialization-lz4 --export_args "{rule: renju, board_size: 15}"
+python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type bin-lz4 --export_args "{rule: renju, board_size: 15}"
 ```
+
+For details of the export arguments, please check the code of the specific serializer.
 
 ### Visualize a dataset
 
@@ -128,11 +130,11 @@ In order to improve the ease of managing weights for different rules and board s
 
 ```C
 struct Header {
-  uint32_t magic;				// 0xacd8cc6a = crc32("gomoku network weight version 1")
-  uint32_t arch_hash;			// architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
-  uint32_t rule_mask;			// applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
-  uint32_t boardsize_mask;	// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
-  uint32_t desc_len;			// length of desc string (=0 for no description)
+  uint32_t magic;         // 0xacd8cc6a = crc32("gomoku network weight version 1")
+  uint32_t arch_hash;     // architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
+  uint32_t rule_mask;     // applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
+  uint32_t boardsize_mask;// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
+  uint32_t desc_len;      // length of desc string (=0 for no description)
   char description[desc_len];	// weight description (encoded in utf-8)
 }
 ```
