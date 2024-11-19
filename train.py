@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from accelerate import Accelerator
+from accelerate import Accelerator, DataLoaderConfiguration
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import configargparse
@@ -187,6 +187,8 @@ def calc_loss(loss_type,
             if policy_loss_weight is not None:
                 policy_loss = policy_loss * policy_loss_weight
             return torch.mean(policy_loss)
+        elif policy_loss_type == 'NONE':
+            return torch.tensor(0.0, device=policy.device)
         else:
             assert 0, f"Unsupported policy loss: {policy_loss_type}"
 
@@ -300,7 +302,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   val_interval, avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, 
                   kd_checkpoint, kd_T, kd_alpha, kd_use_train_mode, **kwargs):
     # use accelerator
-    accelerator = Accelerator(cpu=use_cpu, dispatch_batches=False)
+    dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
+    accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config)
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
