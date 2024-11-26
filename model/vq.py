@@ -65,40 +65,30 @@ def uniform_lazy_tensor_2d(dim0, dim1, device) -> LazyTensor:
 
 def gumbel_sample(
     logits: LazyTensor,
-    temperature = 1.,
     stochastic = False,
-    softmax_gradient = False,
+    temperature = 1.,
     training = True
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> torch.Tensor:
     """
     Sample from a categorical distribution using the Gumbel-Softmax trick.
     Args:
         logits: Unnormalized log probabilities of shape (N, num_classes).
-        temperature: Temperature parameter for sampling.
         stochastic: Whether to use Gumbel sampling.
-        softmax_gradient: Whether to use the Softmax gradients.
+        temperature: Temperature parameter for sampling.
         training: Whether the model is in training mode.
     Returns:
         ind: Indices of the sampled elements.
-        one_hot: One-hot tensor (N, num_classes) of the sampled elements.
     """
     if training and stochastic and temperature > 0:
-        gumbel_noise = uniform_lazy_tensor_2d(*logits.shape, device=logits.variables[0].device)
+        device = logits.variables[0].device
+        gumbel_noise = uniform_lazy_tensor_2d(*logits.shape, device=device)
         gumbel_noise = -(-(gumbel_noise * (1-2e-7) + 1e-7).log()).log()
         sampling_logits = (logits / temperature) + gumbel_noise
     else:
         sampling_logits = logits
 
     ind = sampling_logits.argmax(dim=1).squeeze(1)  # (N,)
-    one_hot = F.one_hot(ind, logits.shape[-1])  # (N, num_classes)
-
-    if not softmax_gradient or temperature <= 0 or not training:
-        return ind, one_hot
-
-    π1 = (logits / temperature).softmax(dim=-1)
-    one_hot = one_hot + π1 - π1.detach()
-
-    return ind, one_hot
+    return ind
 
 
 def compute_perplexity(cluster_size: torch.Tensor) -> torch.Tensor:
@@ -120,13 +110,24 @@ def entropy_regularization(logits: LazyTensor, temperature = 1.) -> torch.Tensor
 
 
 def sample_vectors(inputs: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """Sample num_samples vectors from the input tensor (supports DDP)."""
+    num_processes = PartialState().num_processes
+    process_idx = PartialState().process_index
+    num_samples_per_rank, num_samples_remain = divmod(num_samples, num_processes)
+    if process_idx < num_samples_remain:
+        num_samples_per_rank += 1
+
     num_inputs, device = inputs.shape[0], inputs.device
     assert num_inputs > 0, "Can not sample empty input tensor"
-    if num_inputs >= num_samples:
-        indices = torch.randperm(num_inputs, device=device)[:num_samples]
+    if num_inputs >= num_samples_per_rank:
+        indices = torch.randperm(num_inputs, device=device)[:num_samples_per_rank]
     else:
-        indices = torch.randint(0, num_inputs, (num_samples,), device=device)
-    return inputs[indices]
+        indices = torch.randint(0, num_inputs, (num_samples_per_rank,), device=device)
+    sampled = inputs[indices]  # (num_sample_per_rank, dim_feature)
+    sampled = gather(sampled)  # (num_samples, dim_feature)
+    assert sampled.shape[0] == num_samples
+
+    return sampled
 
 
 def kmeans(
@@ -152,17 +153,12 @@ def kmeans(
         bins: The number of samples in each cluster of shape (num_clusters,).
     """
     (num_samples_per_rank, dim_feature), device, dtype = inputs.shape, inputs.device, inputs.dtype
-    num_processes, process_idx = PartialState().num_processes, PartialState().process_index
-    num_samples = num_samples_per_rank * num_processes
+    num_samples = num_samples_per_rank * PartialState().num_processes
     if num_samples < num_clusters:
         raise ValueError(f"Number of samples {num_samples} < number of clusters {num_clusters}")
 
     # initialize cluster centroids
-    num_sample_clusters, num_sample_clusters_remain = divmod(num_clusters, num_processes)
-    if process_idx < num_sample_clusters_remain:
-        num_sample_clusters += 1
-    means = sample_vectors(inputs, num_sample_clusters)  # (num_sample_clusters, dim_feature)
-    means : torch.Tensor = gather(means)  # (num_clusters, dim_feature)
+    means = sample_vectors(inputs, num_clusters)  # (num_clusters, dim_feature)
 
     # perform K-means iterations
     for _ in range(num_iters):
@@ -195,6 +191,40 @@ def ema_inplace(tensor : torch.Tensor, new : torch.Tensor, decay: float) -> torc
     return tensor.lerp_(new, 1 - decay)
 
 
+def efficient_rotation_trick_transform(u : torch.Tensor, q : torch.Tensor, e : torch.Tensor) -> torch.Tensor:
+    """
+    4.2 in https://arxiv.org/abs/2410.06424
+    """
+    e = e[:, None, :]  # (N, 1, dim_feature)
+    w = F.normalize(u + q, p=2, dim=1, eps=1e-6).detach()  # (N, dim_feature)
+    return (
+        e -
+        2 * (e @ w[:, :, None] @ w[:, None, :]) +
+        2 * (e @ u[:, :, None].detach() @ q[:, None, :].detach())
+    ).squeeze(1)
+
+
+def rotate_to(src : torch.Tensor, tgt : torch.Tensor):
+    """
+    Rotation trick STE (https://arxiv.org/abs/2410.06424) to get gradients through VQ layer.
+    Inputs:
+        src: Source tensor of shape (N, dim_feature).
+        tgt: Target tensor of shape (N, dim_feature).
+    """
+    norm_src = src.norm(dim=-1, keepdim=True)
+    norm_tgt = tgt.norm(dim=-1, keepdim=True)
+
+    rotated_tgt = efficient_rotation_trick_transform(
+        src / norm_src.clamp(min=1e-6),
+        tgt / norm_tgt.clamp(min=1e-6),
+        src,
+    )
+
+    rotated = rotated_tgt * (norm_tgt / norm_src.clamp(min=1e-6)).detach()
+
+    return rotated
+
+
 class VectorQuantize(nn.Module):
     """
     Discretization bottleneck part of the VQ-VAE.
@@ -206,15 +236,18 @@ class VectorQuantize(nn.Module):
     def __init__(self, 
                  codebook_size: int, 
                  dim_feature: int, 
-                 kmeans_init=False,
+                 kmeans_init=True,
                  kmeans_sample_multiplier=1,
                  kmeans_iter=10,
-                 ema_decay=0.9,
+                 ema_update=True,
+                 ema_decay=0.995,
+                 threshold_ema_dead_code=1e-2,
+                 reset_cluster_size=None,
                  commitment_weight=0.25,
                  learnable_codebook=True,
-                 sampling_temp=1.0,
+                 rotation_trick=False,
                  stochastic_sampling=False,
-                 softmax_gradient=False,
+                 sampling_temp=1.0,
                  entropy_reg_weight=0.0,
                  entropy_reg_temp=0.01):
         super().__init__()
@@ -223,41 +256,48 @@ class VectorQuantize(nn.Module):
         self.kmeans_init = kmeans_init
         self.kmeans_sample_multiplier = kmeans_sample_multiplier
         self.kmeans_iter = kmeans_iter
+        self.ema_update = ema_update
         self.ema_decay = ema_decay
+        self.threshold_ema_dead_code = threshold_ema_dead_code
+        self.reset_cluster_size = threshold_ema_dead_code if reset_cluster_size is None else reset_cluster_size 
         self.commitment_weight = commitment_weight
-        self.sampling_temp = sampling_temp
+        self.rotation_trick = rotation_trick
         self.stochastic_sampling = stochastic_sampling
-        self.softmax_gradient = softmax_gradient
+        self.sampling_temp = sampling_temp
         self.entropy_reg_weight = entropy_reg_weight
         self.entropy_reg_temp = entropy_reg_temp
 
         self.register_buffer('inited', torch.zeros([], dtype=torch.bool))
-        self.register_buffer('cluster_size', torch.zeros(codebook_size))
+        self.register_buffer('cluster_size', torch.ones(codebook_size))
         if kmeans_init:
             embed = torch.zeros(codebook_size, dim_feature)
-            self.init_input_samples = (codebook_size * kmeans_sample_multiplier // PartialState().num_processes)
-            self.init_input_batches = []
-            self.init_input_count = 0
+            self._init_input_samples = (codebook_size * kmeans_sample_multiplier // PartialState().num_processes)
+            self._init_input_batches = []
+            self._init_input_count = 0
         else:
             embed = uniform_init(codebook_size, dim_feature)
             self.inited.data.fill_(True)
-        self.embeddings = nn.Parameter(embed, requires_grad=learnable_codebook)
+
+        self.learnable_codebook = learnable_codebook and not ema_update
+        self.embed = nn.Parameter(embed, requires_grad=self.learnable_codebook)
+        self.register_buffer('embed_avg', embed.clone())
 
     def _accumulate_input_batch(self, x):
-        num_samples_remain = self.init_input_samples - self.init_input_count
+        num_samples_remain = self._init_input_samples - self._init_input_count
         if x.shape[0] > num_samples_remain:
             x = x[:num_samples_remain]
-        self.init_input_batches.append(x.detach().clone())
-        self.init_input_count += x.shape[0]
+        x = x.detach().clone()
+        self._init_input_batches.append(x)
+        self._init_input_count += x.shape[0]
 
-        if self.init_input_count < self.init_input_samples:
+        if self._init_input_count < self._init_input_samples:
             return  # wait for more inputs
 
-        inputs = torch.cat(self.init_input_batches, dim=0)  # (num_samples, dim_feature)
+        inputs = torch.cat(self._init_input_batches, dim=0)  # (num_samples, dim_feature)
         # free up memory
-        del self.init_input_samples
-        del self.init_input_batches
-        del self.init_input_count
+        del self._init_input_samples
+        del self._init_input_batches
+        del self._init_input_count
         self._init_embed(inputs)
 
     @torch.no_grad()
@@ -274,26 +314,81 @@ class VectorQuantize(nn.Module):
                 use_cosine_sim=False,
             )
 
-            # Normalize cluster size so that we can assume num_inputs equals to codebook_size
             cluster_size = cluster_size.float()
-            cluster_size *= self.codebook_size / cluster_size.sum()
+            embed_sum = embed * cluster_size[:, None]
         else:
             embed = gather(inputs)
             cluster_size = torch.ones(self.codebook_size, device=inputs.device)
+            embed_sum = embed
 
-        self.embeddings.data.copy_(embed)
+        self.embed.data.copy_(embed)
+        self.embed_avg.data.copy_(embed_sum)
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.fill_(True)
 
-    def update_ema(self, cluster_size):
+    @torch.no_grad()
+    def _expire_codes(self, inputs):
+        if self.threshold_ema_dead_code == 0:
+            return
+        
+        expired_codes = self.normalized_cluster_size < self.threshold_ema_dead_code
+        if not expired_codes.any():
+            return
+        
+        num_samples = int(expired_codes.sum().item())
+        sampled = sample_vectors(inputs, num_samples)  # (num_samples, dim_feature)
+        reset_cluster_size = torch.full((num_samples,), self.reset_cluster_size, device=sampled.device)
+
+        self.embed.data[expired_codes] = sampled
+        self.embed_avg.data[expired_codes] = sampled * reset_cluster_size[:, None]
+        self.cluster_size.data[expired_codes] = reset_cluster_size
+
+    @torch.no_grad()
+    def _update_ema(self, x, embed_indices, cluster_size):
         cluster_size = cluster_size.float()
-        # Normalize cluster size so that we can assume num_inputs equals to codebook_size
-        cluster_size.mul_(self.codebook_size / cluster_size.sum())
         ema_inplace(self.cluster_size, cluster_size, self.ema_decay)
+
+        if self.ema_update:
+            embed_sum = torch.zeros_like(self.embed_avg)  # (codebook_size, dim_feature)
+            embed_sum.scatter_add_(0, embed_indices[:, None].expand(-1, self.dim_feature), x)
+
+            reduce(embed_sum, reduction='sum')  # (codebook_size, dim_feature)
+            ema_inplace(self.embed_avg, embed_sum, self.ema_decay)
+
+            def laplace_smoothing(x, n_categories, eps=1e-5, dim=-1):
+                x_sum = x.sum(dim=dim, keepdim=True)
+                return x_sum * (x + eps) / (x_sum + n_categories * eps)
+            
+            cluster_size_smoothed = laplace_smoothing(self.cluster_size, self.codebook_size)
+            embed_normalized = self.embed_avg / cluster_size_smoothed[:, None]
+            self.embed.data.copy_(embed_normalized)
+
+    def _loss(self, x, quantized, dists):
+        # compute VQ-VAE loss
+        with torch.set_grad_enabled(self.learnable_codebook):
+            loss_embed = (quantized - x.detach()).square().mean()
+        loss_commitment = (quantized.detach() - x).square().mean()
+        loss = loss_embed + self.commitment_weight * loss_commitment
+        loss_terms = {
+            'loss_embed': loss_embed,
+            'loss_commitment': loss_commitment,
+        }
+
+        # add entropy regularization loss
+        if self.entropy_reg_weight > 0:
+            entropy_reg_loss = entropy_regularization(-dists, self.entropy_reg_temp)
+            loss = loss + self.entropy_reg_weight * entropy_reg_loss
+            loss_terms['loss_entropy'] = entropy_reg_loss
+
+        return loss, loss_terms
 
     @property
     def codebook(self) -> torch.Tensor:
-        return self.embeddings
+        return self.embed
+
+    @property
+    def normalized_cluster_size(self) -> torch.Tensor:
+        return self.cluster_size * (self.codebook_size / self.cluster_size.sum())
 
     def from_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return F.embedding(indices, self.codebook)  # (..., dim_feature)
@@ -328,58 +423,44 @@ class VectorQuantize(nn.Module):
         dists = l2_dist(x, codebook)  # (N, codebook_size)
         
         # find closest codebook embeddings
-        embed_indices, embed_onehot = gumbel_sample(
+        embed_indices = gumbel_sample(
             logits=-dists, 
-            temperature=self.sampling_temp, 
             stochastic=self.stochastic_sampling, 
-            softmax_gradient=self.softmax_gradient, 
+            temperature=self.sampling_temp, 
             training=self.training,
         )  # (N,),  (N, codebook_size)
 
         # get quantized vectors
-        if self.training and self.softmax_gradient:
-            quantized = torch.matmul(embed_onehot, codebook)  # (N, dim_feature)
-        else:
-            quantized = self.from_indices(embed_indices)  # (N, dim_feature)
+        quantized = self.from_indices(embed_indices)  # (N, dim_feature)
 
         # preserve gradients
-        x_q = x + (quantized - x).detach()
+        if self.rotation_trick:
+            x_q = rotate_to(x, quantized)
+        else:  # standard STE to get gradients through VQ layer.
+            x_q = x + (quantized - x).detach()
 
         # compute perplexity
         cluster_size = torch.bincount(embed_indices.view(-1), minlength=self.codebook_size)
         reduce(cluster_size, reduction='sum')
         perplexity = compute_perplexity(cluster_size)
 
+        # compute VQ losses
+        total_loss, loss_terms = self._loss(x, quantized, dists)
+
+        # gather inference and loss statistics
         info = {
             'dists': dists,
             'embed_indices': embed_indices,
-            'embed_onehot': embed_onehot,
             'perplexity': perplexity,
             'normalized_perplexity': perplexity / self.codebook_size,
+            'loss': total_loss,
+            **loss_terms,
         }
 
-        # perform EMA update
+        # perform training EMA update and loss computation
         if self.training:
-            self.update_ema(cluster_size)
-
-        # compute VQ-VAE loss
-        loss_embed = (quantized - x.detach()).square().mean()
-        loss_commitment = (quantized.detach() - x).square().mean()
-        loss = loss_embed + self.commitment_weight * loss_commitment
-
-        # add entropy regularization loss
-        if self.entropy_reg_weight > 0:
-            entropy_reg_loss = entropy_regularization(-dists, self.entropy_reg_temp)
-            loss = loss + self.entropy_reg_weight * entropy_reg_loss
-        else:
-            entropy_reg_loss = torch.tensor(0.0, device=x.device)
-
-        info.update({
-            'loss': loss,
-            'loss_embed': loss_embed,
-            'loss_commitment': loss_commitment,
-            'loss_entropy': entropy_reg_loss,
-        })
+            self._update_ema(x, embed_indices, cluster_size)
+            self._expire_codes(x)
 
         return x_q, info
 

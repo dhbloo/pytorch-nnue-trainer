@@ -1427,15 +1427,12 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                  input_type='basic-nostm',
                  value_no_draw=False,
                  codebook_size=65536,
-                 kmeans_sample_multiplier=1,
                  **vq_kwargs):
         super().__init__(dim_middle, dim_feature, input_type, value_no_draw)
         self.vq_layer = nn.ModuleList([
             VectorQuantize(
                 codebook_size=codebook_size, 
                 dim_feature=dim_feature,
-                kmeans_init=True,
-                kmeans_sample_multiplier=kmeans_sample_multiplier,
                 **vq_kwargs,
             )
             for _ in range(3)
@@ -1458,25 +1455,28 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                 loss.append(info['loss'])
                 perplexity.append(info['perplexity'])
                 normalized_perplexity.append(info['normalized_perplexity'])
-                cluster_size_q10.append(torch.quantile(self.vq_layer[i].cluster_size, q=0.1))
-                cluster_size_q50.append(torch.quantile(self.vq_layer[i].cluster_size, q=0.5))
-                cluster_size_q90.append(torch.quantile(self.vq_layer[i].cluster_size, q=0.9))
+                cluster_size = self.vq_layer[i].normalized_cluster_size
+                cluster_size_q10.append(torch.quantile(cluster_size, q=0.1))
+                cluster_size_q50.append(torch.quantile(cluster_size, q=0.5))
+                cluster_size_q90.append(torch.quantile(cluster_size, q=0.9))
 
-        if len(loss) == 0:
-            return feature_groups, {}, {}
+        aux_losses = {}
+        if len(loss) > 0:
+            loss = torch.stack(loss).sum()
+            aux_losses = {'vq': loss}
 
-        loss = torch.stack(loss).sum()
-        perplexity = torch.stack(perplexity).mean()
-        normalized_perplexity = torch.stack(normalized_perplexity).mean()
-        cluster_size_q10 = torch.stack(cluster_size_q10).mean()
-        cluster_size_q50 = torch.stack(cluster_size_q50).mean()
-        cluster_size_q90 = torch.stack(cluster_size_q90).mean()
-        aux_losses = {'vq': loss}
-        aux_outputs = {
-            'vq_perplexity': perplexity,
-            'vq_normed_perplexity': normalized_perplexity,
-            'vq_cluster_size_q10': cluster_size_q10,
-            'vq_cluster_size_q50': cluster_size_q50,
-            'vq_cluster_size_q90': cluster_size_q90,
-        }
+        aux_outputs = {}
+        if len(perplexity) > 0:
+            perplexity = torch.stack(perplexity).mean()
+            normalized_perplexity = torch.stack(normalized_perplexity).mean()
+            cluster_size_q10 = torch.stack(cluster_size_q10).mean()
+            cluster_size_q50 = torch.stack(cluster_size_q50).mean()
+            cluster_size_q90 = torch.stack(cluster_size_q90).mean()
+            aux_outputs = {
+                'vq_perplexity': perplexity,
+                'vq_normed_perplexity': normalized_perplexity,
+                'vq_cluster_size_q10': cluster_size_q10,
+                'vq_cluster_size_q50': cluster_size_q50,
+                'vq_cluster_size_q90': cluster_size_q90,
+            }
         return feature_groups, aux_losses, aux_outputs
