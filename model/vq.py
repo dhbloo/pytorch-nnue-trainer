@@ -1,3 +1,4 @@
+import types
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -249,16 +250,18 @@ class VectorQuantize(nn.Module):
                  stochastic_sampling=False,
                  sampling_temp=1.0,
                  entropy_reg_weight=0.0,
-                 entropy_reg_temp=0.01):
+                 entropy_reg_temp=0.01,
+                 use_simvq=False,
+                 codebook_transform=None):
         super().__init__()
         self.codebook_size = codebook_size
         self.dim_feature = dim_feature
         self.kmeans_init = kmeans_init
         self.kmeans_sample_multiplier = kmeans_sample_multiplier
         self.kmeans_iter = kmeans_iter
-        self.ema_update = ema_update
+        self.ema_update = ema_update and not use_simvq
         self.ema_decay = ema_decay
-        self.threshold_ema_dead_code = threshold_ema_dead_code
+        self.threshold_ema_dead_code = 0 if use_simvq else threshold_ema_dead_code
         self.reset_cluster_size = threshold_ema_dead_code if reset_cluster_size is None else reset_cluster_size 
         self.commitment_weight = commitment_weight
         self.rotation_trick = rotation_trick
@@ -266,6 +269,7 @@ class VectorQuantize(nn.Module):
         self.sampling_temp = sampling_temp
         self.entropy_reg_weight = entropy_reg_weight
         self.entropy_reg_temp = entropy_reg_temp
+        self.use_simvq = use_simvq
 
         self.register_buffer('inited', torch.zeros([], dtype=torch.bool))
         self.register_buffer('cluster_size', torch.ones(codebook_size))
@@ -274,11 +278,23 @@ class VectorQuantize(nn.Module):
             self._init_input_samples = (codebook_size * kmeans_sample_multiplier // PartialState().num_processes)
             self._init_input_batches = []
             self._init_input_count = 0
+        elif use_simvq:
+            embed = torch.randn(codebook_size, dim_feature) * (dim_feature ** -0.5)
+            self.inited.data.fill_(True)
         else:
             embed = uniform_init(codebook_size, dim_feature)
             self.inited.data.fill_(True)
 
-        self.learnable_codebook = learnable_codebook and not ema_update
+        if use_simvq:
+            if codebook_transform is None:
+                codebook_transform = nn.Linear(dim_feature, dim_feature, bias=False)
+                if kmeans_init:
+                    def custom_init(self):
+                        nn.init.eye_(self.weight.data)
+                    setattr(codebook_transform, 'custom_init', types.MethodType(custom_init, codebook_transform))
+            self.code_transform = codebook_transform
+
+        self.learnable_codebook = learnable_codebook and not self.ema_update
         self.embed = nn.Parameter(embed, requires_grad=self.learnable_codebook)
         self.register_buffer('embed_avg', embed.clone())
 
@@ -365,8 +381,7 @@ class VectorQuantize(nn.Module):
 
     def _loss(self, x, quantized, dists):
         # compute VQ-VAE loss
-        with torch.set_grad_enabled(self.learnable_codebook):
-            loss_embed = (quantized - x.detach()).square().mean()
+        loss_embed = (quantized - x.detach()).square().mean()
         loss_commitment = (quantized.detach() - x).square().mean()
         loss = loss_embed + self.commitment_weight * loss_commitment
         loss_terms = {
@@ -384,7 +399,10 @@ class VectorQuantize(nn.Module):
 
     @property
     def codebook(self) -> torch.Tensor:
-        return self.embed
+        if self.use_simvq:
+            return self.code_transform(self.embed)
+        else:
+            return self.embed
 
     @property
     def normalized_cluster_size(self) -> torch.Tensor:
@@ -431,7 +449,7 @@ class VectorQuantize(nn.Module):
         )  # (N,),  (N, codebook_size)
 
         # get quantized vectors
-        quantized = self.from_indices(embed_indices)  # (N, dim_feature)
+        quantized = F.embedding(embed_indices, codebook)  # (N, dim_feature)
 
         # preserve gradients
         if self.rotation_trick:
