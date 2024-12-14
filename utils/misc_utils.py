@@ -25,8 +25,8 @@ def add_dict_to(total_dict, dict_to_add):
 
 def log_value_dict(tb_logger, tag, value_dict, it, rows):
     for name, value in value_dict.items():
-        tb_logger.add_scalar(f'{tag}/{name}', value, it)
-        tb_logger.add_scalar(f'{tag}_rows/{name}', value, rows)
+        tb_logger.add_scalar(f"{tag}/{name}", value, it)
+        tb_logger.add_scalar(f"{tag}_rows/{name}", value, rows)
 
 
 class Register:
@@ -45,6 +45,7 @@ class Register:
 
     def register(self, target):
         """Decorator to register a function or class."""
+
         def add(key, value):
             self[key] = value
             return value
@@ -66,7 +67,7 @@ class Register:
 
 
 def import_submodules(package, recursive=True):
-    """ Import all submodules of a module, recursively, including subpackages
+    """Import all submodules of a module, recursively, including subpackages
 
     :param package: package (name or actual module)
     :type package: str | module
@@ -76,7 +77,7 @@ def import_submodules(package, recursive=True):
         package = importlib.import_module(package)
     results = {}
     for loader, name, is_pkg in pkgutil.walk_packages(package.__path__):
-        full_name = package.__name__ + '.' + name
+        full_name = package.__name__ + "." + name
         results[full_name] = importlib.import_module(full_name)
         if recursive and is_pkg:
             results.update(import_submodules(full_name))
@@ -86,9 +87,9 @@ def import_submodules(package, recursive=True):
 def ascii_hist(name, x, bins=10, width=60):
     N, X = np.histogram(x, bins=bins)
     nmax = N.max()
-    
-    print(name + f', min={x.min():.4f}, max={x.max():.4f}')
-    for (xi, n) in zip(X, N):
-        bar = '#' * int(n * 1.0 * width / nmax)
-        xi = '{0: <8.4g}'.format(xi).ljust(10)
-        print('{0}| {1}'.format(xi, bar))
+
+    print(name + f", min={x.min():.4f}, max={x.max():.4f}")
+    for xi, n in zip(X, N):
+        bar = "#" * int(n * 1.0 * width / nmax)
+        xi = "{0: <8.4g}".format(xi).ljust(10)
+        print("{0}| {1}".format(xi, bar))

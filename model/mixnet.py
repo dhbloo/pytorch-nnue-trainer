@@ -3,8 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU, QuantPReLU, \
-    SwitchGate, SwitchLinearBlock, SwitchPReLU, SequentialWithExtraArguments
+from .blocks import (
+    Conv2dBlock,
+    LinearBlock,
+    ChannelWiseLeakyReLU,
+    QuantPReLU,
+    SwitchGate,
+    SwitchLinearBlock,
+    SwitchPReLU,
+    SequentialWithExtraArguments,
+)
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
 
@@ -16,6 +24,7 @@ from utils.quant_utils import fake_quant
 def tuple_op(f, x):
     return tuple((f(xi) if xi is not None else None) for xi in x)
 
+
 def add_op(t):
     return None if (t[0] is None and t[1] is None) else t[0] + t[1]
 
@@ -24,7 +33,7 @@ class DirectionalConvLayer(nn.Module):
     def __init__(self, dim_in, dim_out, use_nonzero_padding=False):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
-        self.bias = nn.Parameter(torch.zeros((dim_out, )))
+        self.bias = nn.Parameter(torch.zeros((dim_out,)))
         nn.init.kaiming_normal_(self.weight)
         self.use_nonzero_padding = use_nonzero_padding
 
@@ -41,10 +50,12 @@ class DirectionalConvLayer(nn.Module):
         weight = torch.stack(weight_func_map[dir](self.weight), dim=2)
         weight = weight.reshape(dim_out, dim_in, kernel_size, kernel_size)
         if self.use_nonzero_padding:
-            x = F.pad(x,
-                      pad=(kernel_size // 2, kernel_size // 2, kernel_size // 2, kernel_size // 2), 
-                      mode='constant', 
-                      value=1)
+            x = F.pad(
+                x,
+                pad=(kernel_size // 2, kernel_size // 2, kernel_size // 2, kernel_size // 2),
+                mode="constant",
+                value=1,
+            )
             return torch.conv2d(x, weight, self.bias, padding=0)
         else:
             return torch.conv2d(x, weight, self.bias, padding=kernel_size // 2)
@@ -110,39 +121,9 @@ class Mapping(nn.Module):
         return x
 
 
-class RotatedConv2d3x3(nn.Module):
-    def __init__(self, dim_in, dim_out) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty((9, dim_out, dim_in)))
-        self.bias = nn.Parameter(torch.zeros((dim_out, )))
-        nn.init.kaiming_normal_(self.weight)
-
-    def forward(self, x):
-        w = self.weight
-        _, dim_out, dim_in = w.shape
-        zero = torch.zeros((dim_out, dim_in), dtype=w.dtype, device=w.device)
-        weight7x7 = [
-            zero, zero, zero, zero, w[0], zero, zero, \
-            zero, zero, w[1], zero, zero, zero, zero, \
-            w[2], zero, zero, zero, zero, w[3], zero, \
-            zero, zero, zero, w[4], zero, zero, zero, \
-            zero, w[5], zero, zero, zero, zero, w[6], \
-            zero, zero, zero, zero, w[7], zero, zero, \
-            zero, zero, w[8], zero, zero, zero, zero,
-        ]
-        weight7x7 = torch.stack(weight7x7, dim=2)
-        weight7x7 = weight7x7.reshape(dim_out, dim_in, 7, 7)
-        return torch.conv2d(x, weight7x7, self.bias, padding=7 // 2)
-
-
-@MODELS.register('mix6')
+@MODELS.register("mix6")
 class Mix6Net(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_policy=16,
-                 dim_value=32,
-                 map_max=30,
-                 input_type='basic-nostm'):
+    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, map_max=30, input_type="basic-nostm"):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
@@ -154,26 +135,14 @@ class Mix6Net(nn.Module):
         self.mapping_activation = ChannelWiseLeakyReLU(dim_out, bound=6)
 
         # policy nets
-        self.policy_conv = Conv2dBlock(dim_policy,
-                                       dim_policy,
-                                       ks=3,
-                                       st=1,
-                                       padding=1,
-                                       groups=dim_policy)
-        self.policy_linear = Conv2dBlock(dim_policy,
-                                         1,
-                                         ks=1,
-                                         st=1,
-                                         padding=0,
-                                         activation='none',
-                                         bias=False)
+        self.policy_conv = Conv2dBlock(dim_policy, dim_policy, ks=3, st=1, padding=1, groups=dim_policy)
+        self.policy_linear = Conv2dBlock(dim_policy, 1, ks=1, st=1, padding=0, activation="none", bias=False)
         self.policy_activation = ChannelWiseLeakyReLU(1, bias=False)
 
         # value nets
         self.value_activation = ChannelWiseLeakyReLU(dim_value, bias=False)
-        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
-                                          LinearBlock(dim_value, dim_value))
-        self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
+        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value), LinearBlock(dim_value, dim_value))
+        self.value_linear_final = LinearBlock(dim_value, 3, activation="none")
 
     def forward(self, data):
         _, dim_policy, _ = self.model_size
@@ -204,19 +173,14 @@ class Mix6Net(nn.Module):
     @property
     def name(self):
         m, p, v = self.model_size
-        return f"mix6_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
-                                                         if self.map_max != 0 else "")
+        return f"mix6_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm" if self.map_max != 0 else "")
 
 
-@MODELS.register('mix6q')
+@MODELS.register("mix6q")
 class Mix6QNet(nn.Module):  # Q -> quant
-    def __init__(self,
-                 dim_middle=128,
-                 dim_policy=32,
-                 dim_value=32,
-                 input_type='basic',
-                 quantization=True,
-                 scale_feature=4):
+    def __init__(
+        self, dim_middle=128, dim_policy=32, dim_value=32, input_type="basic", quantization=True, scale_feature=4
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.input_type = input_type
@@ -227,26 +191,16 @@ class Mix6QNet(nn.Module):  # Q -> quant
         self.mapping_activation = nn.PReLU(dim_out)
 
         # policy nets
-        self.policy_dw_conv = Conv2dBlock(dim_policy,
-                                          dim_policy,
-                                          ks=3,
-                                          st=1,
-                                          padding=1,
-                                          groups=dim_policy,
-                                          activation='lrelu/16')
-        self.policy_pw_conv = Conv2dBlock(dim_policy,
-                                          1,
-                                          ks=1,
-                                          st=1,
-                                          padding=0,
-                                          activation='lrelu/16',
-                                          bias=False)
+        self.policy_dw_conv = Conv2dBlock(
+            dim_policy, dim_policy, ks=3, st=1, padding=1, groups=dim_policy, activation="lrelu/16"
+        )
+        self.policy_pw_conv = Conv2dBlock(dim_policy, 1, ks=1, st=1, padding=0, activation="lrelu/16", bias=False)
 
         # value nets
         self.value_activation = nn.ReLU(inplace=True)
-        self.value_linear1 = LinearBlock(dim_value, dim_value, activation='relu')
-        self.value_linear2 = LinearBlock(dim_value, dim_value, activation='relu')
-        self.value_linear_final = LinearBlock(dim_value, 3, activation='none')
+        self.value_linear1 = LinearBlock(dim_value, dim_value, activation="relu")
+        self.value_linear2 = LinearBlock(dim_value, dim_value, activation="relu")
+        self.value_linear_final = LinearBlock(dim_value, 3, activation="none")
 
         # adaptive scales
         self.policy_output_scale = nn.Parameter(torch.ones(1), True)
@@ -302,26 +256,24 @@ class Mix6QNet(nn.Module):  # Q -> quant
 
     @property
     def weight_clipping(self):
-        return [] if not self.quantization else [
-            {
-                'params': ['mapping_activation.weight'],
-                'min_weight': -64 / 64,
-                'max_weight': 64 / 64
-            },
-            {
-                'params': [
-                    'policy_dw_conv.conv.weight',
-                    'policy_pw_conv.conv.weight',
-                    'value_linear1.fc.weight',
-                    'value_linear2.fc.weight',
-                    'value_linear_final.fc.weight',
-                ],
-                'min_weight':
-                -self.maxf_i8_w,
-                'max_weight':
-                self.maxf_i8_w
-            },
-        ]
+        return (
+            []
+            if not self.quantization
+            else [
+                {"params": ["mapping_activation.weight"], "min_weight": -64 / 64, "max_weight": 64 / 64},
+                {
+                    "params": [
+                        "policy_dw_conv.conv.weight",
+                        "policy_pw_conv.conv.weight",
+                        "value_linear1.fc.weight",
+                        "value_linear2.fc.weight",
+                        "value_linear_final.fc.weight",
+                    ],
+                    "min_weight": -self.maxf_i8_w,
+                    "max_weight": self.maxf_i8_w,
+                },
+            ]
+        )
 
     @property
     def name(self):
@@ -329,16 +281,18 @@ class Mix6QNet(nn.Module):  # Q -> quant
         return f"mix6q_{self.input_type}_{m}m{p}p{v}v"
 
 
-@MODELS.register('mix7')
+@MODELS.register("mix7")
 class Mix7Net(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_policy=32,
-                 dim_value=32,
-                 dim_dwconv=None,
-                 map_max=30,
-                 input_type='basic-nostm',
-                 dwconv_kernel_size=3):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_policy=32,
+        dim_value=32,
+        dim_dwconv=None,
+        map_max=30,
+        input_type="basic-nostm",
+        dwconv_kernel_size=3,
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.map_max = map_max
@@ -353,27 +307,25 @@ class Mix7Net(nn.Module):
         self.mapping_activation = nn.PReLU(dim_out)
 
         # feature depth-wise conv
-        self.feature_dwconv = Conv2dBlock(self.dim_dwconv,
-                                          self.dim_dwconv,
-                                          ks=dwconv_kernel_size,
-                                          st=1,
-                                          padding=dwconv_kernel_size // 2,
-                                          groups=self.dim_dwconv)
+        self.feature_dwconv = Conv2dBlock(
+            self.dim_dwconv,
+            self.dim_dwconv,
+            ks=dwconv_kernel_size,
+            st=1,
+            padding=dwconv_kernel_size // 2,
+            groups=self.dim_dwconv,
+        )
 
         # policy head (point-wise conv)
-        self.policy_pwconv = Conv2dBlock(dim_policy,
-                                         1,
-                                         ks=1,
-                                         st=1,
-                                         padding=0,
-                                         activation='none',
-                                         bias=False)
+        self.policy_pwconv = Conv2dBlock(dim_policy, 1, ks=1, st=1, padding=0, activation="none", bias=False)
         self.policy_activation = nn.PReLU(1)
 
         # value head
-        self.value_linear = nn.Sequential(LinearBlock(dim_value, dim_value),
-                                          LinearBlock(dim_value, dim_value),
-                                          LinearBlock(dim_value, 3, activation='none'))
+        self.value_linear = nn.Sequential(
+            LinearBlock(dim_value, dim_value),
+            LinearBlock(dim_value, dim_value),
+            LinearBlock(dim_value, 3, activation="none"),
+        )
 
     def forward(self, data):
         _, dim_policy, dim_value = self.model_size
@@ -388,8 +340,8 @@ class Mix7Net(nn.Module):
         feature = self.mapping_activation(feature)
 
         # feature conv
-        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
-        feat_direct = feature[:, self.dim_dwconv:]  # [B, max(PC,VC)-dwconv, H, W]
+        feat_dwconv = self.feature_dwconv(feature[:, : self.dim_dwconv])  # [B, dwconv, H, W]
+        feat_direct = feature[:, self.dim_dwconv :]  # [B, max(PC,VC)-dwconv, H, W]
         feature = torch.cat((feat_dwconv, feat_direct), dim=1)  # [B, max(PC,VC), H, W]
 
         # policy head
@@ -420,8 +372,8 @@ class Mix7Net(nn.Module):
         print(f"feature act at (0,0): \n{feature[..., 0, 0]}")
 
         # feature conv
-        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
-        feat_direct = feature[:, self.dim_dwconv:]  # [B, max(PC,VC)-dwconv, H, W]
+        feat_dwconv = self.feature_dwconv(feature[:, : self.dim_dwconv])  # [B, dwconv, H, W]
+        feat_direct = feature[:, self.dim_dwconv :]  # [B, max(PC,VC)-dwconv, H, W]
         feature = torch.cat((feat_dwconv, feat_direct), dim=1)  # [B, max(PC,VC), H, W]
         print(f"feature after dwconv at (0,0): \n{feature[..., 0, 0]}")
 
@@ -446,33 +398,37 @@ class Mix7Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        return [{
-            'params': ['mapping_activation.weight'],
-            'min_weight': -1.0,
-            'max_weight': 1.0,
-        }, {
-            'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -2.0,
-            'max_weight': 2.0,
-        }]
+        return [
+            {
+                "params": ["mapping_activation.weight"],
+                "min_weight": -1.0,
+                "max_weight": 1.0,
+            },
+            {
+                "params": ["feature_dwconv.conv.weight"],
+                "min_weight": -2.0,
+                "max_weight": 2.0,
+            },
+        ]
 
     @property
     def name(self):
         m, p, v = self.model_size
-        return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm"
-                                                         if self.map_max != 0 else "")
+        return f"mix7_{self.input_type}_{m}m{p}p{v}v" + (f"-{self.map_max}mm" if self.map_max != 0 else "")
 
 
-@MODELS.register('mix8')
+@MODELS.register("mix8")
 class Mix8Net(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=64,
-                 dim_policy=32,
-                 dim_value=64,
-                 dim_value_group=32,
-                 dim_dwconv=None,
-                 input_type='basicns'):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=64,
+        dim_policy=32,
+        dim_value=64,
+        dim_value_group=32,
+        dim_dwconv=None,
+        input_type="basicns",
+    ):
         super().__init__()
         dim_feature = max(dim_policy, dim_value)
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_value_group)
@@ -499,14 +455,14 @@ class Mix8Net(nn.Module):
             st=1,
             padding=3 // 2,
             groups=self.dim_dwconv,
-            activation='relu',
+            activation="relu",
         )
 
         # policy head (point-wise conv)
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy, activation='none'),
+            LinearBlock(dim_feature, dim_policy, activation="none"),
             nn.PReLU(dim_policy),
-            LinearBlock(dim_policy, 4 * dim_policy, activation='none'),
+            LinearBlock(dim_policy, 4 * dim_policy, activation="none"),
         )
         self.policy_output = nn.Sequential(
             nn.PReLU(4),
@@ -514,28 +470,28 @@ class Mix8Net(nn.Module):
         )
 
         # value head
-        self.value_corner_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_corner_linear = LinearBlock(dim_feature, dim_value_group, activation="none")
         self.value_corner_act = nn.PReLU(dim_value_group)
-        self.value_edge_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_edge_linear = LinearBlock(dim_feature, dim_value_group, activation="none")
         self.value_edge_act = nn.PReLU(dim_value_group)
-        self.value_center_linear = LinearBlock(dim_feature, dim_value_group, activation='none')
+        self.value_center_linear = LinearBlock(dim_feature, dim_value_group, activation="none")
         self.value_center_act = nn.PReLU(dim_value_group)
-        self.value_quad_linear = LinearBlock(dim_value_group, dim_value_group, activation='none')
+        self.value_quad_linear = LinearBlock(dim_value_group, dim_value_group, activation="none")
         self.value_quad_act = nn.PReLU(dim_value_group)
         self.value_linear = nn.Sequential(
             LinearBlock(dim_feature + 4 * dim_value_group, dim_value),
             LinearBlock(dim_value, dim_value),
-            LinearBlock(dim_value, 3, activation='none'),
+            LinearBlock(dim_value, 3, activation="none"),
         )
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane({
-            'board_input':
-            torch.flip(data['board_input'], dims=[1]) if inv_side else data['board_input'],
-            'stm_input':
-            -data['stm_input'] if inv_side else data['stm_input']
-        })  # [B, 2, H, W]
+        input_plane = self.input_plane(
+            {
+                "board_input": torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"],
+                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
+            }
+        )  # [B, 2, H, W]
         # get per-point 4-direction cell features
         feature = self.mapping(input_plane)  # [B, 4, dim_feature, H, W]
 
@@ -547,8 +503,8 @@ class Mix8Net(nn.Module):
         feature = self.mapping_activation(feature)  # int16, scale=1020, [-32,32]
 
         # apply feature depth-wise conv
-        feat_dwconv = self.feature_dwconv(feature[:, :self.dim_dwconv])  # [B, dwconv, H, W]
-        feat_direct = feature[:, self.dim_dwconv:]  # [B, dim_feature-dwconv, H, W]
+        feat_dwconv = self.feature_dwconv(feature[:, : self.dim_dwconv])  # [B, dwconv, H, W]
+        feat_direct = feature[:, self.dim_dwconv :]  # [B, dim_feature-dwconv, H, W]
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
         return feature
@@ -582,12 +538,17 @@ class Mix8Net(nn.Module):
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
         pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(4)
-        ],
-                           dim=1)
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(4)
+            ],
+            dim=1,
+        )
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value head
@@ -609,13 +570,16 @@ class Mix8Net(nn.Module):
         value_q01 = self.value_quad_act(self.value_quad_linear(value_q01))
         value_q10 = self.value_quad_act(self.value_quad_linear(value_q10))
         value_q11 = self.value_quad_act(self.value_quad_linear(value_q11))
-        value = torch.cat([
-            feature_mean,
-            value_q00,
-            value_q01,
-            value_q10,
-            value_q11,
-        ], 1)  # [B, dim_feature + 4 * dim_value_group]
+        value = torch.cat(
+            [
+                feature_mean,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + 4 * dim_value_group]
         value = self.value_linear(value)
 
         return value, policy
@@ -662,12 +626,17 @@ class Mix8Net(nn.Module):
         pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
         print(f"policy after dwconv at (0,0): \n{policy[..., 0, 0]}")
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(4)
-        ],
-                           dim=1)
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(4)
+            ],
+            dim=1,
+        )
         print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
         policy = self.policy_output(policy)  # [B, 1, H, W]
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
@@ -707,13 +676,16 @@ class Mix8Net(nn.Module):
         print(f"value_quad01: \n{value_q01}")
         print(f"value_quad10: \n{value_q10}")
         print(f"value_quad11: \n{value_q11}")
-        value = torch.cat([
-            feature_mean,
-            value_q00,
-            value_q01,
-            value_q10,
-            value_q11,
-        ], 1)  # [B, dim_feature + 4 * dim_value_group]
+        value = torch.cat(
+            [
+                feature_mean,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + 4 * dim_value_group]
         print(f"value feature input: \n{value}")
         for i, linear in enumerate(self.value_linear):
             value = linear(value)
@@ -725,25 +697,30 @@ class Mix8Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        return [{
-            'params': [
-                'mapping_activation.weight', 'policy_pwconv_weight_linear.1.weight',
-                'value_corner_act.weight', 'value_edge_act.weight', 'value_center_act.weight',
-                'value_quad_act.weight'
-            ],
-            'min_weight':
-            -1.0,
-            'max_weight':
-            1.0,
-        }, {
-            'params': [f'feature_dwconv.conv.weight'],
-            'min_weight': -1.5,
-            'max_weight': 1.5,
-        }, {
-            'params': [f'feature_dwconv.conv.bias'],
-            'min_weight': -4.0,
-            'max_weight': 4.0,
-        }]
+        return [
+            {
+                "params": [
+                    "mapping_activation.weight",
+                    "policy_pwconv_weight_linear.1.weight",
+                    "value_corner_act.weight",
+                    "value_edge_act.weight",
+                    "value_center_act.weight",
+                    "value_quad_act.weight",
+                ],
+                "min_weight": -1.0,
+                "max_weight": 1.0,
+            },
+            {
+                "params": [f"feature_dwconv.conv.weight"],
+                "min_weight": -1.5,
+                "max_weight": 1.5,
+            },
+            {
+                "params": [f"feature_dwconv.conv.bias"],
+                "min_weight": -4.0,
+                "max_weight": 4.0,
+            },
+        ]
 
     @property
     def name(self):
@@ -755,9 +732,9 @@ class Mix8Net(nn.Module):
 class StarBlock(nn.Module):
     def __init__(self, dim_in, dim_out, expand=1):
         super().__init__()
-        self.up1 = LinearBlock(dim_in, dim_out * 2 * expand, activation='relu', quant=True)
-        self.up2 = LinearBlock(dim_in, dim_out * 2 * expand, activation='none', quant=True)
-        self.down = LinearBlock(dim_out * expand, dim_out, activation='relu', quant=True)
+        self.up1 = LinearBlock(dim_in, dim_out * 2 * expand, activation="relu", quant=True)
+        self.up2 = LinearBlock(dim_in, dim_out * 2 * expand, activation="none", quant=True)
+        self.down = LinearBlock(dim_out * expand, dim_out, activation="relu", quant=True)
 
     def forward(self, x):
         x1 = self.up1(x)
@@ -770,8 +747,8 @@ class StarBlock(nn.Module):
         x = fake_quant(x, scale=128, num_bits=8, floor=True)
         x = self.down(x)  # int8 linear layer with signed input
         return x
-    
-    def forward_debug_print(self, x, name='starblock'):
+
+    def forward_debug_print(self, x, name="starblock"):
         x1 = self.up1(x)
         x2 = self.up2(x)
         x1 = fake_quant(x1, scale=128, num_bits=8, floor=True)
@@ -787,19 +764,21 @@ class StarBlock(nn.Module):
         return x
 
 
-@MODELS.register('mix9')
+@MODELS.register("mix9")
 class Mix9Net(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=64,
-                 dim_policy=32,
-                 dim_value=64,
-                 dim_dwconv=32,
-                 input_type='basicns',
-                 one_mapping=False,
-                 no_star_block=False,
-                 no_dynamic_pwconv=False,
-                 no_value_group=False):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=64,
+        dim_policy=32,
+        dim_value=64,
+        dim_dwconv=32,
+        input_type="basicns",
+        one_mapping=False,
+        no_star_block=False,
+        no_dynamic_pwconv=False,
+        no_value_group=False,
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
@@ -825,8 +804,8 @@ class Mix9Net(nn.Module):
             st=1,
             padding=3 // 2,
             groups=dim_dwconv,
-            activation='relu',
-            quant='pixel-dwconv-floor',
+            activation="relu",
+            quant="pixel-dwconv-floor",
             input_quant_scale=128,
             input_quant_bits=16,
             weight_quant_scale=65536,
@@ -843,28 +822,28 @@ class Mix9Net(nn.Module):
                 dim_pm,
                 ks=1,
                 st=1,
-                activation='relu',
+                activation="relu",
                 quant=True,
                 input_quant_scale=128,
                 input_quant_bits=16,
-                weight_quant_scale=128*128,
+                weight_quant_scale=128 * 128,
                 weight_quant_bits=16,
-                bias_quant_scale=128*128*128,
+                bias_quant_scale=128 * 128 * 128,
                 bias_quant_bits=32,
             )
         else:
             self.policy_pwconv_weight_linear = nn.Sequential(
-                LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
-                LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
+                LinearBlock(dim_feature, dim_policy * 2, activation="relu", quant=True),
+                LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation="none", quant=True),
             )
 
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
         if no_value_group:
             self.value_linear = nn.Sequential(
-                LinearBlock(dim_feature, dim_value, activation='relu', quant=True),
-                LinearBlock(dim_value, dim_value, activation='relu', quant=True),
-                LinearBlock(dim_value, 3, activation='none', quant=True),
+                LinearBlock(dim_feature, dim_value, activation="relu", quant=True),
+                LinearBlock(dim_value, dim_value, activation="relu", quant=True),
+                LinearBlock(dim_value, 3, activation="none", quant=True),
             )
         else:
             if no_star_block:
@@ -878,9 +857,9 @@ class Mix9Net(nn.Module):
                 self.value_center = StarBlock(dim_feature, dim_value)
                 self.value_quad = StarBlock(dim_value, dim_value)
             self.value_linear = nn.Sequential(
-                LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
-                LinearBlock(dim_value, dim_value, activation='relu', quant=True),
-                LinearBlock(dim_value, 3, activation='none', quant=True),
+                LinearBlock(dim_feature + 4 * dim_value, dim_value, activation="relu", quant=True),
+                LinearBlock(dim_value, dim_value, activation="relu", quant=True),
+                LinearBlock(dim_value, 3, activation="none", quant=True),
             )
 
     def custom_init(self):
@@ -888,12 +867,12 @@ class Mix9Net(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane({
-            'board_input':
-            torch.flip(data['board_input'], dims=[1]) if inv_side else data['board_input'],
-            'stm_input':
-            -data['stm_input'] if inv_side else data['stm_input']
-        })  # [B, 2, H, W]
+        input_plane = self.input_plane(
+            {
+                "board_input": torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"],
+                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
+            }
+        )  # [B, 2, H, W]
         # get per-point 4-direction cell features
         if self.one_mapping:
             feature = self.mapping0(input_plane)  # [B, 4, dim_feature, H, W]
@@ -903,7 +882,7 @@ class Mix9Net(nn.Module):
             feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-16, max=511/32)  # int16, scale=32, [-16,16]
+        feature = torch.clamp(feature, min=-16, max=511 / 32)  # int16, scale=32, [-16,16]
         feature = fake_quant(feature, scale=32, num_bits=16)
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
@@ -941,15 +920,21 @@ class Mix9Net(nn.Module):
         else:
             dim_pm = self.policy_middle_dim
             pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
-            pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-            pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
+            pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+            pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
             policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-            policy = torch.cat([
-                F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                        weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                        groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-            ], 1)
-            pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+            policy = torch.cat(
+                [
+                    F.conv2d(
+                        input=policy.reshape(1, B * dim_policy, H, W),
+                        weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                        groups=B,
+                    ).reshape(B, 1, H, W)
+                    for i in range(dim_pm)
+                ],
+                1,
+            )
+            pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
             policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
 
         policy = self.policy_output(policy)  # [B, 1, H, W]
@@ -997,9 +982,9 @@ class Mix9Net(nn.Module):
                 b = fake_quant(b, floor=True)
                 c = fake_quant(c, floor=True)
                 d = fake_quant(d, floor=True)
-                ab = fake_quant((a + b + 1/128) / 2, floor=True)
-                cd = fake_quant((c + d + 1/128) / 2, floor=True)
-                return fake_quant((ab + cd + 1/128) / 2, floor=True)
+                ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
+                cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
+                return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
 
             value_q00 = avg4(value_00, value_01, value_10, value_11)
             value_q01 = avg4(value_01, value_02, value_11, value_12)
@@ -1010,10 +995,16 @@ class Mix9Net(nn.Module):
             value_q10 = self.value_quad(value_q10)
             value_q11 = self.value_quad(value_q11)
 
-            value = torch.cat([
-                feature_sum,
-                value_q00, value_q01, value_q10, value_q11,
-            ], 1)  # [B, dim_feature + dim_value * 4]
+            value = torch.cat(
+                [
+                    feature_sum,
+                    value_q00,
+                    value_q01,
+                    value_q10,
+                    value_q11,
+                ],
+                1,
+            )  # [B, dim_feature + dim_value * 4]
             value = self.value_linear(value)
 
         return value, policy
@@ -1040,18 +1031,24 @@ class Mix9Net(nn.Module):
             dim_pm = self.policy_middle_dim
             pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
             print(f"policy pwconv output: \n{(pwconv_output*128*128).int()}")
-            pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-            pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
+            pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+            pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
             print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
             policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
             print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
-            policy = torch.cat([
-                F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                        weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                        groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-            ], 1)
+            policy = torch.cat(
+                [
+                    F.conv2d(
+                        input=policy.reshape(1, B * dim_policy, H, W),
+                        weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                        groups=B,
+                    ).reshape(B, 1, H, W)
+                    for i in range(dim_pm)
+                ],
+                1,
+            )
             print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
-            pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+            pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
             print(f"policy pwconv bias: \n{(pwconv_bias.flatten(1, -1)*128*128*128).int()}")
             policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
             print(f"policy pwconv output at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
@@ -1134,9 +1131,9 @@ class Mix9Net(nn.Module):
                 b = fake_quant(b, floor=True)
                 c = fake_quant(c, floor=True)
                 d = fake_quant(d, floor=True)
-                ab = fake_quant((a + b + 1/128) / 2, floor=True)
-                cd = fake_quant((c + d + 1/128) / 2, floor=True)
-                return fake_quant((ab + cd + 1/128) / 2, floor=True)
+                ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
+                cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
+                return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
 
             value_q00 = avg4(value_00, value_01, value_10, value_11)
             value_q01 = avg4(value_01, value_02, value_11, value_12)
@@ -1162,10 +1159,16 @@ class Mix9Net(nn.Module):
                 value_q10 = self.value_quad.forward_debug_print(value_q10, "value_q10")
                 value_q11 = self.value_quad.forward_debug_print(value_q11, "value_q11")
 
-            value = torch.cat([
-                feature_sum,
-                value_q00, value_q01, value_q10, value_q11,
-            ], 1)  # [B, dim_feature + dim_value * 4]
+            value = torch.cat(
+                [
+                    feature_sum,
+                    value_q00,
+                    value_q01,
+                    value_q10,
+                    value_q11,
+                ],
+                1,
+            )  # [B, dim_feature + dim_value * 4]
             print(f"value feature input: \n{(value*128).int()}")
             for i, linear in enumerate(self.value_linear):
                 value = linear(value)
@@ -1180,41 +1183,58 @@ class Mix9Net(nn.Module):
         if self.no_value_group:
             value_group_weights = []
         elif self.no_star_block:
-            value_group_weights = ['value_corner.fc.weight', 'value_edge.fc.weight', 'value_center.fc.weight', 'value_quad.fc.weight']
+            value_group_weights = [
+                "value_corner.fc.weight",
+                "value_edge.fc.weight",
+                "value_center.fc.weight",
+                "value_quad.fc.weight",
+            ]
         else:
-            value_group_weights = ['value_corner.up1.fc.weight', 'value_corner.up2.fc.weight', 'value_corner.down.fc.weight',
-                                   'value_edge.up1.fc.weight', 'value_edge.up2.fc.weight', 'value_edge.down.fc.weight',
-                                   'value_center.up1.fc.weight', 'value_center.up2.fc.weight', 'value_center.down.fc.weight',
-                                   'value_quad.up1.fc.weight', 'value_quad.up2.fc.weight', 'value_quad.down.fc.weight']
-            
+            value_group_weights = [
+                "value_corner.up1.fc.weight",
+                "value_corner.up2.fc.weight",
+                "value_corner.down.fc.weight",
+                "value_edge.up1.fc.weight",
+                "value_edge.up2.fc.weight",
+                "value_edge.down.fc.weight",
+                "value_center.up1.fc.weight",
+                "value_center.up2.fc.weight",
+                "value_center.down.fc.weight",
+                "value_quad.up1.fc.weight",
+                "value_quad.up2.fc.weight",
+                "value_quad.down.fc.weight",
+            ]
+
         weight_clipping_list = [
+            {"params": ["feature_dwconv.conv.weight"], "min_weight": -32768 / 65536, "max_weight": 32767 / 65536},
             {
-                'params': ['feature_dwconv.conv.weight'],
-                'min_weight': -32768 / 65536,
-                'max_weight': 32767 / 65536
-            },
-            {
-                'params': [*value_group_weights,
-                           'value_linear.0.fc.weight',
-                           'value_linear.1.fc.weight',
-                           'value_linear.2.fc.weight'],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [
+                    *value_group_weights,
+                    "value_linear.0.fc.weight",
+                    "value_linear.1.fc.weight",
+                    "value_linear.2.fc.weight",
+                ],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
         if self.no_dynamic_pwconv:
-            weight_clipping_list.append({
-                'params': ['policy_pwconv.conv.weight'],
-                'min_weight': -32768 / (128*128),
-                'max_weight': 32767 / (128*128)
-            })
+            weight_clipping_list.append(
+                {
+                    "params": ["policy_pwconv.conv.weight"],
+                    "min_weight": -32768 / (128 * 128),
+                    "max_weight": 32767 / (128 * 128),
+                }
+            )
         else:
-            weight_clipping_list.append({
-                'params': ['policy_pwconv_weight_linear.0.fc.weight', 'policy_pwconv_weight_linear.1.fc.weight'],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
-            })
+            weight_clipping_list.append(
+                {
+                    "params": ["policy_pwconv_weight_linear.0.fc.weight", "policy_pwconv_weight_linear.1.fc.weight"],
+                    "min_weight": -128 / 128,
+                    "max_weight": 127 / 128,
+                }
+            )
 
         return weight_clipping_list
 
@@ -1224,16 +1244,18 @@ class Mix9Net(nn.Module):
         return f"mix9_{self.input_type}_{f}f{p}p{v}v{d}d"
 
 
-@MODELS.register('mix10')
+@MODELS.register("mix10")
 class Mix10Net(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=64,
-                 dim_policy=32,
-                 dim_value=64,
-                 dim_dwconv=32,
-                 input_type='basicns',
-                 one_mapping=False):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=64,
+        dim_policy=32,
+        dim_value=64,
+        dim_dwconv=32,
+        input_type="basicns",
+        one_mapping=False,
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
@@ -1256,8 +1278,8 @@ class Mix10Net(nn.Module):
             st=1,
             padding=3 // 2,
             groups=dim_dwconv,
-            activation='relu',
-            quant='pixel-dwconv-floor',
+            activation="relu",
+            quant="pixel-dwconv-floor",
             input_quant_scale=128,
             input_quant_bits=16,
             weight_quant_scale=65536,
@@ -1269,29 +1291,29 @@ class Mix10Net(nn.Module):
         # policy head (point-wise conv)
         dim_pm = self.policy_middle_dim = 16
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
-            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
+            LinearBlock(dim_feature, dim_policy * 2, activation="relu", quant=True),
+            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation="none", quant=True),
         )
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
         # value head small
         self.value_linear_small = nn.Sequential(
-            LinearBlock(dim_feature, dim_feature, activation='relu', quant=True),
-            LinearBlock(dim_feature, dim_feature, activation='relu', quant=True),
+            LinearBlock(dim_feature, dim_feature, activation="relu", quant=True),
+            LinearBlock(dim_feature, dim_feature, activation="relu", quant=True),
         )
-        self.value_small_output = LinearBlock(dim_feature, 4, activation='none', quant=True)
+        self.value_small_output = LinearBlock(dim_feature, 4, activation="none", quant=True)
 
         # value head large
-        self.value_gate = LinearBlock(dim_feature, dim_feature, activation='none', quant=True)
+        self.value_gate = LinearBlock(dim_feature, dim_feature, activation="none", quant=True)
         self.value_corner = LinearBlock(dim_value, dim_value, quant=True)
         self.value_edge = LinearBlock(dim_value, dim_value, quant=True)
         self.value_center = LinearBlock(dim_value, dim_value, quant=True)
         self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
 
         self.value_linear_large = nn.Sequential(
-            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, 4, activation='none', quant=True),
+            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, 4, activation="none", quant=True),
         )
 
     def custom_init(self):
@@ -1299,12 +1321,12 @@ class Mix10Net(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane({
-            'board_input':
-            torch.flip(data['board_input'], dims=[1]) if inv_side else data['board_input'],
-            'stm_input':
-            -data['stm_input'] if inv_side else data['stm_input']
-        })  # [B, 2, H, W]
+        input_plane = self.input_plane(
+            {
+                "board_input": torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"],
+                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
+            }
+        )  # [B, 2, H, W]
         # get per-point 4-direction cell features
         if self.one_mapping:
             feature = self.mapping0(input_plane)  # [B, 4, dim_feature, H, W]
@@ -1314,7 +1336,7 @@ class Mix10Net(nn.Module):
             feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-16, max=511/32)  # int16, scale=32, [-16,16]
+        feature = torch.clamp(feature, min=-16, max=511 / 32)  # int16, scale=32, [-16,16]
         feature = fake_quant(feature, scale=32, num_bits=16)
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
@@ -1334,7 +1356,7 @@ class Mix10Net(nn.Module):
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
         return feature
-    
+
     def value_head_small(self, feature):
         # global feature accumulator
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
@@ -1349,7 +1371,7 @@ class Mix10Net(nn.Module):
         relative_uncertainty = value_and_rel_uncertainty[:, 3]  # [B]
 
         return value, relative_uncertainty, value_small_feature
-    
+
     def value_head_large(self, feature, value_small_feature):
         B, _, H, W = feature.shape
 
@@ -1412,9 +1434,9 @@ class Mix10Net(nn.Module):
             b = fake_quant(b, floor=True)
             c = fake_quant(c, floor=True)
             d = fake_quant(d, floor=True)
-            ab = fake_quant((a + b + 1/128) / 2, floor=True)
-            cd = fake_quant((c + d + 1/128) / 2, floor=True)
-            return fake_quant((ab + cd + 1/128) / 2, floor=True)
+            ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
+            cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
+            return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
 
         value_q00 = avg4(value_00, value_01, value_10, value_11)
         value_q01 = avg4(value_01, value_02, value_11, value_12)
@@ -1425,30 +1447,42 @@ class Mix10Net(nn.Module):
         value_q10 = self.value_quad(value_q10)
         value_q11 = self.value_quad(value_q11)
 
-        value = torch.cat([
-            value_small_feature,
-            value_q00, value_q01, value_q10, value_q11,
-        ], 1)  # [B, dim_feature + dim_value * 4]
+        value = torch.cat(
+            [
+                value_small_feature,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + dim_value * 4]
         value_and_uncertainty = self.value_linear_large(value)  # [B, 4]
         value = value_and_uncertainty[:, :3]  # [B, 3]
         uncertainty = value_and_uncertainty[:, 3]  # [B]
         return value, uncertainty
-    
+
     def policy_head(self, feature, value_small_feature):
         _, _, dim_policy, _, _ = self.model_size
         B, _, H, W = feature.shape
         dim_pm = self.policy_middle_dim
         pwconv_output = self.policy_pwconv_weight_linear(value_small_feature)  # [B, dim_pm * dim_policy + dim_pm]
-        pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-        pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
-        pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+        pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+        pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
+        pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
 
         policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-        ], 1)
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(dim_pm)
+            ],
+            1,
+        )
         policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
@@ -1468,19 +1502,20 @@ class Mix10Net(nn.Module):
         policy = self.policy_head(feature, value_small_feature)
 
         aux_losses = {
-            'value_small': ('value_loss', value_small),
-            'value_large_uncertainty': ('value_uncertainty_loss', (value_large_uncertainty, value_large)),
-            'value_relative_uncertainty': ('value_relative_uncertainty_loss', 
-                                           (value_relative_uncertainty, value_small, value_large)),
+            "value_small": ("value_loss", value_small),
+            "value_large_uncertainty": ("value_uncertainty_loss", (value_large_uncertainty, value_large)),
+            "value_relative_uncertainty": (
+                "value_relative_uncertainty_loss",
+                (value_relative_uncertainty, value_small, value_large),
+            ),
         }
         aux_outputs = {
-            'value_large_uncertainty_mean': torch.mean(value_large_uncertainty),
-            'value_large_uncertainty_q10': torch.quantile(value_large_uncertainty, q=0.1),
-            'value_large_uncertainty_q90': torch.quantile(value_large_uncertainty, q=0.9),
-
-            'value_relative_uncertainty_mean': torch.mean(value_relative_uncertainty),
-            'value_relative_uncertainty_q10': torch.quantile(value_relative_uncertainty, q=0.1),
-            'value_relative_uncertainty_q90': torch.quantile(value_relative_uncertainty, q=0.9),
+            "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
+            "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
+            "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
+            "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
+            "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
+            "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
         }
         return value_large, policy, aux_losses, aux_outputs
 
@@ -1488,30 +1523,29 @@ class Mix10Net(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        return [{
-            'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -32768 / 65536,
-            'max_weight': 32767 / 65536
-        },
-        {
-            'params': ['value_gate.fc.weight',
-                       'value_corner.fc.weight', 
-                       'value_edge.fc.weight', 
-                       'value_center.fc.weight', 
-                       'value_quad.fc.weight',
-                       'value_linear_small.0.fc.weight',
-                       'value_linear_small.1.fc.weight',
-                       'value_linear_large.0.fc.weight',
-                       'value_linear_large.1.fc.weight',
-                       'value_linear_large.2.fc.weight',
-                       'policy_pwconv_weight_linear.0.fc.weight',
-                       'policy_pwconv_weight_linear.1.fc.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {"params": ["feature_dwconv.conv.weight"], "min_weight": -32768 / 65536, "max_weight": 32767 / 65536},
+            {
+                "params": [
+                    "value_gate.fc.weight",
+                    "value_corner.fc.weight",
+                    "value_edge.fc.weight",
+                    "value_center.fc.weight",
+                    "value_quad.fc.weight",
+                    "value_linear_small.0.fc.weight",
+                    "value_linear_small.1.fc.weight",
+                    "value_linear_large.0.fc.weight",
+                    "value_linear_large.1.fc.weight",
+                    "value_linear_large.2.fc.weight",
+                    "policy_pwconv_weight_linear.0.fc.weight",
+                    "policy_pwconv_weight_linear.1.fc.weight",
+                ],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+        ]
 
     @property
     def name(self):
         _, f, p, v, d = self.model_size
         return f"mix10_{self.input_type}_{f}f{p}p{v}v{d}d"
-

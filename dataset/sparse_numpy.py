@@ -5,19 +5,21 @@ from utils.data_utils import Symmetry, make_subset_range
 from . import DATASETS
 
 
-@DATASETS.register('sparse_numpy')
+@DATASETS.register("sparse_numpy")
 class SparseNumpyDataset(IterableDataset):
-    FILE_EXTS = ['.npz']
+    FILE_EXTS = [".npz"]
 
-    def __init__(self,
-                 file_list,
-                 boardsizes,
-                 fixed_side_input,
-                 apply_symmetry=False,
-                 shuffle=False,
-                 sample_rate=1.0,
-                 max_worker_per_file=2,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        boardsizes,
+        fixed_side_input,
+        apply_symmetry=False,
+        shuffle=False,
+        sample_rate=1.0,
+        max_worker_per_file=2,
+        **kwargs
+    ):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
@@ -48,7 +50,7 @@ class SparseNumpyDataset(IterableDataset):
         # Channel 2: oppo stones
         packed_data = packed_data[:, [1, 2]]
 
-        board_input_stm = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder='big')
+        board_input_stm = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder="big")
         board_input_stm = board_input_stm.reshape(length, 2, bsize, bsize).astype(np.int8)
         return board_input_stm
 
@@ -82,9 +84,17 @@ class SparseNumpyDataset(IterableDataset):
         feature_input_stm = feature_input_stm.reshape(length_u8, n_feature, bsize, bsize)
         return feature_input_stm
 
-    def _unpack_data(self, binaryInputNCHWPacked, globalInputNC, globalTargetsNC,
-                     policyTargetsNCHW, sparseInputNCHWU8, sparseInputNCHWU16, sparseInputDim,
-                     **kwargs):
+    def _unpack_data(
+        self,
+        binaryInputNCHWPacked,
+        globalInputNC,
+        globalTargetsNC,
+        policyTargetsNCHW,
+        sparseInputNCHWU8,
+        sparseInputNCHWU16,
+        sparseInputDim,
+        **kwargs
+    ):
         stm_input = self._unpack_global_feature(globalInputNC)
         board_input_stm = self._unpack_board_input(binaryInputNCHWPacked)
         value_target = self._unpack_global_target(globalTargetsNC)
@@ -94,12 +104,12 @@ class SparseNumpyDataset(IterableDataset):
         assert sparseInputDim.shape[0] == feature_input_stm.shape[1]
 
         return {
-            'board_input': board_input_stm,
-            'sparse_feature_input': feature_input_stm,
-            'sparse_feature_dim': sparseInputDim,
-            'stm_input': stm_input,
-            'value_target': value_target,
-            'policy_target': policy_target
+            "board_input": board_input_stm,
+            "sparse_feature_input": feature_input_stm,
+            "sparse_feature_dim": sparseInputDim,
+            "stm_input": stm_input,
+            "value_target": value_target,
+            "policy_target": policy_target,
         }, len(stm_input)
 
     def _prepare_entry_data(self, data_dict, index):
@@ -110,33 +120,32 @@ class SparseNumpyDataset(IterableDataset):
             else:
                 data[key] = data_dict[key][index]
 
-        data['board_size'] = data['board_input'].shape[1:]
-        if data['board_size'] not in self.boardsizes:
+        data["board_size"] = data["board_input"].shape[1:]
+        if data["board_size"] not in self.boardsizes:
             return None
-        data['board_size'] = np.array(data['board_size'], dtype=np.int8)
+        data["board_size"] = np.array(data["board_size"], dtype=np.int8)
 
         # Flip side when stm is white
-        if self.fixed_side_input and data['stm_input'] > 0:
-            data['board_input'] = np.flip(data['board_input'], axis=0).copy()
-            data['sparse_feature_input'] = np.take(data['sparse_feature_input'],
-                                                   [4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10],
-                                                   axis=0)
-            value_target = data['value_target']
+        if self.fixed_side_input and data["stm_input"] > 0:
+            data["board_input"] = np.flip(data["board_input"], axis=0).copy()
+            data["sparse_feature_input"] = np.take(
+                data["sparse_feature_input"], [4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10], axis=0
+            )
+            value_target = data["value_target"]
             value_target[0], value_target[1] = value_target[1], value_target[0]
 
         if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(data['board_size'])
+            symmetries = Symmetry.available_symmetries(data["board_size"])
             picked_symmetry = np.random.choice(symmetries)
-            data['board_input'] = picked_symmetry.apply_to_array(data['board_input'])
-            data['sparse_feature_input'] = picked_symmetry.apply_to_array(
-                data['sparse_feature_input'])
-            data['policy_target'] = picked_symmetry.apply_to_array(data['policy_target'])
+            data["board_input"] = picked_symmetry.apply_to_array(data["board_input"])
+            data["sparse_feature_input"] = picked_symmetry.apply_to_array(data["sparse_feature_input"])
+            data["policy_target"] = picked_symmetry.apply_to_array(data["policy_target"])
 
         # convert uint16 to int16, uint32 to int32 due to pytorch requirement
         # assert data['sparse_feature_input'].max() <= np.iinfo(np.int16).max
-        assert data['sparse_feature_dim'].max() <= np.iinfo(np.int32).max
-        data['sparse_feature_input'] = data['sparse_feature_input'].astype(np.int32)
-        data['sparse_feature_dim'] = data['sparse_feature_dim'].astype(np.int32)
+        assert data["sparse_feature_dim"].max() <= np.iinfo(np.int32).max
+        data["sparse_feature_input"] = data["sparse_feature_input"].astype(np.int32)
+        data["sparse_feature_dim"] = data["sparse_feature_dim"].astype(np.int32)
 
         return data
 
@@ -147,18 +156,22 @@ class SparseNumpyDataset(IterableDataset):
         worker_per_file = min(worker_num, self.max_worker_per_file)
         assert worker_num % worker_per_file == 0
 
-        for file_index in make_subset_range(len(self.file_list),
-                                            partition_num=worker_num // worker_per_file,
-                                            partition_idx=worker_id // worker_per_file,
-                                            shuffle=self.shuffle):
+        for file_index in make_subset_range(
+            len(self.file_list),
+            partition_num=worker_num // worker_per_file,
+            partition_idx=worker_id // worker_per_file,
+            shuffle=self.shuffle,
+        ):
             filename = self.file_list[file_index]
             data_dict, length = self._unpack_data(**np.load(filename))
 
-            for index in make_subset_range(length,
-                                           partition_num=worker_per_file,
-                                           partition_idx=worker_id % worker_per_file,
-                                           shuffle=self.shuffle,
-                                           sample_rate=self.sample_rate):
+            for index in make_subset_range(
+                length,
+                partition_num=worker_per_file,
+                partition_idx=worker_id % worker_per_file,
+                shuffle=self.shuffle,
+                sample_rate=self.sample_rate,
+            ):
                 data = self._prepare_entry_data(data_dict, index)
                 if data is not None:
                     yield data

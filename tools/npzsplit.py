@@ -6,11 +6,11 @@ from tqdm import tqdm
 
 def npz_split():
     parser = argparse.ArgumentParser(description="Split npz file into multiple npz chunks")
-    parser.add_argument('file', type=str, help="Npz file path")
-    parser.add_argument('-o', '--outdir', type=str, help="Output directory")
-    parser.add_argument('-s', '--splits', type=int, required=True, help="Number of splits")
-    parser.add_argument('--shuffle', action='store_true', help="Shuffle data before saving")
-    parser.add_argument('--exclude_keys', type=str, nargs='+', help="Exclude keys from splitting")
+    parser.add_argument("file", type=str, help="Npz file path")
+    parser.add_argument("-o", "--outdir", type=str, help="Output directory")
+    parser.add_argument("-s", "--splits", type=int, required=True, help="Number of splits")
+    parser.add_argument("--shuffle", action="store_true", help="Shuffle data before saving")
+    parser.add_argument("--exclude_keys", type=str, nargs="+", help="Exclude keys from splitting")
     args = parser.parse_args()
 
     outdir = args.outdir or os.path.dirname(args.file)
@@ -35,8 +35,7 @@ def npz_split():
         print(f"{key}: {data[key].shape} {data[key].dtype}")
         assert args.splits <= len(data[key]), "splits must be less than length of data array"
         if len(data[key]) % args.splits != 0:
-            print(f"Warning: array {key} of length {len(data[key])} "
-                  f"is not divisible by splits {args.splits}")
+            print(f"Warning: array {key} of length {len(data[key])} is not divisible by splits {args.splits}")
         data_to_split[key] = data[key]
     print()
 
@@ -51,9 +50,9 @@ def npz_split():
     for idx in tqdm(range(args.splits)):
         data_chunk = {}
         for key, array in data_to_split.items():
-            data_chunk[key] = array[idx::args.splits]
+            data_chunk[key] = array[idx :: args.splits]
         np.savez_compressed(make_filename(idx), **data_chunk)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     npz_split()

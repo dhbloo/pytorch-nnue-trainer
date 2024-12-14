@@ -9,24 +9,25 @@ from model import build_model
 
 
 def parse_args_and_init():
-    parser = configargparse.ArgParser(description="Test Play",
-                                      config_file_parser_class=configargparse.YAMLConfigFileParser)
-    parser.add('-c', '--config', is_config_file=True, help='Config file path')
-    parser.add('-p', '--checkpoint', required=True, help="Model checkpoint file to test")
-    parser.add('--use_cpu', action='store_true', help="Use cpu only")
-    parser.add('--model_type', required=True, help="Model type")
-    parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
-    parser.add('--board_width', type=int, default=15, help="Board width")
-    parser.add('--board_height', type=int, default=15, help="Board height")
+    parser = configargparse.ArgParser(
+        description="Test Play", config_file_parser_class=configargparse.YAMLConfigFileParser
+    )
+    parser.add("-c", "--config", is_config_file=True, help="Config file path")
+    parser.add("-p", "--checkpoint", required=True, help="Model checkpoint file to test")
+    parser.add("--use_cpu", action="store_true", help="Use cpu only")
+    parser.add("--model_type", required=True, help="Model type")
+    parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add("--board_width", type=int, default=15, help="Board width")
+    parser.add("--board_height", type=int, default=15, help="Board height")
 
     args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
-    print('-' * 60)
+    print("-" * 60)
 
     return args
 
 
-class Board():
+class Board:
     def __init__(self, board_width, board_height, fixed_side_input=False):
         self.board = np.zeros((2, board_height, board_width), dtype=np.int8)
         self.side_to_move = 0
@@ -72,26 +73,26 @@ class Board():
             board_input = self.board
 
         return {
-            'board_size': torch.tensor(self.board.shape, dtype=torch.int8),
-            'board_input': torch.from_numpy(board_input),
-            'stm_input': torch.FloatTensor([-1 if self.side_to_move == 0 else 1])
+            "board_size": torch.tensor(self.board.shape, dtype=torch.int8),
+            "board_input": torch.from_numpy(board_input),
+            "stm_input": torch.FloatTensor([-1 if self.side_to_move == 0 else 1]),
         }
 
     def __str__(self):
-        s = '   '
+        s = "   "
         for x in range(self.board.shape[2]):
-            s += chr(x + ord('A')) + ' '
-        s += '\n'
+            s += chr(x + ord("A")) + " "
+        s += "\n"
         for y in range(self.board.shape[1]):
-            s += f'{y + 1:2d} '
+            s += f"{y + 1:2d} "
             for x in range(self.board.shape[2]):
                 if self.board[0, y, x]:
-                    s += 'X '
+                    s += "X "
                 elif self.board[1, y, x]:
-                    s += 'O '
+                    s += "O "
                 else:
-                    s += '. '
-            s += '\n'
+                    s += ". "
+            s += "\n"
         return s
 
 
@@ -132,12 +133,12 @@ def input_move():
     if input_str == "":
         return None
     x, y = input_str[0].upper(), input_str[1:]
-    return ord(x) - ord('A'), int(y) - 1
+    return ord(x) - ord("A"), int(y) - 1
 
 
 def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_height, **kwargs):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
-        raise RuntimeError(f'Checkpoint {checkpoint} must be a valid file')
+        raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
 
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu)
@@ -147,9 +148,9 @@ def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_he
 
     # load checkpoint if exists
     state_dicts = torch.load(checkpoint, map_location=accelerator.device)
-    model.load_state_dict(state_dicts['model'])
-    epoch, it = state_dicts.get('epoch', 0), state_dicts.get('iteration', 0)
-    accelerator.print(f'Loaded from checkpoint: {checkpoint}, epoch: {epoch}, it: {it}')
+    model.load_state_dict(state_dicts["model"])
+    epoch, it = state_dicts.get("epoch", 0), state_dicts.get("iteration", 0)
+    accelerator.print(f"Loaded from checkpoint: {checkpoint}, epoch: {epoch}, it: {it}")
 
     # accelerate model testing
     model = accelerator.prepare(model)
@@ -167,8 +168,10 @@ def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_he
                 for key in data.keys():
                     data[key] = data[key].to(accelerator.device)
                 winrate, drawrate, move = next_move(board, model, data)
-                print(f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, " +
-                      f"bestmove: {chr(move[0] + ord('A'))}{move[1] + 1}")
+                print(
+                    f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, "
+                    + f"bestmove: {chr(move[0] + ord('A'))}{move[1] + 1}"
+                )
             board.move(*move)
 
 

@@ -19,7 +19,7 @@ def get_total_num_line_encoding(length):
 
 
 class LineEncodingMapping(nn.Module):
-    def __init__(self, dim_middle, dim_out, line_length=11, activation='silu'):
+    def __init__(self, dim_middle, dim_out, line_length=11, activation="silu"):
         super().__init__()
         self.line_length = line_length
         self.dim_middle = dim_middle
@@ -47,12 +47,15 @@ class LineEncodingMapping(nn.Module):
             f = torch.bitwise_and(f, 0b11)
             fs_indices.append(f)
         fs_indices = torch.stack(fs_indices, dim=-1)  # [..., line_length]
-        fs_onehot = torch.stack([
-            fs_indices == 0,
-            fs_indices == 1,
-            fs_indices == 2,
-            fs_indices == 3,
-        ], dim=-2)  # [..., 4, line_length]
+        fs_onehot = torch.stack(
+            [
+                fs_indices == 0,
+                fs_indices == 1,
+                fs_indices == 2,
+                fs_indices == 3,
+            ],
+            dim=-2,
+        )  # [..., 4, line_length]
         return fs_onehot.float()
 
     def forward_line_encoding(self, line_encoding):
@@ -63,7 +66,7 @@ class LineEncodingMapping(nn.Module):
             fs = self.act(conv1x1(fs))
             fs = self.act(conv(fs))
             fs = fs + fs_redisual
-        fs = fs[..., self.line_length // 2:self.line_length // 2 + 1]  # [N, dim_middle, 1]
+        fs = fs[..., self.line_length // 2 : self.line_length // 2 + 1]  # [N, dim_middle, 1]
         fs = torch.squeeze(fs, dim=-1)  # [N, dim_middle]
         fs = self.act(self.output_fc1(fs))  # [N, dim_middle]
         fs = self.output_fc2(fs)  # [N, dim_out]
@@ -71,8 +74,9 @@ class LineEncodingMapping(nn.Module):
 
     def forward(self, data):
         # Must be raw code
-        assert torch.all(data['line_encoding_total_num'] == self.total_num), \
-            "Incorrect total number of line encoding, must set raw_code=True"
+        assert torch.all(
+            data["line_encoding_total_num"] == self.total_num
+        ), "Incorrect total number of line encoding, must set raw_code=True"
         # line_encoding: [B, 4, H, W]
         # enc_unique: [N_unique, 4, line_length]
         # inv_indices: [B, 4, H, W]
@@ -84,15 +88,11 @@ class LineEncodingMapping(nn.Module):
         return fs
 
 
-@MODELS.register('linennuev1')
+@MODELS.register("linennuev1")
 class LineNNUEv1(nn.Module):
     LINE_LENGTH = 11
 
-    def __init__(self,
-                 dim_feature=64,
-                 dim_policy=32,
-                 dim_value=64,
-                 dim_dwconv=32):
+    def __init__(self, dim_feature=64, dim_policy=32, dim_value=64, dim_dwconv=32):
         super().__init__()
         self.model_size = (dim_feature, dim_policy, dim_value, dim_dwconv)
         self.line_encoding_total_num = get_total_num_line_encoding(self.LINE_LENGTH)
@@ -107,8 +107,8 @@ class LineNNUEv1(nn.Module):
             st=1,
             padding=3 // 2,
             groups=dim_dwconv,
-            activation='relu',
-            quant='pixel-dwconv-floor',
+            activation="relu",
+            quant="pixel-dwconv-floor",
             input_quant_scale=128,
             input_quant_bits=16,
             weight_quant_scale=65536,
@@ -120,8 +120,8 @@ class LineNNUEv1(nn.Module):
         # policy head (point-wise conv)
         dim_pm = self.policy_middle_dim = 16
         self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy * 2, activation='relu', quant=True),
-            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation='none', quant=True),
+            LinearBlock(dim_feature, dim_policy * 2, activation="relu", quant=True),
+            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation="none", quant=True),
         )
         self.policy_output = nn.Conv2d(dim_pm, 1, 1)
 
@@ -130,17 +130,17 @@ class LineNNUEv1(nn.Module):
         self.value_center = StarBlock(dim_feature, dim_value)
         self.value_quad = StarBlock(dim_value, dim_value)
         self.value_linear = nn.Sequential(
-            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, dim_value, activation='relu', quant=True),
-            LinearBlock(dim_value, 3, activation='none', quant=True),
+            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, 3, activation="none", quant=True),
         )
-        
+
     def custom_init(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
-        
+
     def get_feature(self, data):
         # get per-point 4-direction cell features
-        feature_index = data['line_encoding']  # [B, 4, H, W]
+        feature_index = data["line_encoding"]  # [B, 4, H, W]
         feature = self.mapping(feature_index)  # [B, 4, H, W, dim_feature]
         feature = torch.permute(feature, (0, 1, 4, 2, 3))  # [B, 4, dim_feature, H, W]
 
@@ -167,7 +167,7 @@ class LineNNUEv1(nn.Module):
         return feature
 
     def forward(self, data):
-        assert torch.all(data['line_encoding_total_num'] == self.line_encoding_total_num)
+        assert torch.all(data["line_encoding_total_num"] == self.line_encoding_total_num)
         _, dim_policy, _, _ = self.model_size
 
         # get feature from single side
@@ -205,15 +205,21 @@ class LineNNUEv1(nn.Module):
         # policy head
         dim_pm = self.policy_middle_dim
         pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
-        pwconv_weight = pwconv_output[:, :dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-        pwconv_weight = fake_quant(pwconv_weight, scale=128*128, num_bits=16, floor=True)
+        pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+        pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
         policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = torch.cat([
-            F.conv2d(input=policy.reshape(1, B * dim_policy, H, W),
-                     weight=pwconv_weight[:, dim_policy * i:dim_policy * (i + 1)],
-                     groups=B).reshape(B, 1, H, W) for i in range(dim_pm)
-        ], 1)
-        pwconv_bias = pwconv_output[:, dim_pm * dim_policy:].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(dim_pm)
+            ],
+            1,
+        )
+        pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
         policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
@@ -233,9 +239,9 @@ class LineNNUEv1(nn.Module):
             b = fake_quant(b, floor=True)
             c = fake_quant(c, floor=True)
             d = fake_quant(d, floor=True)
-            ab = fake_quant((a + b + 1/128) / 2, floor=True)
-            cd = fake_quant((c + d + 1/128) / 2, floor=True)
-            return fake_quant((ab + cd + 1/128) / 2, floor=True)
+            ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
+            cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
+            return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
 
         value_q00 = avg4(value_00, value_01, value_10, value_11)
         value_q01 = avg4(value_01, value_02, value_11, value_12)
@@ -246,10 +252,16 @@ class LineNNUEv1(nn.Module):
         value_q10 = self.value_quad(value_q10)
         value_q11 = self.value_quad(value_q11)
 
-        value = torch.cat([
-            feature_sum,
-            value_q00, value_q01, value_q10, value_q11,
-        ], 1)  # [B, dim_feature + dim_value * 4]
+        value = torch.cat(
+            [
+                feature_sum,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + dim_value * 4]
         value = self.value_linear(value)
 
         return value, policy
@@ -258,32 +270,32 @@ class LineNNUEv1(nn.Module):
     def weight_clipping(self):
         # Clip prelu weight of mapping activation to [-1,1] to avoid overflow
         # In this range, prelu is the same as `max(x, ax)`.
-        return [{
-            'params': ['feature_dwconv.conv.weight'],
-            'min_weight': -32768 / 65536,
-            'max_weight': 32767 / 65536
-        },
-        {
-            'params': ['value_corner.up1.fc.weight', 
-                       'value_corner.up2.fc.weight', 
-                       'value_corner.down.fc.weight', 
-                       'value_edge.up1.fc.weight', 
-                       'value_edge.up2.fc.weight', 
-                       'value_edge.down.fc.weight', 
-                       'value_center.up1.fc.weight', 
-                       'value_center.up2.fc.weight', 
-                       'value_center.down.fc.weight', 
-                       'value_quad.up1.fc.weight', 
-                       'value_quad.up2.fc.weight', 
-                       'value_quad.down.fc.weight', 
-                       'value_linear.0.fc.weight',
-                       'value_linear.1.fc.weight',
-                       'value_linear.2.fc.weight',
-                       'policy_pwconv_weight_linear.0.fc.weight',
-                       'policy_pwconv_weight_linear.1.fc.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {"params": ["feature_dwconv.conv.weight"], "min_weight": -32768 / 65536, "max_weight": 32767 / 65536},
+            {
+                "params": [
+                    "value_corner.up1.fc.weight",
+                    "value_corner.up2.fc.weight",
+                    "value_corner.down.fc.weight",
+                    "value_edge.up1.fc.weight",
+                    "value_edge.up2.fc.weight",
+                    "value_edge.down.fc.weight",
+                    "value_center.up1.fc.weight",
+                    "value_center.up2.fc.weight",
+                    "value_center.down.fc.weight",
+                    "value_quad.up1.fc.weight",
+                    "value_quad.up2.fc.weight",
+                    "value_quad.down.fc.weight",
+                    "value_linear.0.fc.weight",
+                    "value_linear.1.fc.weight",
+                    "value_linear.2.fc.weight",
+                    "policy_pwconv_weight_linear.0.fc.weight",
+                    "policy_pwconv_weight_linear.1.fc.weight",
+                ],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+        ]
 
     @property
     def name(self):

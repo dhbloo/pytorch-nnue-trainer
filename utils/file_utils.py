@@ -42,7 +42,7 @@ def ensure_dirs(paths):
         ensure_dir(paths)
 
 
-def find_latest_model_file(dirname, prefix, ext='.pth'):
+def find_latest_model_file(dirname, prefix, ext=".pth"):
     """
     Find latest file (with largest postfix) in a directory with prefix and ext.
 
@@ -53,7 +53,8 @@ def find_latest_model_file(dirname, prefix, ext='.pth'):
         return None
 
     model_list = [
-        os.path.join(dirname, f) for f in os.listdir(dirname)
+        os.path.join(dirname, f)
+        for f in os.listdir(dirname)
         if os.path.isfile(os.path.join(dirname, f)) and f.startswith(prefix) and f.endswith(ext)
     ]
     if len(model_list) == 0:
@@ -72,11 +73,11 @@ def get_iteration_from_model_filename(model_name):
     """
     if model_name is None:
         return None
-    
+
     model_name = os.path.basename(model_name)
     model_name = os.path.splitext(model_name)[0]
 
-    parts = model_name.split('_')
+    parts = model_name.split("_")
     for part in reversed(parts):
         if part.isdigit():
             return int(part)

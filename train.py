@@ -12,77 +12,73 @@ import os
 
 from dataset import build_dataset
 from model import build_model
-from utils.training_utils import build_lr_scheduler, cross_entropy_with_softlabel, \
-    build_optimizer, weights_init, build_data_loader, weight_clipping, state_dict_drop_size_unmatched
+from utils.training_utils import (
+    build_lr_scheduler,
+    cross_entropy_with_softlabel,
+    build_optimizer,
+    weights_init,
+    build_data_loader,
+    weight_clipping,
+    state_dict_drop_size_unmatched,
+)
 from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
 from utils.file_utils import find_latest_model_file, get_iteration_from_model_filename
 
 
 def parse_args_and_init():
-    parser = configargparse.ArgParser(description="Trainer",
-                                      config_file_parser_class=configargparse.YAMLConfigFileParser)
-    parser.add('-c', '--config', is_config_file=True, help='Config file path')
-    parser.add('-d', '--train_datas', nargs='+', help="Training dataset file or directory paths")
-    parser.add('-v', '--val_datas', nargs='+', help="Validation dataset file or directory paths")
-    parser.add('-r', '--rundir', required=True, help="Run directory")
-    parser.add('--load_from', help="Load pretrained weights from file")
-    parser.add('--use_cpu', action='store_true', help="Use cpu only")
-    parser.add('--dataset_type', required=True, help="Dataset type")
-    parser.add('--dataset_args', type=yaml.safe_load, default={}, help="Extra dataset arguments")
-    parser.add('--val_dataset_type', help="Validate Dataset type (If not set, then it's same as train set)")
-    parser.add('--val_dataset_args', type=yaml.safe_load, default={}, help="Extra validate dataset arguments")
-    parser.add('--dataloader_args',
-               type=yaml.safe_load,
-               default={},
-               help="Extra dataloader arguments")
-    parser.add('--data_pipelines',
-               type=yaml.safe_load,
-               default=None,
-               help="Data-pipeline type and arguments")
-    parser.add('--num_worker',
-               type=int,
-               default=min(8, os.cpu_count()),
-               help="Num of dataloader workers")
-    parser.add('--model_type', required=True, help="Model type")
-    parser.add('--model_args', type=yaml.safe_load, default={}, help="Extra model arguments")
-    parser.add('--optim_type', default='adamw', help='Optimizer type')
-    parser.add('--optim_args', type=yaml.safe_load, default={}, help="Extra optimizer arguments")
-    parser.add('--lr_scheduler_type', default='constant', help='LR scheduler type')
-    parser.add('--lr_scheduler_args',
-               type=yaml.safe_load,
-               default={},
-               help="Extra LR scheduler arguments")
-    parser.add('--init_type', default='kaiming', help='Initialization type')
-    parser.add('--loss_type', default='CE+CE', help='Loss type')
-    parser.add('--loss_args', type=yaml.safe_load, default={}, help="Extra loss arguments")
-    parser.add('--iterations', type=int, default=1000000, help="Num iterations")
-    parser.add('--batch_size', type=int, default=128, help="Batch size")
-    parser.add('--learning_rate', type=float, default=1e-3, help="Learning rate")
-    parser.add('--weight_decay', type=float, default=1e-7, help="Weight decay")
-    parser.add('--clip_grad_norm', type=float, help="Gradient clipping max norm")
-    parser.add('--clip_grad_value', type=float, help="Gradient clipping max value")
-    parser.add('--no_shuffle', action='store_true', help="Do not shuffle dataset")
-    parser.add('--seed', type=int, default=42, help="Random seed")
-    parser.add('--log_interval', type=int, default=100, help="Num iterations to log")
-    parser.add('--show_interval', type=int, default=1000, help="Num iterations to display")
-    parser.add('--save_interval', type=int, default=50000, help="Num iterations to save snapshot")
-    parser.add('--val_interval', type=int, default=50000, help="Num iterations to do validation")
-    parser.add('--avg_loss_interval', type=int, default=2500, help="Num iterations to average loss")
-    parser.add('--temp_save_interval', type=int, default=5000, 
-               help="Num iterations to save a temporary snapshot (removed when there is newer one)")
-    parser.add('--kd_model_type', help="Knowledge distillation model type")
-    parser.add('--kd_model_args',
-               type=yaml.safe_load,
-               default={},
-               help="Knowledge distillation extra model arguments")
-    parser.add('--kd_checkpoint', help="Knowledge distillation model checkpoint")
-    parser.add('--kd_T', type=float, default=1.0, help="Knowledge distillation temperature")
-    parser.add('--kd_alpha',
-               type=float,
-               default=1.0,
-               help="Distillation loss ratio in [0,1] (1 for distillation loss only)")
-    parser.add('--kd_use_train_mode', action='store_true', help="Set teacher to train mode")
-    parser.add('--find_unused_parameters', action='store_true', help="Enable find_unused_parameters in DDP")
+    parser = configargparse.ArgParser(
+        description="Trainer", config_file_parser_class=configargparse.YAMLConfigFileParser
+    )
+    parser.add("-c", "--config", is_config_file=True, help="Config file path")
+    parser.add("-d", "--train_datas", nargs="+", help="Training dataset file or directory paths")
+    parser.add("-v", "--val_datas", nargs="+", help="Validation dataset file or directory paths")
+    parser.add("-r", "--rundir", required=True, help="Run directory")
+    parser.add("--load_from", help="Load pretrained weights from file")
+    parser.add("--use_cpu", action="store_true", help="Use cpu only")
+    parser.add("--dataset_type", required=True, help="Dataset type")
+    parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add("--val_dataset_type", help="Validate Dataset type (If not set, then it's same as train set)")
+    parser.add("--val_dataset_args", type=yaml.safe_load, default={}, help="Extra validate dataset arguments")
+    parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
+    parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline type and arguments")
+    parser.add("--num_worker", type=int, default=min(8, os.cpu_count()), help="Num of dataloader workers")
+    parser.add("--model_type", required=True, help="Model type")
+    parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add("--optim_type", default="adamw", help="Optimizer type")
+    parser.add("--optim_args", type=yaml.safe_load, default={}, help="Extra optimizer arguments")
+    parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
+    parser.add("--lr_scheduler_args", type=yaml.safe_load, default={}, help="Extra LR scheduler arguments")
+    parser.add("--init_type", default="kaiming", help="Initialization type")
+    parser.add("--loss_type", default="CE+CE", help="Loss type")
+    parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
+    parser.add("--iterations", type=int, default=1000000, help="Num iterations")
+    parser.add("--batch_size", type=int, default=128, help="Batch size")
+    parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
+    parser.add("--weight_decay", type=float, default=1e-7, help="Weight decay")
+    parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
+    parser.add("--clip_grad_value", type=float, help="Gradient clipping max value")
+    parser.add("--no_shuffle", action="store_true", help="Do not shuffle dataset")
+    parser.add("--seed", type=int, default=42, help="Random seed")
+    parser.add("--log_interval", type=int, default=100, help="Num iterations to log")
+    parser.add("--show_interval", type=int, default=1000, help="Num iterations to display")
+    parser.add("--save_interval", type=int, default=50000, help="Num iterations to save snapshot")
+    parser.add("--val_interval", type=int, default=50000, help="Num iterations to do validation")
+    parser.add("--avg_loss_interval", type=int, default=2500, help="Num iterations to average loss")
+    parser.add(
+        "--temp_save_interval",
+        type=int,
+        default=5000,
+        help="Num iterations to save a temporary snapshot (removed when there is newer one)",
+    )
+    parser.add("--kd_model_type", help="Knowledge distillation model type")
+    parser.add("--kd_model_args", type=yaml.safe_load, default={}, help="Knowledge distillation extra model arguments")
+    parser.add("--kd_checkpoint", help="Knowledge distillation model checkpoint")
+    parser.add("--kd_T", type=float, default=1.0, help="Knowledge distillation temperature")
+    parser.add(
+        "--kd_alpha", type=float, default=1.0, help="Distillation loss ratio in [0,1] (1 for distillation loss only)"
+    )
+    parser.add("--kd_use_train_mode", action="store_true", help="Set teacher to train mode")
+    parser.add("--find_unused_parameters", action="store_true", help="Enable find_unused_parameters in DDP")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -92,22 +88,24 @@ def parse_args_and_init():
     if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
         parser.write_config_file(args, [run_cfg_filename])
     seed_everything(args.seed)  # set seed
-    print('-' * 60)
+    print("-" * 60)
 
     return args
 
 
-def calc_loss(loss_type,
-              data,
-              results,
-              kd_results=None,
-              kd_T=None,
-              kd_alpha=None,
-              policy_reg_lambda=None,
-              value_policy_ratio=1,
-              ignore_forbidden_point_policy=False,
-              **extra_args):
-    value_loss_type, policy_loss_type = loss_type.split('+')
+def calc_loss(
+    loss_type,
+    data,
+    results,
+    kd_results=None,
+    kd_T=None,
+    kd_alpha=None,
+    policy_reg_lambda=None,
+    value_policy_ratio=1,
+    ignore_forbidden_point_policy=False,
+    **extra_args,
+):
+    value_loss_type, policy_loss_type = loss_type.split("+")
 
     # get predicted value and policy from model results
     value, policy, *retvals = results
@@ -119,8 +117,8 @@ def calc_loss(loss_type,
         value_target, policy_target, *kd_retvals = kd_results
     else:
         # get value and poliay target from data
-        value_target = data['value_target']
-        policy_target = data['policy_target']
+        value_target = data["value_target"]
+        policy_target = data["policy_target"]
 
     # reshape policy
     policy_target = torch.flatten(policy_target, start_dim=1)
@@ -143,20 +141,21 @@ def calc_loss(loss_type,
     if value.size(1) == 1:
         value = value[:, 0]  # squeeze value channel dim
         if value_target.size(1) == 1:
-            value_target = value_target[:, 0]   # squeeze value channel dim
+            value_target = value_target[:, 0]  # squeeze value channel dim
         else:
             value_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2  # in [0, 1]
 
     # ===============================================================
     # value loss
     def get_value_loss(value: torch.Tensor):
-        if value_loss_type == 'CE':
+        if value_loss_type == "CE":
             if value.ndim == 1:
-                return (F.binary_cross_entropy_with_logits(value, value_target) -
-                        F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target))
+                loss_bce = F.binary_cross_entropy_with_logits(value, value_target)
+                base_bce = F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target)
+                return loss_bce - base_bce
             else:
                 return cross_entropy_with_softlabel(value, value_target, adjust=True)
-        elif value_loss_type == 'MSE':
+        elif value_loss_type == "MSE":
             if value.ndim == 1:
                 return F.mse_loss(torch.sigmoid(value), value_target)
             else:
@@ -165,33 +164,30 @@ def calc_loss(loss_type,
                 winrate_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2
                 return F.mse_loss(winrate, winrate_target)
         else:
-            assert 0, f"Unsupported value loss: {value_loss_type}"
+            raise ValueError(f"Unsupported value loss: {value_loss_type}")
 
     # ===============================================================
     # policy loss
     def get_policy_loss(policy: torch.Tensor):
         # check if there is loss weight for policy at each empty cells
         if ignore_forbidden_point_policy:
-            forbidden_point = torch.flatten(data['forbidden_point'], start_dim=1)  # [B, H*W]
+            forbidden_point = torch.flatten(data["forbidden_point"], start_dim=1)  # [B, H*W]
             policy_loss_weight = 1.0 - forbidden_point.float()  # [B, H*W]
         else:
             policy_loss_weight = None
 
-        if policy_loss_type == 'CE':
-            return cross_entropy_with_softlabel(policy,
-                                                policy_target,
-                                                adjust=True,
-                                                weight=policy_loss_weight)
-        elif policy_loss_type == 'MSE':
+        if policy_loss_type == "CE":
+            return cross_entropy_with_softlabel(policy, policy_target, adjust=True, weight=policy_loss_weight)
+        elif policy_loss_type == "MSE":
             policy_softmaxed = torch.softmax(policy, dim=1)
-            policy_loss = F.mse_loss(policy_softmaxed, policy_target, reduction='none')
+            policy_loss = F.mse_loss(policy_softmaxed, policy_target, reduction="none")
             if policy_loss_weight is not None:
                 policy_loss = policy_loss * policy_loss_weight
             return torch.mean(policy_loss)
-        elif policy_loss_type == 'NONE':
+        elif policy_loss_type == "NONE":
             return torch.tensor(0.0, device=policy.device)
         else:
-            assert 0, f"Unsupported policy loss: {policy_loss_type}"
+            raise ValueError(f"Unsupported policy loss: {policy_loss_type}")
 
     # ===============================================================
     # value uncertainty loss
@@ -201,7 +197,7 @@ def calc_loss(loss_type,
 
         if value.ndim == 1:
             winrate = torch.sigmoid(value)  # [B]
-            winrate_target = value_target   # [B]
+            winrate_target = value_target  # [B]
         else:
             value = torch.softmax(value, dim=1)  # [B, 3]
             # compute winrate in [0, 1] from 3-tuple value
@@ -216,15 +212,16 @@ def calc_loss(loss_type,
         uncertainty_gt = get_value_uncertainty_gt(value)
         uncertainty_loss = F.huber_loss(uncertainty, uncertainty_gt)  # [B]
         return uncertainty_loss
-    
-    def get_value_relative_uncertainty_loss(relative_uncertainty: torch.Tensor,
-                                            value_smallnet: torch.Tensor,
-                                            value_largenet: torch.Tensor):
+
+    def get_value_relative_uncertainty_loss(
+        relative_uncertainty: torch.Tensor, value_smallnet: torch.Tensor, value_largenet: torch.Tensor
+    ):
         uncertainty_gt_smallnet = get_value_uncertainty_gt(value_smallnet)
         uncertainty_gt_largenet = get_value_uncertainty_gt(value_largenet)
-        relative_uncertainty_gt = torch.where(uncertainty_gt_largenet < uncertainty_gt_smallnet, 
-                                              uncertainty_gt_largenet / uncertainty_gt_smallnet, 
-                                              1.0)
+        relative_uncertainty_gt = uncertainty_gt_largenet / uncertainty_gt_smallnet
+        relative_uncertainty_gt = torch.where(
+            uncertainty_gt_largenet < uncertainty_gt_smallnet, relative_uncertainty_gt, 1.0
+        )
         relative_uncertainty_loss = F.mse_loss(relative_uncertainty, relative_uncertainty_gt)
         return relative_uncertainty_loss
 
@@ -236,38 +233,38 @@ def calc_loss(loss_type,
     policy_lambda = 2 / (value_policy_ratio + 1)
     total_loss = value_lambda * value_loss + policy_lambda * policy_loss
     loss_dict = {
-        'value_loss': value_loss.detach(),
-        'policy_loss': policy_loss.detach(),
+        "value_loss": value_loss.detach(),
+        "policy_loss": policy_loss.detach(),
     }
 
     if policy_reg_lambda is not None:
         policy_reg = torch.mean(policy).square()
         total_loss += float(policy_reg_lambda) * policy_reg
-        loss_dict['policy_reg'] = policy_reg.detach()
+        loss_dict["policy_reg"] = policy_reg.detach()
 
     if aux_losses is not None:
         for aux_loss_name, aux_loss in aux_losses.items():
             # use pre-defined loss terms if aux_loss is a tuple of (string, inputs)
             if isinstance(aux_loss, tuple) and len(aux_loss) == 2:
                 aux_loss_type, aux_loss_input = aux_loss
-                if aux_loss_type == 'value_loss':
+                if aux_loss_type == "value_loss":
                     aux_loss = get_value_loss(aux_loss_input)
-                elif aux_loss_type == 'policy_loss':
+                elif aux_loss_type == "policy_loss":
                     aux_loss = get_policy_loss(aux_loss_input)
-                elif aux_loss_type == 'value_uncertainty_loss':
+                elif aux_loss_type == "value_uncertainty_loss":
                     aux_loss = get_value_uncertainty_loss(*aux_loss_input)
-                elif aux_loss_type == 'value_relative_uncertainty_loss':
+                elif aux_loss_type == "value_relative_uncertainty_loss":
                     aux_loss = get_value_relative_uncertainty_loss(*aux_loss_input)
                 else:
-                    assert 0, f"Unsupported predefined aux loss: {aux_loss}"
+                    raise ValueError(f"Unsupported predefined aux loss: {aux_loss}")
 
-            if f'{aux_loss_name}_lambda' in extra_args:
-                aux_loss_weight = float(extra_args[f'{aux_loss_name}_lambda'])
+            if f"{aux_loss_name}_lambda" in extra_args:
+                aux_loss_weight = float(extra_args[f"{aux_loss_name}_lambda"])
             else:
                 aux_loss_weight = 1.0
 
             total_loss += aux_loss * aux_loss_weight
-            loss_dict[f'{aux_loss_name}_loss'] = aux_loss.detach()
+            loss_dict[f"{aux_loss_name}_loss"] = aux_loss.detach()
 
     if kd_results is not None:
         # also get a true loss from real data
@@ -282,7 +279,7 @@ def calc_loss(loss_type,
 
         # merge real loss and knowledge distillation loss
         total_loss = kd_alpha * total_loss * (kd_T**2) + (1 - kd_alpha) * real_loss
-        kd_loss_dict = {'kd_' + k: v for k, v in loss_dict.items()}
+        kd_loss_dict = {"kd_" + k: v for k, v in loss_dict.items()}
         loss_dict = real_loss_dict
         loss_dict.update(kd_loss_dict)
 
@@ -291,17 +288,54 @@ def calc_loss(loss_type,
         for aux_name, aux_output in aux_outputs.items():
             aux_outputs_dict[aux_name] = aux_output.detach()
 
-    loss_dict['total_loss'] = total_loss.detach()
+    loss_dict["total_loss"] = total_loss.detach()
     return total_loss, loss_dict, aux_outputs_dict
 
 
-def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_type, dataset_args,
-                  val_dataset_type, val_dataset_args, dataloader_args, data_pipelines, model_type, 
-                  model_args, optim_type, optim_args, lr_scheduler_type, lr_scheduler_args, init_type, 
-                  loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
-                  clip_grad_norm, clip_grad_value, no_shuffle, log_interval, show_interval, save_interval,
-                  val_interval, avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, 
-                  kd_checkpoint, kd_T, kd_alpha, kd_use_train_mode, find_unused_parameters, **kwargs):
+def training_loop(
+    rundir,
+    load_from,
+    use_cpu,
+    train_datas,
+    val_datas,
+    dataset_type,
+    dataset_args,
+    val_dataset_type,
+    val_dataset_args,
+    dataloader_args,
+    data_pipelines,
+    model_type,
+    model_args,
+    optim_type,
+    optim_args,
+    lr_scheduler_type,
+    lr_scheduler_args,
+    init_type,
+    loss_type,
+    loss_args,
+    iterations,
+    batch_size,
+    num_worker,
+    learning_rate,
+    weight_decay,
+    clip_grad_norm,
+    clip_grad_value,
+    no_shuffle,
+    log_interval,
+    show_interval,
+    save_interval,
+    val_interval,
+    avg_loss_interval,
+    temp_save_interval,
+    kd_model_type,
+    kd_model_args,
+    kd_checkpoint,
+    kd_T,
+    kd_alpha,
+    kd_use_train_mode,
+    find_unused_parameters,
+    **kwargs,
+):
     # use accelerator
     dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)
@@ -309,64 +343,59 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
-        log_filename = os.path.join(rundir, 'training_log.json')
+        log_filename = os.path.join(rundir, "training_log.json")
 
     # load train and validation dataset
-    train_dataset = build_dataset(dataset_type,
-                                  train_datas,
-                                  shuffle=not no_shuffle,
-                                  pipeline_args=data_pipelines,
-                                  **dataset_args)
-    train_loader = build_data_loader(train_dataset,
-                                     batch_size,
-                                     num_workers=num_worker,
-                                     shuffle=not no_shuffle,
-                                     **dataloader_args)
+    train_dataset = build_dataset(
+        dataset_type, train_datas, shuffle=not no_shuffle, pipeline_args=data_pipelines, **dataset_args
+    )
+    train_loader = build_data_loader(
+        train_dataset, batch_size, num_workers=num_worker, shuffle=not no_shuffle, **dataloader_args
+    )
     if val_datas:
-        val_dataset = build_dataset(dataset_type if val_dataset_type is None else val_dataset_type,
-                                    val_datas,
-                                    shuffle=False,
-                                    pipeline_args=data_pipelines,
-                                    **(dataset_args if val_dataset_type is None else val_dataset_args))
-        val_loader = build_data_loader(val_dataset,
-                                       batch_size,
-                                       num_workers=num_worker,
-                                       shuffle=False,
-                                       **dataloader_args)
+        val_dataset = build_dataset(
+            dataset_type if val_dataset_type is None else val_dataset_type,
+            val_datas,
+            shuffle=False,
+            pipeline_args=data_pipelines,
+            **(dataset_args if val_dataset_type is None else val_dataset_args),
+        )
+        val_loader = build_data_loader(
+            val_dataset, batch_size, num_workers=num_worker, shuffle=False, **dataloader_args
+        )
     else:
         val_dataset, val_loader = None, None
 
     # build model, optimizer
     model = build_model(model_type, **model_args)
-    optimizer = build_optimizer(optim_type,
-                                model.parameters(),
-                                lr=learning_rate,
-                                weight_decay=weight_decay,
-                                **optim_args)
+    optimizer = build_optimizer(
+        optim_type, model.parameters(), lr=learning_rate, weight_decay=weight_decay, **optim_args
+    )
 
     # load checkpoint if exists
     model_name = model.name
     ckpt_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
     if ckpt_filename:
         state_dicts = torch.load(ckpt_filename, map_location=accelerator.device)
-        model.load_state_dict(state_dicts['model'])
-        optimizer.load_state_dict(state_dicts['optimizer'])
-        accelerator.print(f'Loaded from checkpoint: {ckpt_filename}')
-        it = state_dicts.get('iteration', 0)
-        epoch = state_dicts.get('epoch', 0)
-        rows = state_dicts.get('rows', 0)
+        model.load_state_dict(state_dicts["model"])
+        optimizer.load_state_dict(state_dicts["optimizer"])
+        accelerator.print(f"Loaded from checkpoint: {ckpt_filename}")
+        it = state_dicts.get("iteration", 0)
+        epoch = state_dicts.get("epoch", 0)
+        rows = state_dicts.get("rows", 0)
     else:
         model.apply(weights_init(init_type))
         it, epoch, rows = 0, 0, 0
         if load_from is not None:
             state_dicts = torch.load(load_from, map_location=accelerator.device)
             missing_keys, unexpected_keys = model.load_state_dict(
-                state_dict_drop_size_unmatched(model, state_dicts['model']), strict=False)
+                state_dict_drop_size_unmatched(model, state_dicts["model"]), strict=False
+            )
             if len(unexpected_keys) > 0:
                 accelerator.print(f"unexpected keys in state_dict: {', '.join(unexpected_keys)}")
             if len(missing_keys) > 0:
                 accelerator.print(f"missing keys in state_dict: {', '.join(missing_keys)}")
-            accelerator.print(f'Loaded from pretrained: {load_from}')
+            accelerator.print(f"Loaded from pretrained: {load_from}")
 
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
@@ -377,8 +406,8 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
     if kd_model_type is not None:
         kd_model = build_model(kd_model_type, **kd_model_args)
         kd_state_dicts = torch.load(kd_checkpoint, map_location=accelerator.device)
-        kd_model.load_state_dict(kd_state_dicts['model'])
-        accelerator.print(f'Loaded teacher model {kd_model.name} from: {kd_checkpoint}')
+        kd_model.load_state_dict(kd_state_dicts["model"])
+        accelerator.print(f"Loaded teacher model {kd_model.name} from: {kd_checkpoint}")
 
         kd_model = accelerator.prepare_model(kd_model)
         if kd_use_train_mode:
@@ -389,18 +418,15 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
         # add kd_T into loss_args dict
         assert kd_T is not None, f"kd_T must be set when knowledge distillation is enabled"
         assert kd_alpha is not None and (0 <= kd_alpha <= 1), f"kd_alpha must be in [0,1]"
-        loss_args['kd_T'] = kd_T
-        loss_args['kd_alpha'] = kd_alpha
+        loss_args["kd_T"] = kd_T
+        loss_args["kd_alpha"] = kd_alpha
     else:
         kd_model = None
 
     # build lr scheduler
-    lr_scheduler = build_lr_scheduler(optimizer,
-                                      lr_scheduler_type,
-                                      last_it=it - 1,
-                                      **lr_scheduler_args)
+    lr_scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, last_it=it - 1, **lr_scheduler_args)
 
-    accelerator.print(f'Start training from iteration {it}, epoch {epoch}')
+    accelerator.print(f"Start training from iteration {it}, epoch {epoch}")
     last_it = it
     last_time = time.time()
     stop_training = False
@@ -414,14 +440,14 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
             if it > iterations:
                 stop_training = True
                 break
-            data['train_progress'] = it / iterations
+            data["train_progress"] = it / iterations
 
             # evaulate teacher model for knowledge distillation
             with torch.no_grad():
                 kd_results = kd_model(data) if kd_model is not None else None
 
             # apply weight clipping if needed
-            if hasattr(accelerator.unwrap_model(model), 'weight_clipping'):
+            if hasattr(accelerator.unwrap_model(model), "weight_clipping"):
                 unwarpped_model = accelerator.unwrap_model(model)
                 clip_parameters = unwarpped_model.weight_clipping
                 weight_clipping(unwarpped_model.named_parameters(), clip_parameters)
@@ -454,19 +480,21 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
 
             # logging
             if it % log_interval == 0 and accelerator.is_local_main_process:
-                log_value_dict(tb_logger, 'train', loss_dict, it, rows)
+                log_value_dict(tb_logger, "train", loss_dict, it, rows)
                 if aux_dict:
-                    log_value_dict(tb_logger, 'train_aux', aux_dict, it, rows)
-                with open(log_filename, 'a') as log:
-                    json_text = json.dumps({
-                        'it': it,
-                        'epoch': epoch,
-                        'rows': rows,
-                        'train_loss': loss_dict,
-                        'train_aux': aux_dict,
-                        'lr': lr_scheduler.get_last_lr()[0],
-                    })
-                    log.writelines([json_text, '\n'])
+                    log_value_dict(tb_logger, "train_aux", aux_dict, it, rows)
+                with open(log_filename, "a") as log:
+                    json_text = json.dumps(
+                        {
+                            "it": it,
+                            "epoch": epoch,
+                            "rows": rows,
+                            "train_loss": loss_dict,
+                            "train_aux": aux_dict,
+                            "lr": lr_scheduler.get_last_lr()[0],
+                        }
+                    )
+                    log.writelines([json_text, "\n"])
 
             # display current progress
             if it % show_interval == 0 and accelerator.is_local_main_process:
@@ -474,24 +502,30 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                 num_it = it - last_it
                 speed = num_it / elasped
                 log_value_dict(
-                    tb_logger, 'running_stat', {
-                        'epoch': epoch,
-                        'rows': rows,
-                        'elasped_seconds': elasped,
-                        'it/s': speed,
-                        'entry/s': speed * batch_size,
-                        'lr': lr_scheduler.get_last_lr()[0],
-                    }, it, rows)
-                print(f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]" +
-                      f" total: {loss_dict['total_loss']:.4f}," +
-                      f" value: {loss_dict['value_loss']:.4f}," +
-                      f" policy: {loss_dict['policy_loss']:.4f}")
+                    tb_logger,
+                    "running_stat",
+                    {
+                        "epoch": epoch,
+                        "rows": rows,
+                        "elasped_seconds": elasped,
+                        "it/s": speed,
+                        "entry/s": speed * batch_size,
+                        "lr": lr_scheduler.get_last_lr()[0],
+                    },
+                    it,
+                    rows,
+                )
+                print(
+                    f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]"
+                    + f" total: {loss_dict['total_loss']:.4f},"
+                    + f" value: {loss_dict['value_loss']:.4f},"
+                    + f" policy: {loss_dict['policy_loss']:.4f}"
+                )
                 last_it = it
                 last_time = time.time()
 
             # snapshot saving
-            if (it % save_interval == 0 or it % temp_save_interval == 0) \
-                and accelerator.is_local_main_process:
+            if (it % save_interval == 0 or it % temp_save_interval == 0) and accelerator.is_local_main_process:
                 # get latest snapshot filename
                 last_snapshot_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
 
@@ -504,8 +538,10 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         "rows": rows,
                         "model": accelerator.get_state_dict(model),
                         "optimizer": optimizer.state_dict(),
-                    }, snapshot_filename)
-                
+                    },
+                    snapshot_filename,
+                )
+
                 # remove last temporary snapshot if it's not a snapshot iteration
                 if last_snapshot_filename is not None:
                     last_snapshot_iter = get_iteration_from_model_filename(last_snapshot_filename)
@@ -525,22 +561,22 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                         kd_results = kd_model(val_data) if kd_model is not None else None
                         # model evaluation
                         results = model(val_data)
-                        _, val_losses, val_auxs = calc_loss(loss_type, val_data, results,
-                                                            kd_results, **loss_args)
+                        _, val_losses, val_auxs = calc_loss(loss_type, val_data, results, kd_results, **loss_args)
                         add_dict_to(val_loss_dict, val_losses)
                         add_dict_to(val_aux_dict, val_auxs)
                         num_val_batches += 1
                 model.train()
 
                 # gather all loss dict across processes
-                val_loss_dict['num_val_batches'] = torch.LongTensor([num_val_batches
-                                                                     ]).to(accelerator.device)
+                val_loss_dict["num_val_batches"] = torch.tensor(
+                    [num_val_batches], dtype=torch.long, device=accelerator.device
+                )
                 all_val_loss_dict = accelerator.gather(val_loss_dict)
                 all_val_aux_dict = accelerator.gather(val_aux_dict)
 
                 if accelerator.is_local_main_process:
                     # average all losses
-                    num_val_batches_tensor = all_val_loss_dict.pop('num_val_batches')
+                    num_val_batches_tensor = all_val_loss_dict.pop("num_val_batches")
                     num_val_batches = torch.sum(num_val_batches_tensor).item()
                     val_loss_dict, val_aux_dict = {}, {}
                     for k, loss_tensor in all_val_loss_dict.items():
@@ -551,23 +587,27 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                     val_elasped = time.time() - val_start_time
                     num_val_entries = num_val_batches * batch_size
                     # log validation results
-                    log_value_dict(tb_logger, 'validation', val_loss_dict, it, rows)
+                    log_value_dict(tb_logger, "validation", val_loss_dict, it, rows)
                     if val_aux_dict:
-                        log_value_dict(tb_logger, 'validation_aux', val_aux_dict, it, rows)
-                    with open(log_filename, 'a') as log:
-                        json_text = json.dumps({
-                            'it': it,
-                            'epoch': epoch,
-                            'val_loss': val_loss_dict,
-                            'val_aux': val_aux_dict,
-                            'num_val_entries': num_val_entries,
-                            'elasped_seconds': val_elasped,
-                        })
-                        log.writelines([json_text, '\n'])
-                    print(f"[validation][{num_val_entries} entries][{val_elasped:.2f}s]" +
-                          f" total: {val_loss_dict['total_loss']:.4f}," +
-                          f" value: {val_loss_dict['value_loss']:.4f}," +
-                          f" policy: {val_loss_dict['policy_loss']:.4f}")
+                        log_value_dict(tb_logger, "validation_aux", val_aux_dict, it, rows)
+                    with open(log_filename, "a") as log:
+                        json_text = json.dumps(
+                            {
+                                "it": it,
+                                "epoch": epoch,
+                                "val_loss": val_loss_dict,
+                                "val_aux": val_aux_dict,
+                                "num_val_entries": num_val_entries,
+                                "elasped_seconds": val_elasped,
+                            }
+                        )
+                        log.writelines([json_text, "\n"])
+                    print(
+                        f"[validation][{num_val_entries} entries][{val_elasped:.2f}s]"
+                        + f" total: {val_loss_dict['total_loss']:.4f},"
+                        + f" value: {val_loss_dict['value_loss']:.4f},"
+                        + f" policy: {val_loss_dict['policy_loss']:.4f}"
+                    )
 
                     # substract validation time from training time
                     last_time += val_elasped

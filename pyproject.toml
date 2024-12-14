@@ -5,3 +5,5 @@ exclude = [
     "data",
     "run_dirs",
 ]
+[tool.black]
+line-length = 109

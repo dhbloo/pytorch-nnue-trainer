@@ -3,41 +3,41 @@ import torch.nn as nn
 
 
 def build_input_plane(input_type):
-    if input_type == 'basic':
+    if input_type == "basic":
         return BasicInputPlane(with_stm=True)
-    elif input_type == 'basic-nostm' or input_type == 'basicns':
+    elif input_type == "basic-nostm" or input_type == "basicns":
         return BasicInputPlane(with_stm=False)
-    elif input_type.startswith('pcode'):
+    elif input_type.startswith("pcode"):
         input_type = input_type[5:]
-        if input_type.endswith('-nostm'):
+        if input_type.endswith("-nostm"):
             with_stm = False
             input_type = input_type[:-6]
         else:
             with_stm = True
         feature_dim = int(input_type)
         return PatternCodeEmbeddingInputPlane(feature_dim, with_stm=with_stm)
-    elif input_type.startswith('combpat'):
+    elif input_type.startswith("combpat"):
         input_type = input_type[7:]
-        if input_type.endswith('-nostm'):
+        if input_type.endswith("-nostm"):
             with_stm = False
             input_type = input_type[:-6]
         else:
             with_stm = True
         feature_dim = int(input_type)
         return CombPatEmbeddingInputPlane(feature_dim, with_stm=with_stm)
-    elif input_type.startswith('linepat'):
+    elif input_type.startswith("linepat"):
         input_type = input_type[7:]
-        if input_type.endswith('-nostm'):
+        if input_type.endswith("-nostm"):
             with_stm = False
             input_type = input_type[:-6]
         else:
             with_stm = True
         feature_dim = int(input_type)
         return LinePatEmbeddingInputPlane(feature_dim, with_stm=with_stm)
-    elif input_type == 'raw':
+    elif input_type == "raw":
         return lambda x: x  # identity transform
     else:
-        assert 0, f"Unsupported input: {input_type}"
+        raise ValueError(f"Unsupported input: {input_type}")
 
 
 class BasicInputPlane(nn.Module):
@@ -46,8 +46,8 @@ class BasicInputPlane(nn.Module):
         self.with_stm = with_stm
 
     def forward(self, data):
-        board_input = data['board_input'].float()
-        stm_input = data['stm_input']
+        board_input = data["board_input"].float()
+        stm_input = data["stm_input"]
         assert stm_input.dtype == torch.float32
 
         if self.with_stm:
@@ -73,16 +73,16 @@ class PatternCodeEmbeddingInputPlane(BasicInputPlane):
         self.pcode_embedding = nn.Embedding(num_embeddings=pcode_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data['sparse_feature_dim'][:, 10:12])
+        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
 
         # convert sparse input to dense feature through embedding
-        pcode_sparse_input = data['sparse_feature_input'][:, [10, 11]].int()  # [B, 2, H, W]
+        pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
         pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
         pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
 
         # mask out feature at non-empty cell
-        board_input = data['board_input']  # [B, 2, H, W]
+        board_input = data["board_input"]  # [B, 2, H, W]
         non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         pcode_feature = torch.masked_fill(pcode_feature, non_empty_mask, 0)
@@ -109,16 +109,16 @@ class CombPatEmbeddingInputPlane(BasicInputPlane):
         self.p4_embedding = nn.Embedding(num_embeddings=p4_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        assert torch.all(self.p4_dim == data['sparse_feature_dim'][:, 8:10])
+        assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
 
         # convert sparse input to dense feature through embedding
-        p4_sparse_input = data['sparse_feature_input'][:, [8, 9]].int()  # [B, 2, H, W]
+        p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
         p4_feature = self.p4_embedding(p4_sparse_input)  # [B, 2, H, W, feature_dim]
         p4_feature = torch.sum(p4_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         p4_feature = torch.permute(p4_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
 
         # mask out feature at non-empty cell
-        board_input = data['board_input']  # [B, 2, H, W]
+        board_input = data["board_input"]  # [B, 2, H, W]
         non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         p4_feature = torch.masked_fill(p4_feature, non_empty_mask, 0)
@@ -145,20 +145,18 @@ class LinePatEmbeddingInputPlane(BasicInputPlane):
         self.p_embedding = nn.Embedding(num_embeddings=p_dim, embedding_dim=feature_dim)
 
     def forward(self, data):
-        assert torch.all(self.p_dim == data['sparse_feature_dim'][:, 0:8])
+        assert torch.all(self.p_dim == data["sparse_feature_dim"][:, 0:8])
 
         # convert sparse input to dense feature through embedding
-        p_sparse_input = data['sparse_feature_input'][:, 0:8].int()  # [B, 8, H, W]
+        p_sparse_input = data["sparse_feature_input"][:, 0:8].int()  # [B, 8, H, W]
         p_feature = self.p_embedding(p_sparse_input)  # [B, 8, H, W, feature_dim]
-        p_feature_self = torch.permute(p_feature[:, 0:4],
-                                       (0, 2, 3, 1, 4)).flatten(3)  # [B, H, W, 4*feature_dim]
-        p_feature_oppo = torch.permute(p_feature[:, 4:8],
-                                       (0, 2, 3, 1, 4)).flatten(3)  # [B, H, W, 4*feature_dim]
+        p_feature_self = torch.permute(p_feature[:, 0:4], (0, 2, 3, 1, 4)).flatten(3)  # [B, H, W, 4*feature_dim]
+        p_feature_oppo = torch.permute(p_feature[:, 4:8], (0, 2, 3, 1, 4)).flatten(3)  # [B, H, W, 4*feature_dim]
         p_feature = p_feature_self + p_feature_oppo  # [B, H, W, 4*feature_dim]
         p_feature = torch.permute(p_feature, (0, 3, 1, 2))  # [B, 4*feature_dim, H, W]
 
         # mask out feature at non-empty cell
-        board_input = data['board_input']  # [B, 2, H, W]
+        board_input = data["board_input"]  # [B, 2, H, W]
         non_empty_mask = board_input[:, 0] + board_input[:, 1] > 0  # [B, H, W]
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         p_feature = torch.masked_fill(p_feature, non_empty_mask, 0)

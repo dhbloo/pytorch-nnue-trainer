@@ -13,29 +13,29 @@ from . import DATASETS
 
 class EntryHead(ctypes.Structure):
     _fields_ = [
-        ('boardSize', ctypes.c_uint32, 5),
-        ('rule', ctypes.c_uint32, 3),
-        ('result', ctypes.c_uint32, 4),
-        ('totalPly', ctypes.c_uint32, 10),
-        ('initPly', ctypes.c_uint32, 10),
-        ('gameTag', ctypes.c_uint32, 14),
-        ('moveCount', ctypes.c_uint32, 18),
+        ("boardSize", ctypes.c_uint32, 5),
+        ("rule", ctypes.c_uint32, 3),
+        ("result", ctypes.c_uint32, 4),
+        ("totalPly", ctypes.c_uint32, 10),
+        ("initPly", ctypes.c_uint32, 10),
+        ("gameTag", ctypes.c_uint32, 14),
+        ("moveCount", ctypes.c_uint32, 18),
     ]
 
 
 class EntryMove(ctypes.Structure):
     _fields_ = [
-        ('isFirst', ctypes.c_uint16, 1),
-        ('isLast', ctypes.c_uint16, 1),
-        ('isNoEval', ctypes.c_uint16, 1),
-        ('isPass', ctypes.c_uint16, 1),
-        ('reserved', ctypes.c_uint16, 2),
-        ('move', ctypes.c_uint16, 10),
-        ('eval', ctypes.c_int16),
+        ("isFirst", ctypes.c_uint16, 1),
+        ("isLast", ctypes.c_uint16, 1),
+        ("isNoEval", ctypes.c_uint16, 1),
+        ("isPass", ctypes.c_uint16, 1),
+        ("reserved", ctypes.c_uint16, 2),
+        ("move", ctypes.c_uint16, 10),
+        ("eval", ctypes.c_int16),
     ]
 
 
-class MoveData():
+class MoveData:
     def __init__(self):
         self.moves = []
         self.evals = []
@@ -66,7 +66,7 @@ class MoveData():
         self.evals.append(eval)
 
 
-class EntryData():
+class EntryData:
     def __init__(
         self,
         boardsize: int,
@@ -98,8 +98,9 @@ def read_entry(f: io.RawIOBase) -> EntryData:
     f.readinto(pos_array)
     position = [Move((m >> 5) & 31, m & 31) for m in pos_array]
 
-    entry = EntryData(int(ehead.boardSize), Rule(ehead.rule), Result(ehead.result),
-                      int(ehead.totalPly), int(ehead.gameTag), position)
+    entry = EntryData(
+        int(ehead.boardSize), Rule(ehead.rule), Result(ehead.result), int(ehead.totalPly), int(ehead.gameTag), position
+    )
 
     for _ in range(int(ehead.moveCount)):
         emove = EntryMove()
@@ -109,26 +110,28 @@ def read_entry(f: io.RawIOBase) -> EntryData:
     return entry
 
 
-@DATASETS.register('packed_binary')
+@DATASETS.register("packed_binary")
 class PackedBinaryDataset(IterableDataset):
-    FILE_EXTS = ['.lz4', '.binpack']
+    FILE_EXTS = [".lz4", ".binpack"]
 
-    def __init__(self,
-                 file_list,
-                 rules,
-                 boardsizes,
-                 fixed_side_input,
-                 has_pass_move=False,
-                 value_lambda=0.0,
-                 dynamic_value_lambda=True,
-                 multipv_temperature=0.03,
-                 use_mate_multipv=False,
-                 winrate_model=None,
-                 apply_symmetry=False,
-                 shuffle=False,
-                 sample_rate=1.0,
-                 max_worker_per_file=2,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        rules,
+        boardsizes,
+        fixed_side_input,
+        has_pass_move=False,
+        value_lambda=0.0,
+        dynamic_value_lambda=True,
+        multipv_temperature=0.03,
+        use_mate_multipv=False,
+        winrate_model=None,
+        apply_symmetry=False,
+        shuffle=False,
+        sample_rate=1.0,
+        max_worker_per_file=2,
+        **kwargs
+    ):
         super().__init__()
         self.file_list = file_list
         self.rules = rules
@@ -165,17 +168,19 @@ class PackedBinaryDataset(IterableDataset):
 
         # single bestmove
         move, besteval = movedata[0]
-        if len(movedata) == 1 or self.multipv_temperature == 0.0 \
-            or any(ev is None for ev in movedata.evals) \
-            or (not self.use_mate_multipv and besteval >= self.winrate_model.eval_mate_threshold):
+        if (
+            len(movedata) == 1
+            or self.multipv_temperature == 0.0
+            or any(ev is None for ev in movedata.evals)
+            or (not self.use_mate_multipv and besteval >= self.winrate_model.eval_mate_threshold)
+        ):
             if move is None and self.has_pass_move:
                 policy[-1] = 1.0
             else:
                 policy[move.y * W + move.x] = 1.0
         # multipv
         else:
-            winrates = np.array([self.winrate_model.eval_to_winrate(ev) for ev in movedata.evals],
-                                dtype=np.float32)
+            winrates = np.array([self.winrate_model.eval_to_winrate(ev) for ev in movedata.evals], dtype=np.float32)
             winrates_exp = np.exp(winrates / self.multipv_temperature)
             winrates_softmax = winrates_exp / np.sum(winrates_exp)
             for i, (move, _) in enumerate(movedata):
@@ -213,8 +218,7 @@ class PackedBinaryDataset(IterableDataset):
         # make value target
         if self.fixed_side_input and not stm_is_black:
             result = Result.opposite(result)
-        wld_result = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW],
-                              dtype=np.float32)
+        wld_result = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.float32)
         if self.value_lambda == 0:
             value_target = wld_result
         else:
@@ -243,22 +247,19 @@ class PackedBinaryDataset(IterableDataset):
 
         return {
             # global info
-            'board_size': np.array(boardsize, dtype=np.int8),  # H, W
-            'rule': str(rule),
-
+            "board_size": np.array(boardsize, dtype=np.int8),  # H, W
+            "rule": str(rule),
             # inputs
-            'board_input': board_input,  # [C, H, W], C=(Black,White)
-            'stm_input': -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
-
+            "board_input": board_input,  # [C, H, W], C=(Black,White)
+            "stm_input": -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
             # targets
-            'value_target': value_target,  # [3] (Black Win, White Win, Draw)
-            'policy_target': policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
-
+            "value_target": value_target,  # [3] (Black Win, White Win, Draw)
+            "policy_target": policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
             # other infos
-            'position_string': "".join([str(m) for m in position]),
-            'last_move': position[-1].pos,
-            'ply': ply,
-            'raw_eval': float('nan') if eval is None else float(eval),
+            "position_string": "".join([str(m) for m in position]),
+            "last_move": position[-1].pos,
+            "ply": ply,
+            "raw_eval": float("nan") if eval is None else float(eval),
         }
 
     def _process_entry(self, entry: EntryData) -> list[dict]:
@@ -278,8 +279,9 @@ class PackedBinaryDataset(IterableDataset):
 
             # random skip data according to sample rate
             if random.random() < self.sample_rate:
-                data = self._prepare_data(current_result, boardsize, entry.rule,
-                                          game_stage, current_position, movedata)
+                data = self._prepare_data(
+                    current_result, boardsize, entry.rule, game_stage, current_position, movedata
+                )
                 data_list.append(data)
 
             current_result = Result.opposite(current_result)
@@ -294,13 +296,15 @@ class PackedBinaryDataset(IterableDataset):
         worker_per_file = min(worker_num, self.max_worker_per_file)
         assert worker_num % worker_per_file == 0
 
-        for file_index in make_subset_range(len(self.file_list),
-                                            partition_num=worker_num // worker_per_file,
-                                            partition_idx=worker_id // worker_per_file,
-                                            shuffle=self.shuffle):
+        for file_index in make_subset_range(
+            len(self.file_list),
+            partition_num=worker_num // worker_per_file,
+            partition_idx=worker_id // worker_per_file,
+            shuffle=self.shuffle,
+        ):
             filename = self.file_list[file_index]
             with self._open_binary_file(filename) as f:
-                while f.peek() != b'':
+                while f.peek() != b"":
                     data_list = self._process_entry(read_entry(f))
                     for data in data_list:
                         yield data

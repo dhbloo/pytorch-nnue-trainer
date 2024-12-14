@@ -9,92 +9,94 @@ from torch.utils.data.dataloader import DataLoader
 
 
 def weights_init(init_type):
-    '''Generate a init function given a init type'''
+    """Generate a init function given a init type"""
+
     def init_fun(m):
         classname = m.__class__.__name__
         # First we check if the layer has custom init method.
         # If so, we just call it without our uniform initialization.
-        if hasattr(m, 'custom_init'):
+        if hasattr(m, "custom_init"):
             m.custom_init()
         # Call our unifrom initialization methods for all Conv and Linear layers
-        elif (classname.startswith('Conv') or classname.startswith('Linear')) \
-            and hasattr(m, 'weight'):
-            if init_type == 'gaussian':
+        elif (classname.startswith("Conv") or classname.startswith("Linear")) and hasattr(m, "weight"):
+            if init_type == "gaussian":
                 init.normal_(m.weight.data, 0.0, 0.02)
-            elif init_type == 'xavier':
+            elif init_type == "xavier":
                 init.xavier_normal_(m.weight.data, gain=math.sqrt(2))
-            elif init_type == 'kaiming':
-                init.kaiming_normal_(m.weight.data, a=0, mode='fan_in')
-            elif init_type == 'orthogonal':
+            elif init_type == "kaiming":
+                init.kaiming_normal_(m.weight.data, a=0, mode="fan_in")
+            elif init_type == "orthogonal":
                 init.orthogonal_(m.weight.data, gain=math.sqrt(2))
-            elif init_type == 'normal':
+            elif init_type == "normal":
                 init.normal_(m.weight.data, 0.0, 0.02)
-            elif init_type == 'default':
+            elif init_type == "default":
                 pass
             else:
-                assert 0, f"Unsupported initialization: {init_type}"
+                raise ValueError(f"Unsupported initialization: {init_type}")
 
-            if hasattr(m, 'bias') and m.bias is not None:
+            if hasattr(m, "bias") and m.bias is not None:
                 init.constant_(m.bias.data, 0.0)
 
     return init_fun
 
 
 def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
-    if optim_type == 'adamw':
-        opt = optim.AdamW(parameters,
-                          lr=lr,
-                          betas=(kwargs.get('beta1', 0.9), kwargs.get('beta2', 0.999)),
-                          eps=1e-8,
-                          weight_decay=weight_decay)
-    elif optim_type == 'adamw-ams':
-        opt = optim.AdamW(parameters,
-                          lr=lr,
-                          betas=(kwargs.get('beta1', 0.9), kwargs.get('beta2', 0.999)),
-                          eps=1e-8,
-                          weight_decay=weight_decay,
-                          amsgrad=True)
-    elif optim_type == 'sgd':
+    if optim_type == "adamw":
+        opt = optim.AdamW(
+            parameters,
+            lr=lr,
+            betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
+            eps=1e-8,
+            weight_decay=weight_decay,
+        )
+    elif optim_type == "adamw-ams":
+        opt = optim.AdamW(
+            parameters,
+            lr=lr,
+            betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
+            eps=1e-8,
+            weight_decay=weight_decay,
+            amsgrad=True,
+        )
+    elif optim_type == "sgd":
         opt = optim.SGD(parameters, lr=lr, momentum=0, dampening=0, weight_decay=weight_decay)
-    elif optim_type == 'sgd_momentum':
-        opt = optim.SGD(parameters,
-                        lr=lr,
-                        momentum=kwargs.get('momentum', 0.9),
-                        dampening=kwargs.get('dampening', 0.1),
-                        weight_decay=weight_decay)
+    elif optim_type == "sgd_momentum":
+        opt = optim.SGD(
+            parameters,
+            lr=lr,
+            momentum=kwargs.get("momentum", 0.9),
+            dampening=kwargs.get("dampening", 0.1),
+            weight_decay=weight_decay,
+        )
     else:
-        assert 0, f"Unsupported optimizer: {optim_type}"
+        raise ValueError(f"Unsupported optimizer: {optim_type}")
 
     return opt
 
 
-def build_lr_scheduler(optimizer, lr_schedule_type='constant', last_it=-1, **kwargs):
-    if lr_schedule_type == 'constant':
-        scheduler = optim.lr_scheduler.ConstantLR(optimizer,
-                                                  factor=1.0,
-                                                  total_iters=0,
-                                                  last_epoch=last_it)
-    elif lr_schedule_type == 'step':
-        step_size = kwargs.get('step_size', 50000)
-        step_gamma = kwargs.get('step_gamma', 0.9)
-        scheduler = optim.lr_scheduler.StepLR(optimizer,
-                                              step_size=step_size,
-                                              gamma=step_gamma,
-                                              last_epoch=last_it)
+def build_lr_scheduler(optimizer, lr_schedule_type="constant", last_it=-1, **kwargs):
+    if lr_schedule_type == "constant":
+        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0, last_epoch=last_it)
+    elif lr_schedule_type == "step":
+        step_size = kwargs.get("step_size", 50000)
+        step_gamma = kwargs.get("step_gamma", 0.9)
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=step_gamma, last_epoch=last_it)
     else:
-        assert 0, f"Unsupported lr scheduler: {lr_schedule_type}"
+        raise ValueError(f"Unsupported lr scheduler: {lr_schedule_type}")
 
     return scheduler
 
 
-def build_data_loader(dataset,
-                      batch_size=1,
-                      shuffle=False,
-                      shuffle_buffer_size=10000,
-                      num_workers=0,
-                      drop_last=True,
-                      batch_by_boardsize=False,
-                      **kwargs):
+def build_data_loader(
+    dataset,
+    batch_size=1,
+    shuffle=False,
+    shuffle_buffer_size=10000,
+    num_workers=0,
+    drop_last=True,
+    batch_by_boardsize=False,
+    **kwargs,
+):
     if shuffle and isinstance(dataset, IterableDataset):
         # Warp non shuffleable dataset with ShuffleDataset
         if not dataset.is_internal_shuffleable:
@@ -102,35 +104,35 @@ def build_data_loader(dataset,
         shuffle = False
 
     if batch_by_boardsize:
-        assert isinstance(dataset, IterableDataset), \
-            "batch_by_boardsize must be used with IterableDataset"
+        assert isinstance(dataset, IterableDataset), "batch_by_boardsize must be used with IterableDataset"
         dataset = BatchByBoardSizeDataset(dataset, batch_size)
 
-    dataloader = DataLoader(dataset,
-                            batch_size,
-                            shuffle=shuffle,
-                            num_workers=num_workers,
-                            drop_last=drop_last,
-                            persistent_workers=(num_workers > 0),
-                            **kwargs)
+    dataloader = DataLoader(
+        dataset,
+        batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        persistent_workers=(num_workers > 0),
+        **kwargs,
+    )
     return dataloader
 
 
 def weight_clipping(named_parameters, clip_parameters):
     named_parameters = dict(named_parameters)
     for group in clip_parameters:
-        min_weight = group['min_weight']
-        max_weight = group['max_weight']
-        for i, param_name in enumerate(group['params']):
+        min_weight = group["min_weight"]
+        max_weight = group["max_weight"]
+        for i, param_name in enumerate(group["params"]):
             p = named_parameters[param_name]
             p_data_fp32 = p.data
-            if 'virtual_params' in group:
-                virtual_param_name = group['virtual_params'][i]
+            if "virtual_params" in group:
+                virtual_param_name = group["virtual_params"][i]
                 virtual_param = named_parameters[virtual_param_name]
-                virtual_param = virtual_param.repeat(*[
-                    p_data_fp32.shape[i] // virtual_param.shape[i]
-                    for i in range(virtual_param.ndim)
-                ])
+                virtual_param = virtual_param.repeat(
+                    *[p_data_fp32.shape[i] // virtual_param.shape[i] for i in range(virtual_param.ndim)]
+                )
                 min_weight_t = p_data_fp32.new_full(p_data_fp32.shape, min_weight) - virtual_param
                 p_data_fp32 = torch.max(p_data_fp32, min_weight_t)
                 max_weight_t = p_data_fp32.new_full(p_data_fp32.shape, max_weight) - virtual_param
@@ -140,13 +142,13 @@ def weight_clipping(named_parameters, clip_parameters):
             p.data.copy_(p_data_fp32)
 
 
-def cross_entropy_with_softlabel(input, target, reduction='mean', adjust=False, weight=None):
+def cross_entropy_with_softlabel(input, target, reduction="mean", adjust=False, weight=None):
     """
     :param input: (batch, *)
     :param target: (batch, *) same shape as input,
         each item must be a valid distribution: target[i, :].sum() == 1.
     :param adjust: subtract soft-label bias from the loss
-    :param weight: (batch, *) same shape as input, 
+    :param weight: (batch, *) same shape as input,
         if not none, a weight is specified for each loss item
     """
     input = input.view(input.shape[0], -1)
@@ -167,14 +169,14 @@ def cross_entropy_with_softlabel(input, target, reduction='mean', adjust=False, 
         bias = torch.sum(bias, dim=1)
         batchloss += bias
 
-    if reduction == 'none':
+    if reduction == "none":
         return batchloss
-    elif reduction == 'mean':
+    elif reduction == "mean":
         return torch.mean(batchloss)
-    elif reduction == 'sum':
+    elif reduction == "sum":
         return torch.sum(batchloss)
     else:
-        assert 0, f'Unsupported reduction mode {reduction}.'
+        raise ValueError(f"Unsupported reduction mode {reduction}.")
 
 
 class ShuffleDataset(IterableDataset):
@@ -220,7 +222,7 @@ class BatchByBoardSizeDataset(IterableDataset):
             while True:
                 try:
                     data = next(dataset_iter)
-                    board_size = tuple(data['board_size'])
+                    board_size = tuple(data["board_size"])
                     if board_size not in boardsize_to_databuf:
                         boardsize_to_databuf[board_size] = []
                     databuf = boardsize_to_databuf[board_size]
@@ -234,9 +236,9 @@ class BatchByBoardSizeDataset(IterableDataset):
                     break  # discard last incomplete batch for all board size
         except GeneratorExit:
             pass
-        
-        
-def state_dict_drop_size_unmatched(model : torch.nn.Module, loaded_state_dict : dict) -> dict:
+
+
+def state_dict_drop_size_unmatched(model: torch.nn.Module, loaded_state_dict: dict) -> dict:
     """
     Drop key and values from loaded_state_dict that have shape
     unmatched with the current model's parameters.

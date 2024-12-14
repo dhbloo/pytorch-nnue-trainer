@@ -1,7 +1,7 @@
 import numpy as np
 
 
-class WinrateModel():
+class WinrateModel:
     def __init__(self, scaling_factor=200, eval_mate_threshold=29000, soft_mate_winrate=True):
         self.scaling_factor = scaling_factor
         self.eval_mate_threshold = eval_mate_threshold

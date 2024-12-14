@@ -10,15 +10,24 @@ from . import DATASETS
 
 
 class Entry(ctypes.Structure):
-    _fields_ = [('result', ctypes.c_uint16, 2), ('ply', ctypes.c_uint16, 9),
-                ('boardsize', ctypes.c_uint16, 5), ('rule', ctypes.c_uint16, 3),
-                ('move', ctypes.c_uint16, 13), ('position', ctypes.c_uint16 * 1024)]
+    _fields_ = [
+        ("result", ctypes.c_uint16, 2),
+        ("ply", ctypes.c_uint16, 9),
+        ("boardsize", ctypes.c_uint16, 5),
+        ("rule", ctypes.c_uint16, 3),
+        ("move", ctypes.c_uint16, 13),
+        ("position", ctypes.c_uint16 * 1024),
+    ]
 
 
 class EntryHead(ctypes.Structure):
-    _fields_ = [('result', ctypes.c_uint16, 2), ('ply', ctypes.c_uint16, 9),
-                ('boardsize', ctypes.c_uint16, 5), ('rule', ctypes.c_uint16, 3),
-                ('move', ctypes.c_uint16, 13)]
+    _fields_ = [
+        ("result", ctypes.c_uint16, 2),
+        ("ply", ctypes.c_uint16, 9),
+        ("boardsize", ctypes.c_uint16, 5),
+        ("rule", ctypes.c_uint16, 3),
+        ("move", ctypes.c_uint16, 13),
+    ]
 
 
 def write_entry(
@@ -38,7 +47,7 @@ def write_entry(
     for i, m in enumerate(position):
         entry.position[i] = m.value
 
-    f.write(bytearray(entry)[:4 + 2 * len(position)])
+    f.write(bytearray(entry)[: 4 + 2 * len(position)])
 
 
 def read_entry(f: io.RawIOBase) -> tuple[Result, int, int, Rule, Move, list[Move]]:
@@ -58,20 +67,22 @@ def read_entry(f: io.RawIOBase) -> tuple[Result, int, int, Rule, Move, list[Move
     return result, ply, boardsize, rule, move, position
 
 
-@DATASETS.register('simple_binary')
+@DATASETS.register("simple_binary")
 class SimpleBinaryDataset(IterableDataset):
-    FILE_EXTS = ['.lz4', '.bin']
+    FILE_EXTS = [".lz4", ".bin"]
 
-    def __init__(self,
-                 file_list,
-                 rules,
-                 boardsizes,
-                 fixed_side_input,
-                 apply_symmetry=False,
-                 shuffle=False,
-                 sample_rate=1.0,
-                 max_worker_per_file=2,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        rules,
+        boardsizes,
+        fixed_side_input,
+        apply_symmetry=False,
+        shuffle=False,
+        sample_rate=1.0,
+        max_worker_per_file=2,
+        **kwargs
+    ):
         super().__init__()
         self.file_list = file_list
         self.rules = rules
@@ -124,8 +135,7 @@ class SimpleBinaryDataset(IterableDataset):
 
         if self.fixed_side_input and not stm_is_black:
             result = Result.opposite(result)
-        value_target = np.array(
-            [result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.int8)
+        value_target = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.int8)
 
         policy_target = np.zeros(boardsize, dtype=np.int8)
         policy_target[move.y, move.x] = 1
@@ -139,21 +149,18 @@ class SimpleBinaryDataset(IterableDataset):
 
         return {
             # global info
-            'board_size': np.array(boardsize, dtype=np.int8),  # H, W
-            'rule': str(rule),
-
+            "board_size": np.array(boardsize, dtype=np.int8),  # H, W
+            "rule": str(rule),
             # inputs
-            'board_input': board_input,  # [C, H, W], C=(Black,White)
-            'stm_input': -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
-
+            "board_input": board_input,  # [C, H, W], C=(Black,White)
+            "stm_input": -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
             # targets
-            'value_target': value_target,  # [3] (Black Win, White Win, Draw)
-            'policy_target': policy_target,  # [H, W]
-
+            "value_target": value_target,  # [3] (Black Win, White Win, Draw)
+            "policy_target": policy_target,  # [H, W]
             # other infos
-            'position_string': "".join([str(m) for m in position]),
-            'last_move': position[-1].pos,
-            'ply': ply,
+            "position_string": "".join([str(m) for m in position]),
+            "last_move": position[-1].pos,
+            "ply": ply,
         }
 
     def __iter__(self):
@@ -163,13 +170,15 @@ class SimpleBinaryDataset(IterableDataset):
         worker_per_file = min(worker_num, self.max_worker_per_file)
         assert worker_num % worker_per_file == 0
 
-        for file_index in make_subset_range(len(self.file_list),
-                                            partition_num=worker_num // worker_per_file,
-                                            partition_idx=worker_id // worker_per_file,
-                                            shuffle=self.shuffle):
+        for file_index in make_subset_range(
+            len(self.file_list),
+            partition_num=worker_num // worker_per_file,
+            partition_idx=worker_id // worker_per_file,
+            shuffle=self.shuffle,
+        ):
             filename = self.file_list[file_index]
             with self._open_binary_file(filename) as f:
-                while f.peek() != b'':
+                while f.peek() != b"":
                     data = self._prepare_data_from_entry(*read_entry(f))
 
                     # random skip data according to sample rate

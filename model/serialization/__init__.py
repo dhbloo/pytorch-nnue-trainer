@@ -6,7 +6,8 @@ from datetime import datetime
 
 class BaseSerializer(ABC):
     """The base class for all model serializer."""
-    def __init__(self, rules=['freestyle'], boardsizes=[15], description=None) -> None:
+
+    def __init__(self, rules=["freestyle"], boardsizes=[15], description=None) -> None:
         super().__init__()
         self._rules = rules
         self._boardsizes = boardsizes
@@ -19,7 +20,7 @@ class BaseSerializer(ABC):
     def is_binary(self) -> bool:
         """Whether this serializer outputs binary data."""
         return True
-    
+
     @property
     def needs_header(self) -> bool:
         """Whether binary header is needed before the serializer output."""
@@ -28,11 +29,11 @@ class BaseSerializer(ABC):
     def rule_mask(self, model) -> int:
         """Applicable rule for serialized weight file."""
         rule_mask = 0
-        if 'freestyle' in self._rules:
+        if "freestyle" in self._rules:
             rule_mask |= 1
-        if 'standard' in self._rules:
+        if "standard" in self._rules:
             rule_mask |= 2
-        if 'renju' in self._rules:
+        if "renju" in self._rules:
             rule_mask |= 4
         return rule_mask
 
@@ -46,7 +47,7 @@ class BaseSerializer(ABC):
 
     def description(self, model) -> str:
         """Description of serialized weight file."""
-        return f'model={model.name}; {self._description}'
+        return f"model={model.name}; {self._description}"
 
     @abstractmethod
     def arch_hash(self, model) -> int:
@@ -59,7 +60,7 @@ class BaseSerializer(ABC):
         raise NotImplementedError()
 
 
-SERIALIZERS = Register('serialization')
+SERIALIZERS = Register("serialization")
 import_submodules(__name__, recursive=False)
 
 

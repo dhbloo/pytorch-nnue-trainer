@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 
 class BasePipeline(ABC):
     """The base class for all dataset pipeline."""
+
     def __init__(self) -> None:
         super().__init__()
 
@@ -18,7 +19,7 @@ class BasePipeline(ABC):
         raise NotImplementedError()
 
 
-PIPELINES = Register('pipeline')
+PIPELINES = Register("pipeline")
 import_submodules(__name__, recursive=False)
 
 
@@ -85,4 +86,4 @@ def warp_dataset_with_pipeline(dataset, pipeline_args):
     elif isinstance(dataset, Dataset):
         return DatasetPipelineWrapper(dataset, build_data_pipeline(pipeline_args))
     else:
-        assert 0, "Unsupported dataset type"
+        raise ValueError(f"Unsupported dataset type, {type(dataset)}")

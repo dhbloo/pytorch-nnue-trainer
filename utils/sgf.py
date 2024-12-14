@@ -84,6 +84,7 @@ class GameTree(object):
         class _:
             def __iter__(_):
                 return NodeIterator(self.nodes[0].next)
+
         if self.nodes[0].next:
             return _()
         else:
@@ -182,7 +183,7 @@ class Parser:
             if state == 0:
                 if whitespace(ch):
                     state = 0
-                elif ch == '(':
+                elif ch == "(":
                     self.start_gametree()
                     state = 1
                 else:

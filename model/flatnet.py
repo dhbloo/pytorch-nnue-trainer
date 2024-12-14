@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 try:
     from collections.abc import Iterable
 except ImportError:
@@ -13,23 +14,19 @@ from .vq import VectorQuantize
 from utils.quant_utils import fake_quant
 
 
-@MODELS.register('flat_nnue_v1')
+@MODELS.register("flat_nnue_v1")
 class FlatNNUEv1(nn.Module):
-    def __init__(self, flat_board_size, dim_policy=16, dim_value=32, input_type='basic-nostm'):
+    def __init__(self, flat_board_size, dim_policy=16, dim_value=32, input_type="basic-nostm"):
         super().__init__()
         if isinstance(flat_board_size, Iterable):
-            assert len(
-                flat_board_size
-            ) == 2, f"flat_board_size should be a list of length 2, got {flat_board_size}"
+            assert len(flat_board_size) == 2, f"flat_board_size should be a list of length 2, got {flat_board_size}"
             flat_board_size = flat_board_size[0] * flat_board_size[1]
         self.model_size = (dim_policy, dim_value)
         self.flat_board_size = flat_board_size
         dim_embed = dim_policy + dim_value
 
         self.input_plane = build_input_plane(input_type)
-        self.embed = LinearBlock(flat_board_size * self.input_plane.dim_plane,
-                                 dim_embed,
-                                 activation="none")
+        self.embed = LinearBlock(flat_board_size * self.input_plane.dim_plane, dim_embed, activation="none")
 
         # policy head
         if dim_policy > 0:
@@ -58,9 +55,7 @@ class FlatNNUEv1(nn.Module):
             policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, flat_board_size]
         else:
-            policy = torch.zeros((feature.shape[0], self.flat_board_size),
-                                 dtype=feature.dtype,
-                                 device=feature.device)
+            policy = torch.zeros((feature.shape[0], self.flat_board_size), dtype=feature.dtype, device=feature.device)
 
         # value head
         value = self.value(feature[:, dim_policy:])  # [B, 3]
@@ -77,7 +72,7 @@ class LadderConvLayer(nn.Module):
     def __init__(self, dim_in, dim_out):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
-        self.bias = nn.Parameter(torch.zeros((dim_out, )))
+        self.bias = nn.Parameter(torch.zeros((dim_out,)))
         nn.init.kaiming_normal_(self.weight)
 
     def forward(self, x):
@@ -90,14 +85,9 @@ class LadderConvLayer(nn.Module):
         return F.conv2d(x, weight, self.bias, padding=0)
 
 
-@MODELS.register('flat_ladder7x7_nnue_v1')
+@MODELS.register("flat_ladder7x7_nnue_v1")
 class FlatLadder7x7NNUEv1(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_policy=16,
-                 dim_value=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.value_no_draw = value_no_draw
@@ -127,12 +117,14 @@ class FlatLadder7x7NNUEv1(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_value, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_value, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def get_feature_sum(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
@@ -171,9 +163,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7),
-                                 dtype=feature.dtype,
-                                 device=feature.device)
+            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
 
         # value head
         value = feature[:, dim_policy:]  # [B, dim_value]
@@ -196,9 +186,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7),
-                                 dtype=feature.dtype,
-                                 device=feature.device)
+            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
 
         # value head
         value = feature[:, dim_policy:]  # [B, dim_value]
@@ -214,9 +202,9 @@ class FlatLadder7x7NNUEv1(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
@@ -226,14 +214,9 @@ class FlatLadder7x7NNUEv1(nn.Module):
         return f"flat_ladder7x7_nnue_v1_{m}m{p}p{v}v"
 
 
-@MODELS.register('flat_ladder7x7_nnue_v2')
+@MODELS.register("flat_ladder7x7_nnue_v2")
 class FlatLadder7x7NNUEv2(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_policy=16,
-                 dim_value=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.value_no_draw = value_no_draw
@@ -251,12 +234,14 @@ class FlatLadder7x7NNUEv2(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_value, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_value, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_ladder_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -321,9 +306,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7),
-                                 dtype=feature.dtype,
-                                 device=feature.device)
+            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
 
         # value head
         value = feature[:, dim_policy:]  # [B, dim_value]
@@ -346,9 +329,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7),
-                                 dtype=feature.dtype,
-                                 device=feature.device)
+            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
 
         # value head
         value = feature[:, dim_policy:]  # [B, dim_value]
@@ -364,9 +345,9 @@ class FlatLadder7x7NNUEv2(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
@@ -376,14 +357,16 @@ class FlatLadder7x7NNUEv2(nn.Module):
         return f"flat_ladder7x7_nnue_v2_{m}m{p}p{v}v"
 
 
-@MODELS.register('flat_ladder7x7_nnue_v3')
+@MODELS.register("flat_ladder7x7_nnue_v3")
 class FlatLadder7x7NNUEv3(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_global_feature=128,
-                 dim_conv_feature=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_global_feature=128,
+        dim_conv_feature=32,
+        input_type="basic-nostm",
+        value_no_draw=False,
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_global_feature, dim_conv_feature)
         self.value_no_draw = value_no_draw
@@ -394,11 +377,13 @@ class FlatLadder7x7NNUEv3(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_global_feature + dim_conv_feature, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_global_feature + dim_conv_feature, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_ladder_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -422,16 +407,12 @@ class FlatLadder7x7NNUEv3(nn.Module):
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane,
-                                dim_middle,
-                                ks=2,
-                                st=1,
-                                norm="bn",
-                                activation="mish"),
+                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
-                ))
+                )
+            )
         return conv_list
 
     def get_phase_plane(self, data):
@@ -510,9 +491,8 @@ class FlatLadder7x7NNUEv3(nn.Module):
             [1, 2, False],
             [0, 2, False],
         ]
-        for (y, x), (conv_idx, k, t) in zip([(y, x) for y in range(0, 5) for x in range(0, 5)],
-                                            conv_index):
-            chunk = input_plane[:, :, y:y + 3, x:x + 3]
+        for (y, x), (conv_idx, k, t) in zip([(y, x) for y in range(0, 5) for x in range(0, 5)], conv_index):
+            chunk = input_plane[:, :, y : y + 3, x : x + 3]
             if t:
                 chunk = torch.transpose(chunk, 2, 3)
             chunk = torch.rot90(chunk, k, (2, 3))
@@ -557,9 +537,9 @@ class FlatLadder7x7NNUEv3(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
@@ -569,13 +549,9 @@ class FlatLadder7x7NNUEv3(nn.Module):
         return f"flat_ladder7x7_nnue_v3_{m}m{gf}gf{cf}cf"
 
 
-@MODELS.register('flat_posconv3x3_nnue')
+@MODELS.register("flat_posconv3x3_nnue")
 class FlatConv3x3NNUE(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(self, dim_middle=128, dim_feature=32, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.value_no_draw = value_no_draw
@@ -584,27 +560,25 @@ class FlatConv3x3NNUE(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_conv3x3_mappings(self, num_conv, dim_middle, dim_mapping):
         conv_list = nn.ModuleList()
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane,
-                                dim_middle,
-                                ks=2,
-                                st=1,
-                                norm="bn",
-                                activation="mish"),
+                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
-                ))
+                )
+            )
         return conv_list
 
     def get_feature_sum(self, input_plane):
@@ -612,7 +586,7 @@ class FlatConv3x3NNUE(nn.Module):
         features = []
         conv_coords = [(y, x) for y in range(0, H - 2) for x in range(0, W - 2)]
         for conv_idx, (y, x) in enumerate(conv_coords):
-            chunk = input_plane[:, :, y:y + 3, x:x + 3]
+            chunk = input_plane[:, :, y : y + 3, x : x + 3]
             feat = torch.clamp(self.conv_mappings[conv_idx](chunk), min=-1, max=127 / 128)
             feat = fake_quant(feat, scale=128)
             features.append(feat.squeeze(-1).squeeze(-1))
@@ -640,9 +614,9 @@ class FlatConv3x3NNUE(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
@@ -652,93 +626,93 @@ class FlatConv3x3NNUE(nn.Module):
         return f"flat_posconv3x3_nnue_{m}m{f}f"
 
 
-@MODELS.register('flat_posconv3x4_4x3_nnue')
+@MODELS.register("flat_posconv3x4_4x3_nnue")
 class FlatConv3x44x3NNUE(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 stride_3x4=(1, 1),
-                 stride_4x3=(1, 1),
-                 board_size=(7, 7),
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=32,
+        stride_3x4=(1, 1),
+        stride_4x3=(1, 1),
+        board_size=(7, 7),
+        input_type="basic-nostm",
+        value_no_draw=False,
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.value_no_draw = value_no_draw
         self.input_plane = build_input_plane(input_type)
         self.stride_3x4 = stride_3x4
         self.stride_4x3 = stride_4x3
-        num_conv3x4 = sum([1
-                           for y in range(0, board_size[0] - 2, stride_3x4[0]) 
-                           for x in range(0, board_size[1] - 3, stride_3x4[1])])
-        num_conv4x3 = sum([1
-                           for y in range(0, board_size[0] - 3, stride_4x3[0]) 
-                           for x in range(0, board_size[1] - 2, stride_4x3[1])])
+        num_conv3x4 = sum(
+            [1 for y in range(0, board_size[0] - 2, stride_3x4[0]) for x in range(0, board_size[1] - 3, stride_3x4[1])]
+        )
+        num_conv4x3 = sum(
+            [1 for y in range(0, board_size[0] - 3, stride_4x3[0]) for x in range(0, board_size[1] - 2, stride_4x3[1])]
+        )
         self.conv_mappings3x4 = self._make_conv3x4_mappings(num_conv3x4, dim_middle, dim_feature)
         self.conv_mappings4x3 = self._make_conv4x3_mappings(num_conv4x3, dim_middle, dim_feature)
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 2, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature * 2, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_conv3x4_mappings(self, num_conv, dim_middle, dim_mapping):
         conv_list = nn.ModuleList()
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane,
-                                dim_middle,
-                                ks=2,
-                                st=1,
-                                norm="bn",
-                                activation="mish"),
+                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=(1, 2), st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
-                ))
+                )
+            )
         return conv_list
-    
+
     def _make_conv4x3_mappings(self, num_conv, dim_middle, dim_mapping):
         conv_list = nn.ModuleList()
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane,
-                                dim_middle,
-                                ks=2,
-                                st=1,
-                                norm="bn",
-                                activation="mish"),
+                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=(2, 1), st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
-                ))
+                )
+            )
         return conv_list
 
     def get_feature_sum(self, input_plane):
         _, _, H, W = input_plane.shape
         features3x4 = []
-        conv_coords = [(y, x) for y in range(0, H - 2, self.stride_3x4[0]) for x in range(0, W - 3, self.stride_3x4[1])]
+        conv_coords = [
+            (y, x) for y in range(0, H - 2, self.stride_3x4[0]) for x in range(0, W - 3, self.stride_3x4[1])
+        ]
         for conv_idx, (y, x) in enumerate(conv_coords):
-            chunk = input_plane[:, :, y:y + 3, x:x + 4]
+            chunk = input_plane[:, :, y : y + 3, x : x + 4]
             feat = torch.clamp(self.conv_mappings3x4[conv_idx](chunk), min=-1, max=127 / 128)
             feat = fake_quant(feat, scale=128)
             features3x4.append(feat.squeeze(-1).squeeze(-1))
         features3x4 = torch.sum(torch.stack(features3x4), dim=0)
-        
+
         features4x3 = []
-        conv_coords = [(y, x) for y in range(0, H - 3, self.stride_4x3[0]) for x in range(0, W - 2, self.stride_4x3[1])]
+        conv_coords = [
+            (y, x) for y in range(0, H - 3, self.stride_4x3[0]) for x in range(0, W - 2, self.stride_4x3[1])
+        ]
         for conv_idx, (y, x) in enumerate(conv_coords):
-            chunk = input_plane[:, :, y:y + 4, x:x + 3]
+            chunk = input_plane[:, :, y : y + 4, x : x + 3]
             feat = torch.clamp(self.conv_mappings4x3[conv_idx](chunk), min=-1, max=127 / 128)
             feat = fake_quant(feat, scale=128)
             features4x3.append(feat.squeeze(-1).squeeze(-1))
         features4x3 = torch.sum(torch.stack(features4x3), dim=0)
-        
+
         return torch.cat([features3x4, features4x3], dim=1)
 
     def forward(self, data):
@@ -761,9 +735,9 @@ class FlatConv3x44x3NNUE(nn.Module):
     def weight_clipping(self):
         return [
             {
-                'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-                'min_weight': -128 / 128,
-                'max_weight': 127 / 128
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
             },
         ]
 
@@ -771,16 +745,11 @@ class FlatConv3x44x3NNUE(nn.Module):
     def name(self):
         m, f = self.model_size
         return f"flat_posconv3x4_4x3_nnue_{m}m{f}f"
-    
 
-@MODELS.register('flat_hashconv_nnue')
+
+@MODELS.register("flat_hashconv_nnue")
 class FlatHashConvNNUE(nn.Module):
-    def __init__(self,
-                 kernel_size,
-                 hash_logsize,
-                 dim_feature=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(self, kernel_size, hash_logsize, dim_feature=32, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (kernel_size, hash_logsize, dim_feature)
         self.value_no_draw = value_no_draw
@@ -790,15 +759,18 @@ class FlatHashConvNNUE(nn.Module):
             self.input_plane.dim_plane * kernel_size * kernel_size,
             input_level=2,  # 1 bits per plane
             hash_logsize=hash_logsize,
-            dim_feature=dim_feature)
+            dim_feature=dim_feature,
+        )
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def get_feature_sum(self, input_plane):
         _, C, H, W = input_plane.shape
@@ -836,15 +808,14 @@ class FlatHashConvNNUE(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }, {
-            'params': [f'hash_layer.features.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+            {"params": [f"hash_layer.features.weight"], "min_weight": -128 / 128, "max_weight": 127 / 128},
+        ]
 
     @property
     def name(self):
@@ -852,34 +823,40 @@ class FlatHashConvNNUE(nn.Module):
         return f"flat_hashconv_nnue_{ks}ks{hs}hs{f}f"
 
 
-@MODELS.register('flat_hash7x7_nnue_v1')
+@MODELS.register("flat_hash7x7_nnue_v1")
 class FlatHash7x7NNUEv1(nn.Module):
-    def __init__(self,
-                 hash_logsize,
-                 dim_feature=32,
-                 sub_features=1,
-                 sub_divisor=2,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(
+        self,
+        hash_logsize,
+        dim_feature=32,
+        sub_features=1,
+        sub_divisor=2,
+        input_type="basic-nostm",
+        value_no_draw=False,
+    ):
         super().__init__()
         self.model_size = (hash_logsize, dim_feature)
         self.value_no_draw = value_no_draw
         self.input_plane = build_input_plane(input_type)
 
-        self.hash_layer_corner = HashLayer(4 * 4,
-                                           input_level=3,
-                                           hash_logsize=hash_logsize,
-                                           dim_feature=dim_feature,
-                                           sub_features=sub_features,
-                                           sub_divisor=sub_divisor)
+        self.hash_layer_corner = HashLayer(
+            4 * 4,
+            input_level=3,
+            hash_logsize=hash_logsize,
+            dim_feature=dim_feature,
+            sub_features=sub_features,
+            sub_divisor=sub_divisor,
+        )
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_4x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -931,15 +908,14 @@ class FlatHash7x7NNUEv1(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }, {
-            'params': ['hash_layer_corner.features.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+            {"params": ["hash_layer_corner.features.weight"], "min_weight": -128 / 128, "max_weight": 127 / 128},
+        ]
 
     @property
     def name(self):
@@ -947,14 +923,9 @@ class FlatHash7x7NNUEv1(nn.Module):
         return f"flat_hash7x7_nnue_v1_{hs}hs{f}f"
 
 
-@MODELS.register('flat_square7x7_nnue_v1')
+@MODELS.register("flat_square7x7_nnue_v1")
 class FlatSquare7x7NNUEv1(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=8,
-                 quant_int4=False,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(self, dim_middle=128, dim_feature=8, quant_int4=False, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.quant_int4 = quant_int4
@@ -964,11 +935,13 @@ class FlatSquare7x7NNUEv1(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 4, 32, activation="none", quant=True),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature * 4, 32, activation="none", quant=True),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_4x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -1021,11 +994,13 @@ class FlatSquare7x7NNUEv1(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            }
+        ]
 
     @property
     def name(self):
@@ -1033,14 +1008,11 @@ class FlatSquare7x7NNUEv1(nn.Module):
         return f"flat_square7x7_nnue_v1_{m}m{f}f"
 
 
-@MODELS.register('flat_square7x7_nnue_v2')
+@MODELS.register("flat_square7x7_nnue_v2")
 class FlatSquare7x7NNUEv2(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 quant_int4=False,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(
+        self, dim_middle=128, dim_feature=32, quant_int4=False, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.quant_int4 = quant_int4
@@ -1051,11 +1023,13 @@ class FlatSquare7x7NNUEv2(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 4, 32, activation="none", quant=True, weight_quant_scale=256),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature * 4, 32, activation="none", quant=True, weight_quant_scale=256),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_4x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -1067,7 +1041,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
             Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
             Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
         )
-        
+
     def _make_4x3_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
             Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=(2, 2), st=1, activation="mish"),
@@ -1096,7 +1070,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
                 feat = fake_quant(torch.clamp(feat, min=-1, max=127 / 128), scale=128)
             feat = feat.squeeze(-1).squeeze(-1)
             features_corner.append(feat)
-            
+
         middle_index = [
             [0, 4, 2, 5, 0],
             [2, 5, 3, 7, 1],
@@ -1110,7 +1084,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
             feat = fake_quant(torch.clamp(feat, min=-1, max=127 / 128), scale=128)
             feat = feat.squeeze(-1).squeeze(-1)
             features_middle.append(feat)
-            
+
         return features_corner, features_middle
 
     def forward(self, data):
@@ -1131,7 +1105,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
         return value, policy
-    
+
     def forward_debug_print(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
         _, _, H, W = input_plane.shape
@@ -1160,11 +1134,13 @@ class FlatSquare7x7NNUEv2(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            }
+        ]
 
     @property
     def name(self):
@@ -1172,14 +1148,11 @@ class FlatSquare7x7NNUEv2(nn.Module):
         return f"flat_square7x7_nnue_v2_{m}m{f}f"
 
 
-@MODELS.register('flat_square7x7_nnue_v3')
+@MODELS.register("flat_square7x7_nnue_v3")
 class FlatSquare7x7NNUEv3(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 quant_int4=False,
-                 input_type='basic-nostm',
-                 value_no_draw=False):
+    def __init__(
+        self, dim_middle=128, dim_feature=32, quant_int4=False, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.quant_int4 = quant_int4
@@ -1191,11 +1164,13 @@ class FlatSquare7x7NNUEv3(nn.Module):
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature * 4, 64, activation="none", quant=True, weight_quant_scale=256),
-            LinearBlock(64, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature * 4, 64, activation="none", quant=True, weight_quant_scale=256),
+                LinearBlock(64, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_3x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -1215,12 +1190,10 @@ class FlatSquare7x7NNUEv3(nn.Module):
             [0, 4, 4, 7, 1, fs_corner1, self.mapping3x4_corner1],
             [4, 7, 3, 7, 2, fs_corner1, self.mapping3x4_corner1],
             [3, 7, 0, 3, 3, fs_corner1, self.mapping3x4_corner1],
-            
             [0, 4, 0, 3, 3, fs_corner2, self.mapping3x4_corner2],
             [0, 3, 3, 7, 0, fs_corner2, self.mapping3x4_corner2],
             [3, 7, 4, 7, 1, fs_corner2, self.mapping3x4_corner2],
             [4, 7, 0, 4, 2, fs_corner2, self.mapping3x4_corner2],
-            
             [0, 4, 2, 5, 3, fs_middle, self.mapping3x4_middle],
             [2, 5, 3, 7, 0, fs_middle, self.mapping3x4_middle],
             [3, 7, 2, 5, 1, fs_middle, self.mapping3x4_middle],
@@ -1247,7 +1220,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
         f_corner1 = torch.cat(fs_corner1, dim=1)
         f_corner2 = torch.cat(fs_corner2, dim=1)
         f_middle = torch.cat(fs_middle, dim=1)
-        feature = fake_quant((f_corner1 + f_corner2 + 1/128) / 2, floor=True) + f_middle
+        feature = fake_quant((f_corner1 + f_corner2 + 1 / 128) / 2, floor=True) + f_middle
 
         # value head
         value = feature  # [B, dim_feature]
@@ -1257,7 +1230,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
         return value, policy
-    
+
     def forward_debug_print(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
         _, _, H, W = input_plane.shape
@@ -1273,7 +1246,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
         f_corner1 = torch.cat(fs_corner1, dim=1)
         f_corner2 = torch.cat(fs_corner2, dim=1)
         f_middle = torch.cat(fs_middle, dim=1)
-        feature = fake_quant((f_corner1 + f_corner2 + 1/128) / 2, floor=True) + f_middle
+        feature = fake_quant((f_corner1 + f_corner2 + 1 / 128) / 2, floor=True) + f_middle
         print(f"feature sum: \n{(feature * 128).int()}")
 
         # value head
@@ -1289,15 +1262,14 @@ class FlatSquare7x7NNUEv3(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': ['value_linears.1.fc.weight', 'value_linears.2.fc.weight'],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }, {
-            'params': [f'value_linears.0.fc.weight'],
-            'min_weight': -128 / 256,
-            'max_weight': 127 / 256
-        }]
+        return [
+            {
+                "params": ["value_linears.1.fc.weight", "value_linears.2.fc.weight"],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+            {"params": [f"value_linears.0.fc.weight"], "min_weight": -128 / 256, "max_weight": 127 / 256},
+        ]
 
     @property
     def name(self):
@@ -1305,31 +1277,27 @@ class FlatSquare7x7NNUEv3(nn.Module):
         return f"flat_square7x7_nnue_v3_{m}m{f}f"
 
 
-@MODELS.register('flat_square7x7_nnue_v4')
+@MODELS.register("flat_square7x7_nnue_v4")
 class FlatSquare7x7NNUEv4(nn.Module):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False,
-                 unit_feature_vector=False):
+    def __init__(
+        self, dim_middle=128, dim_feature=32, input_type="basic-nostm", value_no_draw=False, unit_feature_vector=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.value_no_draw = value_no_draw
         self.unit_feature_vector = unit_feature_vector
         self.input_plane = build_input_plane(input_type)
-        self.mapping4x4 = nn.ModuleList([
-            self._make_4x4_mapping(dim_middle, dim_feature)
-            for _ in range(3)
-        ])
+        self.mapping4x4 = nn.ModuleList([self._make_4x4_mapping(dim_middle, dim_feature) for _ in range(3)])
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
-        self.value_linears = nn.ModuleList([
-            LinearBlock(dim_feature, 32, activation="none", quant=True, weight_quant_scale=256),
-            LinearBlock(32, 32, activation="none", quant=True),
-            LinearBlock(32, dim_vhead, activation="none", quant=True),
-        ])
+        self.value_linears = nn.ModuleList(
+            [
+                LinearBlock(dim_feature, 32, activation="none", quant=True, weight_quant_scale=256),
+                LinearBlock(32, 32, activation="none", quant=True),
+                LinearBlock(32, dim_vhead, activation="none", quant=True),
+            ]
+        )
 
     def _make_4x4_mapping(self, dim_middle, dim_mapping):
         return nn.Sequential(
@@ -1382,10 +1350,10 @@ class FlatSquare7x7NNUEv4(nn.Module):
                 # normalize feature onto unit hypersphere
                 if self.unit_feature_vector:
                     feat = F.normalize(feat, p=2, dim=-1)
-                feat = torch.clamp(feat, min=-1, max=127/128)
+                feat = torch.clamp(feat, min=-1, max=127 / 128)
                 features.append(feat)
             feature_groups.append(torch.stack(features))
-            
+
         return feature_groups
 
     def forward(self, data):
@@ -1413,11 +1381,13 @@ class FlatSquare7x7NNUEv4(nn.Module):
 
     @property
     def weight_clipping(self):
-        return [{
-            'params': [f'value_linears.{i}.fc.weight' for i in range(len(self.value_linears))],
-            'min_weight': -128 / 128,
-            'max_weight': 127 / 128
-        }]
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            }
+        ]
 
     @property
     def name(self):
@@ -1425,29 +1395,32 @@ class FlatSquare7x7NNUEv4(nn.Module):
         return f"flat_square7x7_nnue_v4_{m}m{f}f"
 
 
-@MODELS.register('flat_square7x7_nnue_v4_vq')
+@MODELS.register("flat_square7x7_nnue_v4_vq")
 class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
-    def __init__(self,
-                 dim_middle=128,
-                 dim_feature=32,
-                 input_type='basic-nostm',
-                 value_no_draw=False,
-                 codebook_size=65536,
-                 use_cosine_sim=False,
-                 **vq_kwargs):
-        super().__init__(dim_middle, dim_feature, input_type, value_no_draw,
-                         unit_feature_vector=use_cosine_sim)
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=32,
+        input_type="basic-nostm",
+        value_no_draw=False,
+        codebook_size=65536,
+        use_cosine_sim=False,
+        **vq_kwargs,
+    ):
+        super().__init__(dim_middle, dim_feature, input_type, value_no_draw, unit_feature_vector=use_cosine_sim)
         self.codebook_size = codebook_size
         self.use_cosine_sim = use_cosine_sim
-        self.vq_layer = nn.ModuleList([
-            VectorQuantize(
-                codebook_size=codebook_size, 
-                dim_feature=dim_feature,
-                use_cosine_sim=use_cosine_sim,
-                **vq_kwargs,
-            )
-            for _ in range(3)
-        ])
+        self.vq_layer = nn.ModuleList(
+            [
+                VectorQuantize(
+                    codebook_size=codebook_size,
+                    dim_feature=dim_feature,
+                    use_cosine_sim=use_cosine_sim,
+                    **vq_kwargs,
+                )
+                for _ in range(3)
+            ]
+        )
 
     def _do_vector_quantize(self, feature_groups):
         loss = []
@@ -1466,9 +1439,9 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
             feature_groups[i] = feature_quantized.view_as(feature)
 
             if info is not None:
-                loss.append(info['loss'])
-                perplexity.append(info['perplexity'])
-                normalized_perplexity.append(info['normalized_perplexity'])
+                loss.append(info["loss"])
+                perplexity.append(info["perplexity"])
+                normalized_perplexity.append(info["normalized_perplexity"])
                 cluster_size = self.vq_layer[i].normalized_cluster_size
                 cluster_size_q10.append(torch.quantile(cluster_size, q=0.1))
                 cluster_size_q50.append(torch.quantile(cluster_size, q=0.5))
@@ -1477,7 +1450,7 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         aux_losses = {}
         if len(loss) > 0:
             loss = torch.stack(loss).sum()
-            aux_losses = {'vq': loss}
+            aux_losses = {"vq": loss}
 
         aux_outputs = {}
         if len(perplexity) > 0:
@@ -1487,10 +1460,10 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
             cluster_size_q50 = torch.stack(cluster_size_q50).mean()
             cluster_size_q90 = torch.stack(cluster_size_q90).mean()
             aux_outputs = {
-                'vq_perplexity': perplexity,
-                'vq_normed_perplexity': normalized_perplexity,
-                'vq_cluster_size_q10': cluster_size_q10,
-                'vq_cluster_size_q50': cluster_size_q50,
-                'vq_cluster_size_q90': cluster_size_q90,
+                "vq_perplexity": perplexity,
+                "vq_normed_perplexity": normalized_perplexity,
+                "vq_cluster_size_q10": cluster_size_q10,
+                "vq_cluster_size_q50": cluster_size_q50,
+                "vq_cluster_size_q90": cluster_size_q90,
             }
         return feature_groups, aux_losses, aux_outputs

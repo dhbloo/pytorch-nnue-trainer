@@ -5,23 +5,25 @@ from utils.data_utils import make_subset_range, post_process_data, filter_data_b
 from . import DATASETS
 
 
-@DATASETS.register('katago_numpy')
+@DATASETS.register("katago_numpy")
 class KatagoNumpyDataset(IterableDataset):
-    FILE_EXTS = ['.npz']
+    FILE_EXTS = [".npz"]
 
-    def __init__(self,
-                 file_list,
-                 boardsizes,
-                 fixed_side_input,
-                 has_pass_move=False,
-                 apply_symmetry=False,
-                 shuffle=False,
-                 sample_rate=1.0,
-                 max_worker_per_file=1,
-                 filter_stm=None,
-                 filter_condition=None,
-                 value_td_level=0,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        boardsizes,
+        fixed_side_input,
+        has_pass_move=False,
+        apply_symmetry=False,
+        shuffle=False,
+        sample_rate=1.0,
+        max_worker_per_file=1,
+        filter_stm=None,
+        filter_condition=None,
+        value_td_level=0,
+        **kwargs,
+    ):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
@@ -34,8 +36,9 @@ class KatagoNumpyDataset(IterableDataset):
         self.filter_stm = filter_stm
         self.filter_condition = filter_condition
         self.value_td_level = value_td_level
-        assert filter_stm is None or isinstance(filter_stm, int), \
-            "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
+        assert filter_stm is None or isinstance(
+            filter_stm, int
+        ), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
 
     @property
     def is_fixed_side_input(self):
@@ -45,13 +48,13 @@ class KatagoNumpyDataset(IterableDataset):
     def is_internal_shuffleable(self):
         return True
 
-    def _unpack_global_feature(self, packed_data): 
-        if packed_data.shape[1] == 1: 
-            # Channel 0: side to move (black = -1.0, white = 1.0) 
-            stm_input = packed_data[:, [0]].astype(np.float32) 
-        else: 
-            # Original katago feature format: 
-            # Channel 5: komi (black negative, white positive) 
+    def _unpack_global_feature(self, packed_data):
+        if packed_data.shape[1] == 1:
+            # Channel 0: side to move (black = -1.0, white = 1.0)
+            stm_input = packed_data[:, [0]].astype(np.float32)
+        else:
+            # Original katago feature format:
+            # Channel 5: komi (black negative, white positive)
             stm_input = np.where(packed_data[:, [5]] > 0, 1, -1).astype(np.float32)
         return stm_input
 
@@ -63,7 +66,7 @@ class KatagoNumpyDataset(IterableDataset):
         # Channel 2: oppo stones
         packed_data = packed_data[:, dims]
 
-        board_input = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder='big')
+        board_input = np.unpackbits(packed_data, axis=2, count=bsize * bsize, bitorder="big")
         board_input = board_input.reshape(length, len(dims), bsize, bsize).astype(np.int8)
         return board_input
 
@@ -80,7 +83,7 @@ class KatagoNumpyDataset(IterableDataset):
         assert bsize * bsize + 1 == n_cells
 
         # Channel 0: policy target this turn
-        policy_target_stm = packed_data[:, 0, :bsize * bsize + (1 if self.has_pass_move else 0)]
+        policy_target_stm = packed_data[:, 0, : bsize * bsize + (1 if self.has_pass_move else 0)]
         policy_sum = np.sum(policy_target_stm.astype(np.float32), axis=1, keepdims=True)
         policy_target_stm = policy_target_stm / (policy_sum + 1e-9)
         if not self.has_pass_move:
@@ -89,45 +92,45 @@ class KatagoNumpyDataset(IterableDataset):
 
     def _unpack_data(self, raw_npz_data):
         raw_data_dict = {
-            'binaryInputNCHWPacked': raw_npz_data['binaryInputNCHWPacked'],
-            'globalInputNC': raw_npz_data['globalInputNC'],
-            'globalTargetsNC': raw_npz_data['globalTargetsNC'],
-            'policyTargetsNCMove': raw_npz_data['policyTargetsNCMove'],
+            "binaryInputNCHWPacked": raw_npz_data["binaryInputNCHWPacked"],
+            "globalInputNC": raw_npz_data["globalInputNC"],
+            "globalTargetsNC": raw_npz_data["globalTargetsNC"],
+            "policyTargetsNCMove": raw_npz_data["policyTargetsNCMove"],
         }
         if self.filter_stm is not None:
-            if raw_data_dict['globalInputNC'].shape[1] == 1:
-                cond = f'globalInputNC[:, 0] == {self.filter_stm}'
+            if raw_data_dict["globalInputNC"].shape[1] == 1:
+                cond = f"globalInputNC[:, 0] == {self.filter_stm}"
             else:
-                cond = f'globalInputNC[:, 5] > 0' if self.filter_stm == 1 else f'globalInputNC[:, 5] < 0'
+                cond = f"globalInputNC[:, 5] > 0" if self.filter_stm == 1 else f"globalInputNC[:, 5] < 0"
             filter_data_by_condition(cond, raw_data_dict)
         if self.filter_condition is not None:
             filter_data_by_condition(self.filter_condition, raw_data_dict)
-            
-        stm_input = self._unpack_global_feature(raw_data_dict['globalInputNC'])
-        board_input_stm = self._unpack_board_feature(raw_data_dict['binaryInputNCHWPacked'])
-        value_target = self._unpack_global_target(raw_data_dict['globalTargetsNC'])
-        policy_target = self._unpack_policy_target(raw_data_dict['policyTargetsNCMove'])
-        
+
+        stm_input = self._unpack_global_feature(raw_data_dict["globalInputNC"])
+        board_input_stm = self._unpack_board_feature(raw_data_dict["binaryInputNCHWPacked"])
+        value_target = self._unpack_global_target(raw_data_dict["globalTargetsNC"])
+        policy_target = self._unpack_policy_target(raw_data_dict["policyTargetsNCMove"])
+
         # Get board size from the 0 channel of packed board input
-        board_mask = self._unpack_board_feature(raw_data_dict['binaryInputNCHWPacked'], dims=[0])
+        board_mask = self._unpack_board_feature(raw_data_dict["binaryInputNCHWPacked"], dims=[0])
         board_width = np.sum(board_mask[:, 0, 0, :], axis=1)
         board_height = np.sum(board_mask[:, 0, :, 0], axis=1)
         board_size = np.stack([board_height, board_width], axis=1)  # (N, 2)
 
         return {
-            'board_size': board_size,
-            'board_input': board_input_stm,
-            'stm_input': stm_input,
-            'value_target': value_target,
-            'policy_target': policy_target,
+            "board_size": board_size,
+            "board_input": board_input_stm,
+            "stm_input": stm_input,
+            "value_target": value_target,
+            "policy_target": policy_target,
         }, len(board_size)
 
     def _prepare_entry_data(self, data_dict, index):
         data = {k: data_dict[k][index] for k in data_dict.keys()}
-    
-        if tuple(data['board_size']) not in self.boardsizes:
+
+        if tuple(data["board_size"]) not in self.boardsizes:
             return None
-        
+
         return post_process_data(data, self.fixed_side_input, self.apply_symmetry)
 
     def __iter__(self):
@@ -137,36 +140,42 @@ class KatagoNumpyDataset(IterableDataset):
         worker_per_file = min(worker_num, self.max_worker_per_file)
         assert worker_num % worker_per_file == 0
 
-        for file_index in make_subset_range(len(self.file_list),
-                                            partition_num=worker_num // worker_per_file,
-                                            partition_idx=worker_id // worker_per_file,
-                                            shuffle=self.shuffle):
+        for file_index in make_subset_range(
+            len(self.file_list),
+            partition_num=worker_num // worker_per_file,
+            partition_idx=worker_id // worker_per_file,
+            shuffle=self.shuffle,
+        ):
             filename = self.file_list[file_index]
             data_dict, length = self._unpack_data(np.load(filename))
 
-            for index in make_subset_range(length,
-                                           partition_num=worker_per_file,
-                                           partition_idx=worker_id % worker_per_file,
-                                           shuffle=self.shuffle,
-                                           sample_rate=self.sample_rate):
+            for index in make_subset_range(
+                length,
+                partition_num=worker_per_file,
+                partition_idx=worker_id % worker_per_file,
+                shuffle=self.shuffle,
+                sample_rate=self.sample_rate,
+            ):
                 data = self._prepare_entry_data(data_dict, index)
                 if data is not None:
                     yield data
 
 
-@DATASETS.register('processed_katago_numpy')
+@DATASETS.register("processed_katago_numpy")
 class ProcessedKatagoNumpyDataset(Dataset):
-    FILE_EXTS = ['.npz']
+    FILE_EXTS = [".npz"]
 
-    def __init__(self,
-                 file_list,
-                 boardsizes,
-                 fixed_side_input,
-                 has_pass_move=False,
-                 apply_symmetry=False,
-                 filter_stm=None,
-                 filter_condition=None,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        boardsizes,
+        fixed_side_input,
+        has_pass_move=False,
+        apply_symmetry=False,
+        filter_stm=None,
+        filter_condition=None,
+        **kwargs,
+    ):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
@@ -210,18 +219,16 @@ class ProcessedKatagoNumpyDataset(Dataset):
         # Get length of dataset and assert length are equal for all keys
         self.length = length_list[0]
         assert self.length > 0, f"No valid data entry in dataset: {self.file_list}"
-        assert length_list.count(self.length) == len(length_list), \
-               "Unequal length of data in npz file"
+        assert length_list.count(self.length) == len(length_list), "Unequal length of data in npz file"
 
         # Get board size
         self.boardsize = self.data_dict["bf"].shape[2:]
         assert len(self.boardsize) == 2
 
         if filter_stm is not None:
-            assert isinstance(filter_stm, int), \
-                "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
+            assert isinstance(filter_stm, int), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
             assert "gf" in self.data_dict, "gf tensor is required for filtering stm"
-            self.length = filter_data_by_condition(f'gf[:, 0] == {filter_stm}', self.data_dict)
+            self.length = filter_data_by_condition(f"gf[:, 0] == {filter_stm}", self.data_dict)
         if filter_condition is not None:
             self.length = filter_data_by_condition(filter_condition, self.data_dict)
 
@@ -231,19 +238,19 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
     def _prepare_data(self, index):
         board_size = np.array(self.boardsize, dtype=np.int8)
-        board_input = self.data_dict['bf'][index].astype(np.int8)
-        if 'gf' in self.data_dict:
-            stm_input = self.data_dict['gf'][index].astype(np.float32)
+        board_input = self.data_dict["bf"][index].astype(np.int8)
+        if "gf" in self.data_dict:
+            stm_input = self.data_dict["gf"][index].astype(np.float32)
         else:
             stm_input = np.array([0], dtype=np.float32)
-        value_target = self.data_dict['vt'][index].astype(np.float32)
+        value_target = self.data_dict["vt"][index].astype(np.float32)
 
-        if 'pt' in self.data_dict:
-            policy_target = self.data_dict['pt'][index].astype(np.float32)
+        if "pt" in self.data_dict:
+            policy_target = self.data_dict["pt"][index].astype(np.float32)
         else:
             _, h, w = board_input.shape
             if self.has_pass_move:
-                policy_target = np.zeros((h * w + 1, ), dtype=np.float32)
+                policy_target = np.zeros((h * w + 1,), dtype=np.float32)
             else:
                 policy_target = np.zeros((h, w), dtype=np.float32)
 
@@ -252,11 +259,11 @@ class ProcessedKatagoNumpyDataset(Dataset):
             policy_target = policy_target[:-1].reshape(*board_input.shape[1:])
 
         return {
-            'board_size': board_size,
-            'board_input': board_input,
-            'stm_input': stm_input,
-            'value_target': value_target,
-            'policy_target': policy_target,
+            "board_size": board_size,
+            "board_input": board_input,
+            "stm_input": stm_input,
+            "value_target": value_target,
+            "policy_target": policy_target,
         }
 
     def __len__(self):
@@ -267,19 +274,21 @@ class ProcessedKatagoNumpyDataset(Dataset):
         return post_process_data(data, self.fixed_side_input, self.apply_symmetry)
 
 
-@DATASETS.register('iterative_processed_katago_numpy')
+@DATASETS.register("iterative_processed_katago_numpy")
 class IterativeProcessedKatagoNumpyDataset(IterableDataset):
-    FILE_EXTS = ['.npz']
+    FILE_EXTS = [".npz"]
 
-    def __init__(self,
-                 file_list,
-                 boardsizes,
-                 fixed_side_input,
-                 apply_symmetry=False,
-                 shuffle=False,
-                 sample_rate=1.0,
-                 max_worker_per_file=2,
-                 **kwargs):
+    def __init__(
+        self,
+        file_list,
+        boardsizes,
+        fixed_side_input,
+        apply_symmetry=False,
+        shuffle=False,
+        sample_rate=1.0,
+        max_worker_per_file=2,
+        **kwargs,
+    ):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
@@ -305,19 +314,25 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
         worker_per_file = min(worker_num, self.max_worker_per_file)
         assert worker_num % worker_per_file == 0
 
-        for file_index in make_subset_range(len(self.file_list),
-                                            partition_num=worker_num // worker_per_file,
-                                            partition_idx=worker_id // worker_per_file,
-                                            shuffle=self.shuffle):
+        for file_index in make_subset_range(
+            len(self.file_list),
+            partition_num=worker_num // worker_per_file,
+            partition_idx=worker_id // worker_per_file,
+            shuffle=self.shuffle,
+        ):
             filename = self.file_list[file_index]
-            dataset = ProcessedKatagoNumpyDataset(file_list=[filename],
-                                                  boardsizes=self.boardsizes,
-                                                  fixed_side_input=self.fixed_side_input,
-                                                  apply_symmetry=self.apply_symmetry,
-                                                  **self.extra_kwargs)
-            for index in make_subset_range(len(dataset),
-                                           partition_num=worker_per_file,
-                                           partition_idx=worker_id % worker_per_file,
-                                           shuffle=self.shuffle,
-                                           sample_rate=self.sample_rate):
+            dataset = ProcessedKatagoNumpyDataset(
+                file_list=[filename],
+                boardsizes=self.boardsizes,
+                fixed_side_input=self.fixed_side_input,
+                apply_symmetry=self.apply_symmetry,
+                **self.extra_kwargs,
+            )
+            for index in make_subset_range(
+                len(dataset),
+                partition_num=worker_per_file,
+                partition_idx=worker_id % worker_per_file,
+                shuffle=self.shuffle,
+                sample_rate=self.sample_rate,
+            ):
                 yield dataset[index]

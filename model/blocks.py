@@ -6,53 +6,53 @@ from utils.quant_utils import fake_quant
 
 
 def build_activation_layer(activation):
-    if activation == 'relu':
+    if activation == "relu":
         return nn.ReLU(inplace=True)
-    elif activation == 'lrelu':
+    elif activation == "lrelu":
         return nn.LeakyReLU(0.1, inplace=True)
-    elif activation.startswith('lrelu/'):  # custom slope
+    elif activation.startswith("lrelu/"):  # custom slope
         neg_slope = 1.0 / int(activation[6:])
         return nn.LeakyReLU(neg_slope, inplace=True)
-    elif activation == 'crelu':
+    elif activation == "crelu":
         return ClippedReLU(inplace=True)
-    elif activation == 'tanh':
+    elif activation == "tanh":
         return nn.Tanh()
-    elif activation == 'sigmoid':
+    elif activation == "sigmoid":
         return nn.Sigmoid()
-    elif activation == 'gelu':
+    elif activation == "gelu":
         return nn.GELU()
-    elif activation == 'silu':
+    elif activation == "silu":
         return nn.SiLU(inplace=True)
-    elif activation == 'mish':
+    elif activation == "mish":
         return nn.Mish(inplace=True)
-    elif activation == 'none':
+    elif activation == "none":
         return None
     else:
-        assert 0, f"Unsupported activation: {activation}"
+        raise ValueError(f"Unsupported activation: {activation}")
 
 
 def build_norm1d_layer(norm, norm_dim=None):
-    if norm == 'bn':
+    if norm == "bn":
         return nn.BatchNorm1d(norm_dim)
-    elif norm == 'in':
+    elif norm == "in":
         return nn.InstanceNorm1d(norm_dim)
-    elif norm == 'none':
+    elif norm == "none":
         return None
     else:
-        assert 0, f"Unsupported normalization: {norm}"
+        raise ValueError(f"Unsupported normalization: {norm}")
 
 
 def build_norm2d_layer(norm, norm_dim=None):
-    if norm == 'bn':
+    if norm == "bn":
         assert norm_dim is not None
         return nn.BatchNorm2d(norm_dim)
-    elif norm == 'in':
+    elif norm == "in":
         assert norm_dim is not None
         return nn.InstanceNorm2d(norm_dim)
-    elif norm == 'none':
+    elif norm == "none":
         return None
     else:
-        assert 0, f"Unsupported normalization: {norm}"
+        raise ValueError(f"Unsupported normalization: {norm}")
 
 
 # ---------------------------------------------------------
@@ -95,14 +95,16 @@ class ChannelWiseLeakyReLU(nn.Module):
 
 
 class QuantPReLU(nn.PReLU):
-    def __init__(self,
-                 num_parameters: int = 1,
-                 init: float = 0.25,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 weight_signed=True):
+    def __init__(
+        self,
+        num_parameters: int = 1,
+        init: float = 0.25,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        weight_signed=True,
+    ):
         super().__init__(num_parameters, init)
         self.input_quant_scale = input_quant_scale
         self.input_quant_bits = input_quant_bits
@@ -126,14 +128,9 @@ class QuantPReLU(nn.PReLU):
 
 
 class SwitchPReLU(nn.Module):
-    def __init__(self,
-                 num_parameters: int,
-                 num_experts: int,
-                 init: float = 0.25,
-                 device=None,
-                 dtype=None) -> None:
+    def __init__(self, num_parameters: int, num_experts: int, init: float = 0.25, device=None, dtype=None) -> None:
         super().__init__()
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.num_parameters = num_parameters
         self.weight = nn.Parameter(torch.zeros((num_experts, num_parameters), **factory_kwargs))
         self.weight_fact = nn.Parameter(torch.full((1, num_parameters), init, **factory_kwargs))
@@ -146,8 +143,7 @@ class SwitchPReLU(nn.Module):
 
     def forward(self, input: torch.Tensor, route_index: torch.Tensor) -> torch.Tensor:
         neg_slope = self.get_weight(route_index)
-        neg_slope = neg_slope.view(neg_slope.shape[0], neg_slope.shape[1],
-                                   *([1] * (input.ndim - neg_slope.ndim)))
+        neg_slope = neg_slope.view(neg_slope.shape[0], neg_slope.shape[1], *([1] * (input.ndim - neg_slope.ndim)))
         return torch.where(input >= 0, input, neg_slope * input)
 
 
@@ -156,18 +152,20 @@ class SwitchPReLU(nn.Module):
 
 
 class LinearBlock(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 norm='none',
-                 activation='relu',
-                 bias=True,
-                 quant=False,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 bias_quant_bits=32):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        norm="none",
+        activation="relu",
+        bias=True,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_bits=32,
+    ):
         super(LinearBlock, self).__init__()
         self.fc = nn.Linear(in_dim, out_dim, bias)
         self.quant = quant
@@ -187,9 +185,9 @@ class LinearBlock(nn.Module):
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits, floor=True)
             w = fake_quant(self.fc.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             if self.fc.bias is not None:
-                b = fake_quant(self.fc.bias,
-                               self.weight_quant_scale * self.input_quant_scale,
-                               num_bits=self.bias_quant_bits)
+                b = fake_quant(
+                    self.fc.bias, self.weight_quant_scale * self.input_quant_scale, num_bits=self.bias_quant_bits
+                )
                 out = F.linear(x, w, b)
             else:
                 out = F.linear(x, w)
@@ -204,30 +202,31 @@ class LinearBlock(nn.Module):
 
 
 class Conv2dBlock(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 ks,
-                 st,
-                 padding=0,
-                 norm='none',
-                 activation='relu',
-                 pad_type='zeros',
-                 bias=True,
-                 dilation=1,
-                 groups=1,
-                 activation_first=False,
-                 use_spectral_norm=False,
-                 quant=False,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 bias_quant_scale=None,
-                 bias_quant_bits=32):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        ks,
+        st,
+        padding=0,
+        norm="none",
+        activation="relu",
+        pad_type="zeros",
+        bias=True,
+        dilation=1,
+        groups=1,
+        activation_first=False,
+        use_spectral_norm=False,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_scale=None,
+        bias_quant_bits=32,
+    ):
         super(Conv2dBlock, self).__init__()
-        assert pad_type in ['zeros', 'reflect', 'replicate',
-                            'circular'], f"Unsupported padding mode: {pad_type}"
+        assert pad_type in ["zeros", "reflect", "replicate", "circular"], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
         self.norm = build_norm2d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
@@ -248,7 +247,7 @@ class Conv2dBlock(nn.Module):
 
         self.quant = quant
         if quant:
-            assert self.conv.padding_mode == 'zeros', "quant conv requires zero padding"
+            assert self.conv.padding_mode == "zeros", "quant conv requires zero padding"
             self.input_quant_scale = input_quant_scale
             self.input_quant_bits = input_quant_bits
             self.weight_quant_scale = weight_quant_scale
@@ -264,20 +263,22 @@ class Conv2dBlock(nn.Module):
                 x = self.activation(x)
         if self.quant:
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
-            w = fake_quant(self.conv.weight,
-                           self.weight_quant_scale,
-                           num_bits=self.weight_quant_bits)
+            w = fake_quant(self.conv.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             b = self.conv.bias
             if b is not None:
                 b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
-            if self.quant == 'pixel-dwconv' or self.quant == 'pixel-dwconv-floor':  # pixel-wise quantization in depthwise conv
+            if (
+                self.quant == "pixel-dwconv" or self.quant == "pixel-dwconv-floor"
+            ):  # pixel-wise quantization in depthwise conv
                 assert self.conv.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
                 x_ = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups)
                 x = F.unfold(x, self.conv.kernel_size, self.conv.dilation, self.conv.padding, self.conv.stride)
-                x = fake_quant(x * w.view(-1)[None, :, None], 
-                               self.bias_quant_scale, 
-                               num_bits=self.bias_quant_bits, 
-                               floor=(self.quant=='pixel-dwconv-floor'))
+                x = fake_quant(
+                    x * w.view(-1)[None, :, None],
+                    self.bias_quant_scale,
+                    num_bits=self.bias_quant_bits,
+                    floor=(self.quant == "pixel-dwconv-floor"),
+                )
                 x = x.reshape(x_.shape[0], x_.shape[1], -1, x_.size(2) * x_.size(3)).sum(2)
                 x = F.fold(x, (x_.size(2), x_.size(3)), (1, 1))
                 x = x + b[None, :, None, None]
@@ -294,25 +295,27 @@ class Conv2dBlock(nn.Module):
 
 
 class Conv1dLine4Block(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 ks,
-                 st,
-                 padding=0,
-                 norm='none',
-                 activation='relu',
-                 bias=True,
-                 dilation=1,
-                 groups=1,
-                 activation_first=False,
-                 quant=False,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 bias_quant_scale=None,
-                 bias_quant_bits=32):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        ks,
+        st,
+        padding=0,
+        norm="none",
+        activation="relu",
+        bias=True,
+        dilation=1,
+        groups=1,
+        activation_first=False,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_scale=None,
+        bias_quant_bits=32,
+    ):
         super().__init__()
         assert in_dim % groups == 0, f"in_dim({in_dim}) should be divisible by groups({groups})"
         self.in_dim = in_dim
@@ -326,7 +329,7 @@ class Conv1dLine4Block(nn.Module):
         self.norm = build_norm2d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
         self.weight = nn.Parameter(torch.empty((4 * ks - 3, out_dim, in_dim // groups)))
-        self.bias = nn.Parameter(torch.zeros((out_dim, ))) if bias else None
+        self.bias = nn.Parameter(torch.zeros((out_dim,))) if bias else None
         nn.init.kaiming_normal_(self.weight)
 
         self.quant = quant
@@ -352,8 +355,7 @@ class Conv1dLine4Block(nn.Module):
 
         assert weight_index == self.weight.size(0), f"{weight_index} != {self.weight.size(0)}"
         kernel = torch.stack(kernel, dim=2)
-        kernel = kernel.reshape(self.out_dim, self.in_dim // self.groups, self.kernel_size,
-                                self.kernel_size)
+        kernel = kernel.reshape(self.out_dim, self.in_dim // self.groups, self.kernel_size, self.kernel_size)
         return kernel
 
     def conv(self, x):
@@ -384,17 +386,19 @@ class Conv1dLine4Block(nn.Module):
 
 
 class ResBlock(nn.Module):
-    def __init__(self,
-                 dim_in,
-                 ks=3,
-                 st=1,
-                 padding=1,
-                 norm='none',
-                 activation='relu',
-                 pad_type='zeros',
-                 dim_out=None,
-                 dim_hidden=None,
-                 activation_first=False):
+    def __init__(
+        self,
+        dim_in,
+        ks=3,
+        st=1,
+        padding=1,
+        norm="none",
+        activation="relu",
+        pad_type="zeros",
+        dim_out=None,
+        dim_hidden=None,
+        activation_first=False,
+    ):
         super(ResBlock, self).__init__()
         dim_out = dim_out or dim_in
         dim_hidden = dim_hidden or min(dim_in, dim_out)
@@ -403,33 +407,25 @@ class ResBlock(nn.Module):
         self.activation_first = activation_first
         self.activation = build_activation_layer(activation)
         self.conv = nn.Sequential(
-            Conv2dBlock(dim_in,
-                        dim_hidden,
-                        ks,
-                        st,
-                        padding,
-                        norm,
-                        activation,
-                        pad_type,
-                        activation_first=activation_first),
-            Conv2dBlock(dim_hidden,
-                        dim_out,
-                        ks,
-                        st,
-                        padding,
-                        norm,
-                        activation if activation_first else 'none',
-                        pad_type,
-                        activation_first=activation_first),
+            Conv2dBlock(
+                dim_in, dim_hidden, ks, st, padding, norm, activation, pad_type, activation_first=activation_first
+            ),
+            Conv2dBlock(
+                dim_hidden,
+                dim_out,
+                ks,
+                st,
+                padding,
+                norm,
+                activation if activation_first else "none",
+                pad_type,
+                activation_first=activation_first,
+            ),
         )
         if self.learned_shortcut:
-            self.conv_shortcut = Conv2dBlock(dim_in,
-                                             dim_out,
-                                             1,
-                                             1,
-                                             norm=norm,
-                                             activation=activation,
-                                             activation_first=activation_first)
+            self.conv_shortcut = Conv2dBlock(
+                dim_in, dim_out, 1, 1, norm=norm, activation=activation, activation_first=activation_first
+            )
 
     def forward(self, x):
         residual = self.conv_shortcut(x) if self.learned_shortcut else x
@@ -442,15 +438,18 @@ class ResBlock(nn.Module):
 
 class HashLayer(nn.Module):
     """Maps an input space of size=(input_level**input_size) to a hashed feature space of size=(2**hash_logsize)."""
-    def __init__(self,
-                 input_size,
-                 input_level=2,
-                 hash_logsize=20,
-                 dim_feature=32,
-                 quant_int8=True,
-                 sub_features=1,
-                 sub_divisor=2,
-                 scale_grad_by_freq=False):
+
+    def __init__(
+        self,
+        input_size,
+        input_level=2,
+        hash_logsize=20,
+        dim_feature=32,
+        quant_int8=True,
+        sub_features=1,
+        sub_divisor=2,
+        scale_grad_by_freq=False,
+    ):
         super().__init__()
         self.input_size = input_size
         self.input_level = input_level
@@ -463,23 +462,19 @@ class HashLayer(nn.Module):
         self.perfect_hash = 2**hash_logsize >= input_level**input_size
         if self.perfect_hash:  # Do perfect hashing
             n_features = input_level**input_size
-            self.register_buffer('idx_stride',
-                                 input_level**torch.arange(input_size, dtype=torch.int64))
+            self.register_buffer("idx_stride", input_level ** torch.arange(input_size, dtype=torch.int64))
         else:
             n_features = 2**hash_logsize
             ii32 = torch.iinfo(torch.int32)
-            self.hashs = nn.Parameter(torch.randint(ii32.min,
-                                                    ii32.max,
-                                                    size=(input_size, input_level),
-                                                    dtype=torch.int32),
-                                      requires_grad=False)
+            self.hashs = nn.Parameter(
+                torch.randint(ii32.min, ii32.max, size=(input_size, input_level), dtype=torch.int32),
+                requires_grad=False,
+            )
 
         n_features = [math.ceil(n_features / sub_divisor**i) for i in range(sub_features)]
         self.offsets = [sum(n_features[:i]) for i in range(sub_features + 1)]
         level_dim = max(dim_feature // sub_features, 1)
-        self.features = nn.Embedding(sum(n_features),
-                                     level_dim,
-                                     scale_grad_by_freq=scale_grad_by_freq)
+        self.features = nn.Embedding(sum(n_features), level_dim, scale_grad_by_freq=scale_grad_by_freq)
         if self.quant_int8:
             nn.init.trunc_normal_(self.features.weight.data, std=0.5, a=-1, b=127 / 128)
         if self.sub_features > 1:
@@ -502,9 +497,9 @@ class HashLayer(nn.Module):
         if self.perfect_hash:
             x_indices = torch.sum(x_long * self.idx_stride, dim=1)  # (batch_size,)
         else:
-            x_onthot = torch.zeros((x_long.shape[0], self.input_size, self.input_level),
-                                   dtype=torch.bool,
-                                   device=x_long.device)
+            x_onthot = torch.zeros(
+                (x_long.shape[0], self.input_size, self.input_level), dtype=torch.bool, device=x_long.device
+            )
             x_onthot.scatter_(2, x_long.unsqueeze(-1), 1)  # (batch_size, input_size, input_level)
             x_hash = x_onthot * self.hashs  # (batch_size, input_size, input_level)
             x_hash = torch.sum(x_hash, dim=(1, 2))  # (batch_size,)
@@ -531,9 +526,11 @@ class HashLayer(nn.Module):
 
 # ---------------------------------------------------------
 # Switch Variant of Networks
-    
+
+
 class SwitchGate(nn.Module):
     """Switch Gating for MoE networks"""
+
     def __init__(self, num_experts: int, jitter_eps=0.0, no_scaling=False) -> None:
         super().__init__()
         self.num_experts = num_experts
@@ -563,10 +560,11 @@ class SwitchGate(nn.Module):
 
         # calc load balancing loss
         inv_batch_size = 1.0 / route_logits.shape[0]
-        route_frac = torch.tensor([(route_idx == i).sum() * inv_batch_size
-                                   for i in range(self.num_experts)],
-                                  dtype=route_probs.dtype,
-                                  device=route_probs.device)  # [num_experts]
+        route_frac = torch.tensor(
+            [(route_idx == i).sum() * inv_batch_size for i in range(self.num_experts)],
+            dtype=route_probs.dtype,
+            device=route_probs.device,
+        )  # [num_experts]
         route_prob_mean = route_probs.mean(0)  # [num_experts]
         load_balancing_loss = self.num_experts * torch.dot(route_frac, route_prob_mean)
         load_balancing_loss = load_balancing_loss - 1.0
@@ -577,38 +575,33 @@ class SwitchGate(nn.Module):
             route_multiplier = route_prob_max
 
         aux_outputs = {
-            'route_prob_max': route_prob_max,
-            'route_frac_min': route_frac.min(),
-            'route_frac_max': route_frac.max(),
-            'route_frac_std': route_frac.std(),
+            "route_prob_max": route_prob_max,
+            "route_frac_min": route_frac.min(),
+            "route_frac_max": route_frac.max(),
+            "route_frac_std": route_frac.std(),
         }
         return route_idx, route_multiplier, load_balancing_loss, aux_outputs
-    
+
 
 class SwitchLinear(nn.Module):
-    '''Switchable linear layer for MoE networks'''
-    def __init__(self,
-                 in_features: int,
-                 out_features: int,
-                 num_experts: int,
-                 bias: bool = True,
-                 device=None,
-                 dtype=None) -> None:
+    """Switchable linear layer for MoE networks"""
+
+    def __init__(
+        self, in_features: int, out_features: int, num_experts: int, bias: bool = True, device=None, dtype=None
+    ) -> None:
         super().__init__()
-        factory_kwargs = {'device': device, 'dtype': dtype}
+        factory_kwargs = {"device": device, "dtype": dtype}
         assert num_experts > 0, "Number of experts must be at least 1"
         self.in_features = in_features
         self.out_features = out_features
         self.num_experts = num_experts
-        self.weight = nn.Parameter(
-            torch.empty((num_experts, out_features * in_features), **factory_kwargs))
-        self.weight_fact = nn.Parameter(
-            torch.empty((1, out_features * in_features), **factory_kwargs))
+        self.weight = nn.Parameter(torch.empty((num_experts, out_features * in_features), **factory_kwargs))
+        self.weight_fact = nn.Parameter(torch.empty((1, out_features * in_features), **factory_kwargs))
         if bias:
             self.bias = nn.Parameter(torch.empty((num_experts, out_features), **factory_kwargs))
             self.bias_fact = nn.Parameter(torch.empty((1, out_features), **factory_kwargs))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -643,26 +636,29 @@ class SwitchLinear(nn.Module):
 
     def forward(self, input: torch.Tensor, route_index: torch.Tensor) -> torch.Tensor:
         expert_weight, expert_bias = self.get_weight_and_bias(route_index)
-        output = torch.einsum('bmn,bn->bm', expert_weight, input)
+        output = torch.einsum("bmn,bn->bm", expert_weight, input)
         if expert_bias is not None:
             output = output + expert_bias
         return output
 
 
 class SwitchLinearBlock(nn.Module):
-    '''LinearBlock with switchable linear layer for MoE networks'''
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 num_experts,
-                 activation='relu',
-                 bias=True,
-                 quant=False,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 bias_quant_bits=32) -> None:
+    """LinearBlock with switchable linear layer for MoE networks"""
+
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        num_experts,
+        activation="relu",
+        bias=True,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_bits=32,
+    ) -> None:
         super().__init__()
         self.fc = SwitchLinear(in_dim, out_dim, num_experts, bias)
         self.quant = quant
@@ -682,9 +678,7 @@ class SwitchLinearBlock(nn.Module):
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
             w = fake_quant(weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             if bias is not None:
-                b = fake_quant(bias,
-                               self.weight_quant_scale * self.input_quant_scale,
-                               num_bits=self.bias_quant_bits)
+                b = fake_quant(bias, self.weight_quant_scale * self.input_quant_scale, num_bits=self.bias_quant_bits)
                 out = F.linear(x, w, b)
             else:
                 out = F.linear(x, w)
@@ -697,22 +691,25 @@ class SwitchLinearBlock(nn.Module):
 
 
 class SwitchConv2d(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 num_experts: int,
-                 kernel_size: int,
-                 stride=1,
-                 padding=0,
-                 dilation=1,
-                 groups: int = 1,
-                 bias: bool = True,
-                 padding_mode: str = 'zeros',
-                 device=None,
-                 dtype=None) -> None:
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        num_experts: int,
+        kernel_size: int,
+        stride=1,
+        padding=0,
+        dilation=1,
+        groups: int = 1,
+        bias: bool = True,
+        padding_mode: str = "zeros",
+        device=None,
+        dtype=None,
+    ) -> None:
         super().__init__()
         from torch.nn.modules.utils import _pair, _reverse_repeat_tuple
-        factory_kwargs = {'device': device, 'dtype': dtype}
+
+        factory_kwargs = {"device": device, "dtype": dtype}
         self.num_experts = num_experts
         self.kernel_size = _pair(kernel_size)
         self.stride = _pair(stride)
@@ -730,7 +727,7 @@ class SwitchConv2d(nn.Module):
             self.bias = nn.Parameter(torch.empty((num_experts, out_channels), **factory_kwargs))
             self.bias_fact = nn.Parameter(torch.empty((1, out_channels), **factory_kwargs))
         else:
-            self.register_parameter('bias', None)
+            self.register_parameter("bias", None)
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -763,7 +760,7 @@ class SwitchConv2d(nn.Module):
         return expert_weight, expert_bias
 
     def forward(self, input: torch.Tensor, route_index: torch.Tensor):
-        if self.padding_mode != 'zeros':
+        if self.padding_mode != "zeros":
             input = F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             padding = (0, 0)
         else:
@@ -776,36 +773,38 @@ class SwitchConv2d(nn.Module):
             expert_bias = expert_bias.view(-1)
 
         input = input.view(1, -1, input.size(-2), input.size(-1))
-        output = F.conv2d(input, expert_weight, expert_bias, self.stride, padding, self.dilation,
-                          self.groups * batch_size)
+        output = F.conv2d(
+            input, expert_weight, expert_bias, self.stride, padding, self.dilation, self.groups * batch_size
+        )
         output = output.view(batch_size, self.weight_shape[0], output.size(-2), output.size(-1))
         return output
 
 
 class SwitchConv2dBlock(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 num_experts,
-                 ks,
-                 st=1,
-                 padding=0,
-                 activation='relu',
-                 pad_type='zeros',
-                 bias=True,
-                 dilation=1,
-                 groups=1,
-                 activation_first=False,
-                 quant=False,
-                 input_quant_scale=128,
-                 input_quant_bits=8,
-                 weight_quant_scale=128,
-                 weight_quant_bits=8,
-                 bias_quant_scale=None,
-                 bias_quant_bits=32):
+    def __init__(
+        self,
+        in_dim,
+        out_dim,
+        num_experts,
+        ks,
+        st=1,
+        padding=0,
+        activation="relu",
+        pad_type="zeros",
+        bias=True,
+        dilation=1,
+        groups=1,
+        activation_first=False,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_scale=None,
+        bias_quant_bits=32,
+    ):
         super().__init__()
-        assert pad_type in ['zeros', 'reflect', 'replicate',
-                            'circular'], f"Unsupported padding mode: {pad_type}"
+        assert pad_type in ["zeros", "reflect", "replicate", "circular"], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
         self.activation = build_activation_layer(activation)
         self.conv = SwitchConv2d(
@@ -823,7 +822,7 @@ class SwitchConv2dBlock(nn.Module):
 
         self.quant = quant
         if quant:
-            assert self.conv.padding_mode == 'zeros', "quant conv requires zero padding"
+            assert self.conv.padding_mode == "zeros", "quant conv requires zero padding"
             self.input_quant_scale = input_quant_scale
             self.input_quant_bits = input_quant_bits
             self.weight_quant_scale = weight_quant_scale
@@ -844,8 +843,9 @@ class SwitchConv2dBlock(nn.Module):
             if bias is not None:
                 bias = fake_quant(bias, self.bias_quant_scale, num_bits=self.bias_quant_bits)
                 bias = bias.reshape(-1)
-            x = F.conv2d(x, w, bias, self.conv.stride, self.conv.padding, self.conv.dilation,
-                         self.conv.groups * batch_size)
+            x = F.conv2d(
+                x, w, bias, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups * batch_size
+            )
             x = x.view(batch_size, -1, x.size(-2), x.size(-1))
         else:
             x = self.conv(x, route_index)
