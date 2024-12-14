@@ -1311,10 +1311,12 @@ class FlatSquare7x7NNUEv4(nn.Module):
                  dim_middle=128,
                  dim_feature=32,
                  input_type='basic-nostm',
-                 value_no_draw=False):
+                 value_no_draw=False,
+                 unit_feature_vector=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.value_no_draw = value_no_draw
+        self.unit_feature_vector = unit_feature_vector
         self.input_plane = build_input_plane(input_type)
         self.mapping4x4 = nn.ModuleList([
             self._make_4x4_mapping(dim_middle, dim_feature)
@@ -1376,8 +1378,12 @@ class FlatSquare7x7NNUEv4(nn.Module):
                 if t:
                     chunk = torch.transpose(chunk, 2, 3)
                 feat = self.mapping4x4[chunk_idx](chunk)
+                feat = feat.squeeze(-1).squeeze(-1)
+                # normalize feature onto unit hypersphere
+                if self.unit_feature_vector:
+                    feat = F.normalize(feat, p=2, dim=-1)
                 feat = torch.clamp(feat, min=-1, max=127/128)
-                features.append(feat.squeeze(-1).squeeze(-1))
+                features.append(feat)
             feature_groups.append(torch.stack(features))
             
         return feature_groups
@@ -1427,12 +1433,17 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                  input_type='basic-nostm',
                  value_no_draw=False,
                  codebook_size=65536,
+                 use_cosine_sim=False,
                  **vq_kwargs):
-        super().__init__(dim_middle, dim_feature, input_type, value_no_draw)
+        super().__init__(dim_middle, dim_feature, input_type, value_no_draw,
+                         unit_feature_vector=use_cosine_sim)
+        self.codebook_size = codebook_size
+        self.use_cosine_sim = use_cosine_sim
         self.vq_layer = nn.ModuleList([
             VectorQuantize(
                 codebook_size=codebook_size, 
                 dim_feature=dim_feature,
+                use_cosine_sim=use_cosine_sim,
                 **vq_kwargs,
             )
             for _ in range(3)
@@ -1447,10 +1458,13 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         cluster_size_q90 = []
 
         for i, feature in enumerate(feature_groups):
+            # fix feature if vq layer is not inited
             if not self.vq_layer[i].inited:
                 feature = feature.detach()
+            # Do vector quantization
             feature_quantized, info = self.vq_layer[i](feature.view(-1, feature.shape[-1]))
             feature_groups[i] = feature_quantized.view_as(feature)
+
             if info is not None:
                 loss.append(info['loss'])
                 perplexity.append(info['perplexity'])

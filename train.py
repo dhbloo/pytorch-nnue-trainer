@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from accelerate import Accelerator, DataLoaderConfiguration
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
 import configargparse
@@ -82,6 +82,7 @@ def parse_args_and_init():
                default=1.0,
                help="Distillation loss ratio in [0,1] (1 for distillation loss only)")
     parser.add('--kd_use_train_mode', action='store_true', help="Set teacher to train mode")
+    parser.add('--find_unused_parameters', action='store_true', help="Enable find_unused_parameters in DDP")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -183,7 +184,7 @@ def calc_loss(loss_type,
                                                 weight=policy_loss_weight)
         elif policy_loss_type == 'MSE':
             policy_softmaxed = torch.softmax(policy, dim=1)
-            policy_loss = F.mse_loss(policy_softmaxed, policy_target, size_average='none')
+            policy_loss = F.mse_loss(policy_softmaxed, policy_target, reduction='none')
             if policy_loss_weight is not None:
                 policy_loss = policy_loss * policy_loss_weight
             return torch.mean(policy_loss)
@@ -300,10 +301,11 @@ def training_loop(rundir, load_from, use_cpu, train_datas, val_datas, dataset_ty
                   loss_type, loss_args, iterations, batch_size, num_worker, learning_rate, weight_decay, 
                   clip_grad_norm, clip_grad_value, no_shuffle, log_interval, show_interval, save_interval,
                   val_interval, avg_loss_interval, temp_save_interval, kd_model_type, kd_model_args, 
-                  kd_checkpoint, kd_T, kd_alpha, kd_use_train_mode, **kwargs):
+                  kd_checkpoint, kd_T, kd_alpha, kd_use_train_mode, find_unused_parameters, **kwargs):
     # use accelerator
     dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
-    accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)
+    accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config, kwargs_handlers=[ddp_kwargs])
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))

@@ -9,14 +9,16 @@ from dataset import build_dataset
 from model import build_model
 from model.serialization import build_serializer
 from utils.training_utils import build_data_loader
+from utils.file_utils import find_latest_model_file
 
 
 def parse_args_and_init():
     parser = configargparse.ArgParser(description="Export",
                                       config_file_parser_class=configargparse.YAMLConfigFileParser)
     parser.add('-c', '--config', is_config_file=True, help='Config file path')
-    parser.add('-p', '--checkpoint', required=True, help="Model checkpoint file to test")
+    parser.add('-p', '--checkpoint', help="Model checkpoint file to test")
     parser.add('-o', '--output', help="Output filename")
+    parser.add('-r', '--rundir', help="Run directory (specify this if checkpoint is not specified)")
     parser.add('--export_type', required=True, help="Export type")
     parser.add('--export_args',
                type=yaml.safe_load,
@@ -238,12 +240,20 @@ def export_binary(output, output_type, model_type, model, export_args, use_cpu,
     print(f"Serialized {type} model has been written to {output}")
 
 
-def export(checkpoint, output, export_type, model_type, model_args, **kwargs):
-    if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
+def export(checkpoint, output, rundir, export_type, model_type, model_args, **kwargs):
+    # construct the model
+    model = build_model(model_type, **model_args)
+
+    if checkpoint is None:
+        if rundir is None:
+            raise RuntimeError("Either checkpoint or rundir must be specified.")
+        # try to find the latest checkpoint
+        checkpoint = find_latest_model_file(rundir, f"ckpt_{model.name}")
+    elif not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f'Checkpoint {checkpoint} must be a valid file')
 
     # load checkpoint
-    model = build_model(model_type, **model_args)
+    print(f"Loading model state from {checkpoint}")
     state_dicts = torch.load(checkpoint, map_location='cpu')
     model.load_state_dict(state_dicts['model'])
     model.eval()

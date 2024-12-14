@@ -7,6 +7,10 @@ from accelerate.utils import gather, reduce
 from pykeops.torch import LazyTensor
 
 
+def l2_norm(x: torch.Tensor) -> torch.Tensor:
+    return F.normalize(x, p=2, dim=-1, eps=1e-7)
+
+
 def l2_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
     """
     Compute the L2 distance between x and y.
@@ -31,13 +35,11 @@ def cosine_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
     """
     Compute the cosine similarity between x and y.
     Args:
-        x: Input embedding tensor of shape (N, dim_feature).
-        y: Codebook tensor of shape (M, dim_feature).
+        x: Input embedding tensor of shape (N, dim_feature), assumed to be unit vec.
+        y: Codebook tensor of shape (M, dim_feature), assumed to be unit vec.
     Returns:
         dists: A tensor of shape (N, M).
     """
-    x = F.normalize(x, p=2, dim=-1, eps=1e-6)
-    y = F.normalize(y, p=2, dim=-1, eps=1e-6)
     x_i = LazyTensor(x[:, None, :])  # (N, 1, dim_feature)
     y_j = LazyTensor(y[None, :, :])  # (1, M, dim_feature)
     dists = 1 - (x_i * y_j).sum(-1)  # (N, M)
@@ -100,14 +102,15 @@ def compute_perplexity(cluster_size: torch.Tensor) -> torch.Tensor:
 
 
 def entropy_regularization(logits: LazyTensor, temperature = 1.) -> torch.Tensor:
-    logits = logits / temperature  # (N, codebook_size)
+    logits = logits * (1.0 / temperature)  # (N, codebook_size)
     logits_max_and_exp = logits.reduction('Max_SumShiftExp', dim=1)  # (N, 2)
     logits_max = logits_max_and_exp[:, 0].contiguous()
     logits_sumexp = logits_max_and_exp[:, 1].contiguous()
     logits_exp = (logits - LazyTensor(logits_max[:, None], axis=0)).exp()  # (N, codebook_size)
     softprobs = logits_exp / LazyTensor(logits_sumexp[:, None], axis=0)  # (N, codebook_size)
-    avg_probs = (softprobs.sum(0) / logits.shape[0]).squeeze(1)  # (codebook_size,)
-    return -(-avg_probs * torch.log(avg_probs.clamp_min(1e-5))).sum(dim=-1).mean()
+    avg_probs = (softprobs.sum(0) / softprobs.shape[0]).squeeze(1)  # (codebook_size,)
+    entropy = (-avg_probs * torch.log(avg_probs.clamp_min(1e-7))).sum(dim=-1)
+    return -entropy
 
 
 def sample_vectors(inputs: torch.Tensor, num_samples: int) -> torch.Tensor:
@@ -181,7 +184,7 @@ def kmeans(
         new_means = new_means / bins_min_clamped[:, None]  # (num_clusters, dim_feature)
 
         if use_cosine_sim:
-            new_means = F.normalize(new_means, p=2, dim=-1, eps=1e-6)
+            new_means = l2_norm(new_means)
 
         means = torch.where(zero_mask[:, None], means, new_means)
 
@@ -197,7 +200,7 @@ def efficient_rotation_trick_transform(u : torch.Tensor, q : torch.Tensor, e : t
     4.2 in https://arxiv.org/abs/2410.06424
     """
     e = e[:, None, :]  # (N, 1, dim_feature)
-    w = F.normalize(u + q, p=2, dim=1, eps=1e-6).detach()  # (N, dim_feature)
+    w = l2_norm(u + q).detach()  # (N, dim_feature)
     return (
         e -
         2 * (e @ w[:, :, None] @ w[:, None, :]) +
@@ -236,7 +239,8 @@ class VectorQuantize(nn.Module):
     """
     def __init__(self, 
                  codebook_size: int, 
-                 dim_feature: int, 
+                 dim_feature: int,
+                 use_cosine_sim=False,
                  kmeans_init=True,
                  kmeans_sample_multiplier=1,
                  kmeans_iter=10,
@@ -256,6 +260,7 @@ class VectorQuantize(nn.Module):
         super().__init__()
         self.codebook_size = codebook_size
         self.dim_feature = dim_feature
+        self.use_cosine_sim = use_cosine_sim
         self.kmeans_init = kmeans_init
         self.kmeans_sample_multiplier = kmeans_sample_multiplier
         self.kmeans_iter = kmeans_iter
@@ -283,6 +288,8 @@ class VectorQuantize(nn.Module):
             self.inited.data.fill_(True)
         else:
             embed = uniform_init(codebook_size, dim_feature)
+            if use_cosine_sim:
+                embed = l2_norm(embed)
             self.inited.data.fill_(True)
 
         if use_simvq:
@@ -327,7 +334,7 @@ class VectorQuantize(nn.Module):
                 inputs=inputs,
                 num_clusters=self.codebook_size,
                 num_iters=self.kmeans_iter,
-                use_cosine_sim=False,
+                use_cosine_sim=self.use_cosine_sim,
             )
 
             cluster_size = cluster_size.float()
@@ -377,6 +384,8 @@ class VectorQuantize(nn.Module):
             
             cluster_size_smoothed = laplace_smoothing(self.cluster_size, self.codebook_size)
             embed_normalized = self.embed_avg / cluster_size_smoothed[:, None]
+            if self.use_cosine_sim:
+                embed_normalized = l2_norm(embed_normalized)
             self.embed.data.copy_(embed_normalized)
 
     def _loss(self, x, quantized, dists):
@@ -400,9 +409,14 @@ class VectorQuantize(nn.Module):
     @property
     def codebook(self) -> torch.Tensor:
         if self.use_simvq:
-            return self.code_transform(self.embed)
+            code = self.code_transform(self.embed)
         else:
-            return self.embed
+            code = self.embed
+
+        if self.use_cosine_sim and not self.ema_update:
+            code = l2_norm(code)
+
+        return code
 
     @property
     def normalized_cluster_size(self) -> torch.Tensor:
@@ -430,6 +444,9 @@ class VectorQuantize(nn.Module):
         assert x.shape[-1] == self.dim_feature, \
             f"Wrong input dim {x.shape[-1]} != {self.dim_feature}"
         
+        if self.use_cosine_sim:
+            x = l2_norm(x)
+        
         if not self.inited:
             self._accumulate_input_batch(x)
             return x, None
@@ -438,7 +455,10 @@ class VectorQuantize(nn.Module):
         codebook = self.codebook  # (codebook_size, dim_feature)
 
         # compute distances to codebook embeddings
-        dists = l2_dist(x, codebook)  # (N, codebook_size)
+        if self.use_cosine_sim:
+            dists = cosine_dist(x, codebook)  # (N, codebook_size)
+        else:
+            dists = l2_dist(x, codebook)  # (N, codebook_size)
         
         # find closest codebook embeddings
         embed_indices = gumbel_sample(
@@ -446,7 +466,7 @@ class VectorQuantize(nn.Module):
             stochastic=self.stochastic_sampling, 
             temperature=self.sampling_temp, 
             training=self.training,
-        )  # (N,),  (N, codebook_size)
+        )  # (N,)
 
         # get quantized vectors
         quantized = F.embedding(embed_indices, codebook)  # (N, dim_feature)
