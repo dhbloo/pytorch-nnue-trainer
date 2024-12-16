@@ -93,3 +93,9 @@ def ascii_hist(name, x, bins=10, width=60):
         bar = "#" * int(n * 1.0 * width / nmax)
         xi = "{0: <8.4g}".format(xi).ljust(10)
         print("{0}| {1}".format(xi, bar))
+
+
+def aligned_write(output, buffer, alignment=1):
+    output.write(buffer)
+    padding = (alignment - len(buffer) % alignment) % alignment
+    output.write(b"\0" * padding)

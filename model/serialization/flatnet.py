@@ -2,7 +2,7 @@ import torch
 import numpy as np
 import io
 from tqdm import tqdm
-from utils.misc_utils import ascii_hist
+from utils.misc_utils import ascii_hist, aligned_write
 from . import BaseSerializer, SERIALIZERS
 from ..flatnet import *
 
@@ -781,16 +781,16 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
     The corresponding C-language struct layout:
     struct FlatSquare7x7NNUEv4VQWeight {
         // mapping features
-        uint16_t mapping4x4_indices[3][43046721];
-        int8_t   mapping4x4_features[3][CodebookSize][FeatureDim];
+        alignas(32) uint16_t mapping4x4_indices[3][43046721];
+        alignas(32) int8_t   mapping4x4_features[3][CodebookSize][FeatureDim];
 
         // nnue layers weights
-        int8_t  l1_weight[32][FeatureDim];
-        int32_t l1_bias[32];
-        int8_t  l2_weight[32][32];
-        int32_t l2_bias[32];
-        int8_t  l3_weight[4][32];
-        int32_t l3_bias[4];
+        alignas(32) int8_t  l1_weight[32][FeatureDim];
+        alignas(32) int32_t l1_bias[32];
+        alignas(32) int8_t  l2_weight[32][32];
+        alignas(32) int32_t l2_bias[32];
+        alignas(32) int8_t  l3_weight[4][32];
+        alignas(32) int32_t l3_bias[4];
     };
     """
 
@@ -899,24 +899,22 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
             model
         )
 
-        o: io.RawIOBase = out
-
         # uint16_t mapping4x4_indices[3][43046721];
-        o.write(mapping4x4_indices.astype("<u2").tobytes())
+        aligned_write(out, mapping4x4_indices.astype("<u2").tobytes(), alignment=32)
         # int8_t   mapping4x4[3][CodebookSize][FeatureDim];
-        o.write(mapping4x4_features.astype("<i1").tobytes())  # (3, CodebookSize, F)
+        aligned_write(out, mapping4x4_features.astype("<i1").tobytes(), alignment=32)  # (3, CodebookSize, F)
 
         # float l1_weight[32][FeatureDim];
         # float l1_bias[32];
-        o.write(linear1_weight.astype("<i1").tobytes())  # (32, F)
-        o.write(linear1_bias.astype("<i4").tobytes())  # (32,)
+        aligned_write(out, linear1_weight.astype("<i1").tobytes(), alignment=32)  # (32, F)
+        aligned_write(out, linear1_bias.astype("<i4").tobytes(), alignment=32)  # (32,)
 
         # float l2_weight[32][32];
         # float l2_bias[32];
-        o.write(linear2_weight.astype("<i1").tobytes())  # (32, 32)
-        o.write(linear2_bias.astype("<i4").tobytes())  # (32,)
+        aligned_write(out, linear2_weight.astype("<i1").tobytes(), alignment=32)  # (32, 32)
+        aligned_write(out, linear2_bias.astype("<i4").tobytes(), alignment=32)  # (32,)
 
         # float l3_weight[4][32];
         # float l3_bias[4];
-        o.write(linear3_weight.astype("<i1").tobytes())  # (4, 32)
-        o.write(linear3_bias.astype("<i4").tobytes())  # (4,)
+        aligned_write(out, linear3_weight.astype("<i1").tobytes(), alignment=32)  # (4, 32)
+        aligned_write(out, linear3_bias.astype("<i4").tobytes(), alignment=32)  # (4,)
