@@ -1379,6 +1379,32 @@ class FlatSquare7x7NNUEv4(nn.Module):
 
         return value, policy, aux_losses, aux_outputs
 
+    def forward_debug_print(self, data):
+        input_plane = self.input_plane(data)  # [B, C, H, W]
+        _, _, H, W = input_plane.shape
+
+        # get feature sum from chunks
+        feature_groups = self.get_features(input_plane)
+
+        # do vector quantization
+        feature_groups, aux_losses, aux_outputs = self._do_vector_quantize(feature_groups)
+        for i, f in enumerate(feature_groups):
+            print(f"feature_group{i}: \n{(fake_quant(f, scale=128) * 128).int()}")
+
+        # int8 quant and sum
+        feature = torch.sum(fake_quant(torch.cat(feature_groups), scale=128), dim=0)
+        print(f"feature sum: \n{(feature * 128).int()}")
+
+        # value head
+        value = feature  # [B, dim_feature]
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
+            value = layer(value)
+
+        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+
+        return value, policy, aux_losses, aux_outputs
+
     @property
     def weight_clipping(self):
         return [
