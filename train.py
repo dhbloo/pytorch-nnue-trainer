@@ -1,9 +1,11 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs, ProfileKwargs
+from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
+from contextlib import nullcontext
 import configargparse
 import yaml
 import json
@@ -21,7 +23,7 @@ from utils.training_utils import (
     weight_clipping,
     state_dict_drop_size_unmatched,
 )
-from utils.misc_utils import add_dict_to, seed_everything, log_value_dict
+from utils.misc_utils import seed_everything, set_performance_level, add_dict_to, log_value_dict
 from utils.file_utils import find_latest_model_file, get_iteration_from_model_filename
 
 
@@ -38,9 +40,13 @@ def parse_args_and_init():
     parser.add("--dataset_type", required=True, help="Dataset type")
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
     parser.add("--val_dataset_type", help="Validate Dataset type (If not set, then it's same as train set)")
-    parser.add("--val_dataset_args", type=yaml.safe_load, default={}, help="Extra validate dataset arguments")
+    parser.add(
+        "--val_dataset_args", type=yaml.safe_load, default={}, help="Extra validate dataset arguments"
+    )
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
-    parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline type and arguments")
+    parser.add(
+        "--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline type and arguments"
+    )
     parser.add("--num_worker", type=int, default=min(8, os.cpu_count()), help="Num of dataloader workers")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
@@ -61,7 +67,7 @@ def parse_args_and_init():
     parser.add("--seed", type=int, default=42, help="Random seed")
     parser.add("--log_interval", type=int, default=100, help="Num iterations to log")
     parser.add("--show_interval", type=int, default=1000, help="Num iterations to display")
-    parser.add("--save_interval", type=int, default=50000, help="Num iterations to save snapshot")
+    parser.add("--save_interval", type=int, default=100000, help="Num iterations to save snapshot")
     parser.add("--val_interval", type=int, default=50000, help="Num iterations to do validation")
     parser.add("--avg_loss_interval", type=int, default=2500, help="Num iterations to average loss")
     parser.add(
@@ -71,14 +77,33 @@ def parse_args_and_init():
         help="Num iterations to save a temporary snapshot (removed when there is newer one)",
     )
     parser.add("--kd_model_type", help="Knowledge distillation model type")
-    parser.add("--kd_model_args", type=yaml.safe_load, default={}, help="Knowledge distillation extra model arguments")
+    parser.add(
+        "--kd_model_args",
+        type=yaml.safe_load,
+        default={},
+        help="Knowledge distillation extra model arguments",
+    )
     parser.add("--kd_checkpoint", help="Knowledge distillation model checkpoint")
     parser.add("--kd_T", type=float, default=1.0, help="Knowledge distillation temperature")
     parser.add(
-        "--kd_alpha", type=float, default=1.0, help="Distillation loss ratio in [0,1] (1 for distillation loss only)"
+        "--kd_alpha",
+        type=float,
+        default=1.0,
+        help="Distillation loss ratio in [0,1] (1 for distillation loss only)",
     )
     parser.add("--kd_use_train_mode", action="store_true", help="Set teacher to train mode")
+    parser.add("--kd_disable_amp", action="store_true", help="Disable mixed precision for teacher")
     parser.add("--find_unused_parameters", action="store_true", help="Enable find_unused_parameters in DDP")
+    parser.add(
+        "--performance_level",
+        type=int,
+        default=2,
+        help="Performance level to use. A higher value will trade higher performance with less precision and reproducibility",
+    )
+    parser.add("--profile", action="store_true", help="Enable profiling")
+    parser.add("--profile_active_iters", type=int, default=100, help="Num iterations to profile")
+    parser.add("--profile_warmup_iters", type=int, default=100, help="Warmup iterations before profiling")
+    parser.add("--profile_memory", action="store_true", help="Enable memory profiling")
 
     args = parser.parse_args()  # parse args
     parser.print_values()  # print out values
@@ -177,7 +202,9 @@ def calc_loss(
             policy_loss_weight = None
 
         if policy_loss_type == "CE":
-            return cross_entropy_with_softlabel(policy, policy_target, adjust=True, weight=policy_loss_weight)
+            return cross_entropy_with_softlabel(
+                policy, policy_target, adjust=True, weight=policy_loss_weight
+            )
         elif policy_loss_type == "MSE":
             policy_softmaxed = torch.softmax(policy, dim=1)
             policy_loss = F.mse_loss(policy_softmaxed, policy_target, reduction="none")
@@ -333,17 +360,52 @@ def training_loop(
     kd_T,
     kd_alpha,
     kd_use_train_mode,
+    kd_disable_amp,
     find_unused_parameters,
+    performance_level,
+    profile,
+    profile_active_iters,
+    profile_warmup_iters,
+    profile_memory,
     **kwargs,
 ):
     # use accelerator
     dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)
     accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config, kwargs_handlers=[ddp_kwargs])
+    set_performance_level(performance_level)
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
         log_filename = os.path.join(rundir, "training_log.json")
+
+    profile_ctx = nullcontext()
+    if profile:
+
+        def profile_handler(p: torch.profiler.profile):
+            if accelerator.is_local_main_process:
+                dev_name = "cpu" if use_cpu else "cuda"
+                print(p.key_averages().table(sort_by=f"{dev_name}_time_total", row_limit=16))
+                print("Profile finished. Saving trace...")
+            torch.profiler.tensorboard_trace_handler(os.path.join(rundir, "profile_trace"), use_gzip=True)(p)
+
+        profile_ctx = accelerator.profile(
+            ProfileKwargs(
+                activities=["cpu"] if use_cpu else ["cpu", "cuda"],
+                schedule_option={
+                    "active": profile_active_iters,
+                    "warmup": profile_warmup_iters,
+                    "wait": 0,
+                    "repeat": 1,
+                },
+                on_trace_ready=profile_handler,
+                record_shapes=True,
+                profile_memory=profile_memory,
+                with_stack=True,
+                with_flops=True,
+                with_modules=True,
+            )
+        )
 
     # load train and validation dataset
     train_dataset = build_dataset(
@@ -379,6 +441,8 @@ def training_loop(
         state_dicts = torch.load(ckpt_filename, map_location=accelerator.device)
         model.load_state_dict(state_dicts["model"])
         optimizer.load_state_dict(state_dicts["optimizer"])
+        if accelerator.scaler is not None and "scalar" in state_dicts:
+            accelerator.scaler.load_state_dict(state_dicts["scalar"])
         accelerator.print(f"Loaded from checkpoint: {ckpt_filename}")
         it = state_dicts.get("iteration", 0)
         epoch = state_dicts.get("epoch", 0)
@@ -397,8 +461,13 @@ def training_loop(
                 accelerator.print(f"missing keys in state_dict: {', '.join(missing_keys)}")
             accelerator.print(f"Loaded from pretrained: {load_from}")
 
+    # build lr scheduler
+    scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, last_it=it - 1, **lr_scheduler_args)
+
     # accelerate model training
-    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
+    model, optimizer, train_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, scheduler
+    )
     if val_loader is not None:
         val_loader = accelerator.prepare_data_loader(val_loader)
 
@@ -409,7 +478,7 @@ def training_loop(
         kd_model.load_state_dict(kd_state_dicts["model"])
         accelerator.print(f"Loaded teacher model {kd_model.name} from: {kd_checkpoint}")
 
-        kd_model = accelerator.prepare_model(kd_model)
+        kd_model = accelerator.prepare_model(kd_model, evaluation_mode=True)
         if kd_use_train_mode:
             kd_model.train()
         else:
@@ -423,49 +492,57 @@ def training_loop(
     else:
         kd_model = None
 
-    # build lr scheduler
-    lr_scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, last_it=it - 1, **lr_scheduler_args)
-
     accelerator.print(f"Start training from iteration {it}, epoch {epoch}")
+    train_data_iter = iter(train_loader)
     last_it = it
     last_time = time.time()
-    stop_training = False
     avg_metric_dict = {}
     model.train()
-    while not stop_training:
-        epoch += 1
-        for data in train_loader:
+    with profile_ctx as profiler:
+        while it < iterations:
+            torch.compiler.cudagraph_mark_step_begin()
+
+            # fetch the next batch of data from train loader
+            try:
+                data = next(train_data_iter)
+            except StopIteration:
+                epoch += 1
+                train_data_iter = iter(train_loader)
+                data = next(train_data_iter)
+
             it += 1
             rows += batch_size * accelerator.num_processes
-            if it > iterations:
-                stop_training = True
-                break
             data["train_progress"] = it / iterations
 
             # evaulate teacher model for knowledge distillation
-            with torch.no_grad():
+            with torch.no_grad(), nullcontext() if kd_disable_amp else accelerator.autocast():
                 kd_results = kd_model(data) if kd_model is not None else None
 
+            # get unwarpped model and apply weight clipping if needed
+            unwarpped_model = accelerator.unwrap_model(model)
+            if is_compiled_module(unwarpped_model):
+                unwarpped_model = unwarpped_model._orig_mod
+
             # apply weight clipping if needed
-            if hasattr(accelerator.unwrap_model(model), "weight_clipping"):
-                unwarpped_model = accelerator.unwrap_model(model)
-                clip_parameters = unwarpped_model.weight_clipping
-                weight_clipping(unwarpped_model.named_parameters(), clip_parameters)
+            if hasattr(unwarpped_model, "weight_clipping"):
+                # A workaround to get the original model from the dynamo optimized model
+                weight_clipping(unwarpped_model.named_parameters(), unwarpped_model.weight_clipping)
 
-            # model update
-            optimizer.zero_grad()
-            results = model(data)
-            loss, loss_dict, aux_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
-            accelerator.backward(loss)
+            with accelerator.accumulate(model), accelerator.autocast():
+                # model update
+                optimizer.zero_grad(set_to_none=True)
+                results = model(data)
+                loss, loss_dict, aux_dict = calc_loss(loss_type, data, results, kd_results, **loss_args)
+                accelerator.backward(loss)
 
-            # apply gradient clipping if needed
-            if clip_grad_norm is not None:
-                accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
-            if clip_grad_value is not None:
-                accelerator.clip_grad_value_(model.parameters(), clip_value=clip_grad_value)
+                # apply gradient clipping if needed
+                if clip_grad_norm is not None:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=clip_grad_norm)
+                elif clip_grad_value is not None:
+                    accelerator.clip_grad_value_(model.parameters(), clip_value=clip_grad_value)
 
-            optimizer.step()
-            lr_scheduler.step()
+                optimizer.step()
+                scheduler.step()
 
             # update running average loss
             loss_dict = accelerator.gather(loss_dict)
@@ -491,7 +568,7 @@ def training_loop(
                             "rows": rows,
                             "train_loss": loss_dict,
                             "train_aux": aux_dict,
-                            "lr": lr_scheduler.get_last_lr()[0],
+                            "lr": scheduler.get_last_lr()[0],
                         }
                     )
                     log.writelines([json_text, "\n"])
@@ -510,7 +587,7 @@ def training_loop(
                         "elasped_seconds": elasped,
                         "it/s": speed,
                         "entry/s": speed * batch_size,
-                        "lr": lr_scheduler.get_last_lr()[0],
+                        "lr": scheduler.get_last_lr()[0],
                     },
                     it,
                     rows,
@@ -525,22 +602,23 @@ def training_loop(
                 last_time = time.time()
 
             # snapshot saving
-            if (it % save_interval == 0 or it % temp_save_interval == 0) and accelerator.is_local_main_process:
+            if (
+                it % save_interval == 0 or it % temp_save_interval == 0
+            ) and accelerator.is_local_main_process:
                 # get latest snapshot filename
                 last_snapshot_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
 
                 # save snapshot at current iteration
-                snapshot_filename = os.path.join(rundir, f"ckpt_{model_name}_{it:08d}.pth")
-                torch.save(
-                    {
-                        "iteration": it,
-                        "epoch": epoch,
-                        "rows": rows,
-                        "model": accelerator.get_state_dict(model),
-                        "optimizer": optimizer.state_dict(),
-                    },
-                    snapshot_filename,
-                )
+                state_dict = {
+                    "iteration": it,
+                    "epoch": epoch,
+                    "rows": rows,
+                    "model": unwarpped_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                }
+                if accelerator.scaler is not None:
+                    state_dict["scalar"] = accelerator.scaler.state_dict()
+                torch.save(state_dict, os.path.join(rundir, f"ckpt_{model_name}_{it:08d}.pth"))
 
                 # remove last temporary snapshot if it's not a snapshot iteration
                 if last_snapshot_filename is not None:
@@ -558,10 +636,14 @@ def training_loop(
                 with torch.no_grad():
                     for val_data in val_loader:
                         # evaulate teacher model for knowledge distillation
-                        kd_results = kd_model(val_data) if kd_model is not None else None
+                        with nullcontext() if kd_disable_amp else accelerator.autocast():
+                            kd_results = kd_model(val_data) if kd_model is not None else None
                         # model evaluation
-                        results = model(val_data)
-                        _, val_losses, val_auxs = calc_loss(loss_type, val_data, results, kd_results, **loss_args)
+                        with accelerator.autocast():
+                            results = model(val_data)
+                            _, val_losses, val_auxs = calc_loss(
+                                loss_type, val_data, results, kd_results, **loss_args
+                            )
                         add_dict_to(val_loss_dict, val_losses)
                         add_dict_to(val_aux_dict, val_auxs)
                         num_val_batches += 1
@@ -611,6 +693,9 @@ def training_loop(
 
                     # substract validation time from training time
                     last_time += val_elasped
+
+            if profile:
+                profiler.step()
 
 
 if __name__ == "__main__":

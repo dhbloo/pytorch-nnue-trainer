@@ -424,6 +424,7 @@ class VectorQuantize(nn.Module):
     def from_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return F.embedding(indices, self.codebook)  # (..., dim_feature)
 
+    @torch.compiler.disable
     def forward(self, x: torch.Tensor):
         """
         Get the quantized version x_q of the continuous input x.

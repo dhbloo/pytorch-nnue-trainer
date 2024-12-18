@@ -19,7 +19,9 @@ class FlatNNUEv1(nn.Module):
     def __init__(self, flat_board_size, dim_policy=16, dim_value=32, input_type="basic-nostm"):
         super().__init__()
         if isinstance(flat_board_size, Iterable):
-            assert len(flat_board_size) == 2, f"flat_board_size should be a list of length 2, got {flat_board_size}"
+            assert (
+                len(flat_board_size) == 2
+            ), f"flat_board_size should be a list of length 2, got {flat_board_size}"
             flat_board_size = flat_board_size[0] * flat_board_size[1]
         self.model_size = (dim_policy, dim_value)
         self.flat_board_size = flat_board_size
@@ -55,7 +57,9 @@ class FlatNNUEv1(nn.Module):
             policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, flat_board_size]
         else:
-            policy = torch.zeros((feature.shape[0], self.flat_board_size), dtype=feature.dtype, device=feature.device)
+            policy = torch.zeros(
+                (feature.shape[0], self.flat_board_size), dtype=feature.dtype, device=feature.device
+            )
 
         # value head
         value = self.value(feature[:, dim_policy:])  # [B, 3]
@@ -87,7 +91,9 @@ class LadderConvLayer(nn.Module):
 
 @MODELS.register("flat_ladder7x7_nnue_v1")
 class FlatLadder7x7NNUEv1(nn.Module):
-    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False):
+    def __init__(
+        self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.value_no_draw = value_no_draw
@@ -216,7 +222,9 @@ class FlatLadder7x7NNUEv1(nn.Module):
 
 @MODELS.register("flat_ladder7x7_nnue_v2")
 class FlatLadder7x7NNUEv2(nn.Module):
-    def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False):
+    def __init__(
+        self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
         self.value_no_draw = value_no_draw
@@ -407,7 +415,9 @@ class FlatLadder7x7NNUEv3(nn.Module):
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(
+                        self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"
+                    ),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
@@ -573,7 +583,9 @@ class FlatConv3x3NNUE(nn.Module):
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(
+                        self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"
+                    ),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
@@ -645,10 +657,18 @@ class FlatConv3x44x3NNUE(nn.Module):
         self.stride_3x4 = stride_3x4
         self.stride_4x3 = stride_4x3
         num_conv3x4 = sum(
-            [1 for y in range(0, board_size[0] - 2, stride_3x4[0]) for x in range(0, board_size[1] - 3, stride_3x4[1])]
+            [
+                1
+                for y in range(0, board_size[0] - 2, stride_3x4[0])
+                for x in range(0, board_size[1] - 3, stride_3x4[1])
+            ]
         )
         num_conv4x3 = sum(
-            [1 for y in range(0, board_size[0] - 3, stride_4x3[0]) for x in range(0, board_size[1] - 2, stride_4x3[1])]
+            [
+                1
+                for y in range(0, board_size[0] - 3, stride_4x3[0])
+                for x in range(0, board_size[1] - 2, stride_4x3[1])
+            ]
         )
         self.conv_mappings3x4 = self._make_conv3x4_mappings(num_conv3x4, dim_middle, dim_feature)
         self.conv_mappings4x3 = self._make_conv4x3_mappings(num_conv4x3, dim_middle, dim_feature)
@@ -668,7 +688,9 @@ class FlatConv3x44x3NNUE(nn.Module):
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(
+                        self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"
+                    ),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=(1, 2), st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
@@ -681,7 +703,9 @@ class FlatConv3x44x3NNUE(nn.Module):
         for _ in range(num_conv):
             conv_list.append(
                 nn.Sequential(
-                    Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
+                    Conv2dBlock(
+                        self.input_plane.dim_plane, dim_middle, ks=2, st=1, norm="bn", activation="mish"
+                    ),
                     Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_middle, ks=(2, 1), st=1, norm="bn", activation="mish"),
                     Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
@@ -749,7 +773,9 @@ class FlatConv3x44x3NNUE(nn.Module):
 
 @MODELS.register("flat_hashconv_nnue")
 class FlatHashConvNNUE(nn.Module):
-    def __init__(self, kernel_size, hash_logsize, dim_feature=32, input_type="basic-nostm", value_no_draw=False):
+    def __init__(
+        self, kernel_size, hash_logsize, dim_feature=32, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (kernel_size, hash_logsize, dim_feature)
         self.value_no_draw = value_no_draw
@@ -914,7 +940,11 @@ class FlatHash7x7NNUEv1(nn.Module):
                 "min_weight": -128 / 128,
                 "max_weight": 127 / 128,
             },
-            {"params": ["hash_layer_corner.features.weight"], "min_weight": -128 / 128, "max_weight": 127 / 128},
+            {
+                "params": ["hash_layer_corner.features.weight"],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
         ]
 
     @property
@@ -925,7 +955,9 @@ class FlatHash7x7NNUEv1(nn.Module):
 
 @MODELS.register("flat_square7x7_nnue_v1")
 class FlatSquare7x7NNUEv1(nn.Module):
-    def __init__(self, dim_middle=128, dim_feature=8, quant_int4=False, input_type="basic-nostm", value_no_draw=False):
+    def __init__(
+        self, dim_middle=128, dim_feature=8, quant_int4=False, input_type="basic-nostm", value_no_draw=False
+    ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.quant_int4 = quant_int4
@@ -1280,14 +1312,21 @@ class FlatSquare7x7NNUEv3(nn.Module):
 @MODELS.register("flat_square7x7_nnue_v4")
 class FlatSquare7x7NNUEv4(nn.Module):
     def __init__(
-        self, dim_middle=128, dim_feature=32, input_type="basic-nostm", value_no_draw=False, unit_feature_vector=False
+        self,
+        dim_middle=128,
+        dim_feature=32,
+        input_type="basic-nostm",
+        value_no_draw=False,
+        unit_feature_vector=False,
     ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
         self.value_no_draw = value_no_draw
         self.unit_feature_vector = unit_feature_vector
         self.input_plane = build_input_plane(input_type)
-        self.mapping4x4 = nn.ModuleList([self._make_4x4_mapping(dim_middle, dim_feature) for _ in range(3)])
+        self.mapping4x4 = nn.ModuleList(
+            [self._make_4x4_mapping(self.input_plane.dim_plane, dim_middle, dim_feature) for _ in range(3)]
+        )
 
         # value head
         dim_vhead = 1 if value_no_draw else 3
@@ -1299,14 +1338,14 @@ class FlatSquare7x7NNUEv4(nn.Module):
             ]
         )
 
-    def _make_4x4_mapping(self, dim_middle, dim_mapping):
+    def _make_4x4_mapping(self, dim_in, dim_mid, dim_map):
         return nn.Sequential(
-            Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, activation="relu"),
-            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="relu"),
-            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="relu"),
-            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="relu"),
-            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="relu"),
-            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
+            Conv2dBlock(dim_in, dim_mid, ks=2, st=1, activation="relu", bias=False),
+            Conv2dBlock(dim_mid, dim_mid, ks=1, st=1, norm="bn", activation="relu", bias=False),
+            Conv2dBlock(dim_mid, dim_mid, ks=2, st=1, norm="bn", activation="relu", bias=False),
+            Conv2dBlock(dim_mid, dim_mid, ks=1, st=1, norm="bn", activation="relu", bias=False),
+            Conv2dBlock(dim_mid, dim_mid, ks=2, st=1, norm="bn", activation="relu", bias=False),
+            Conv2dBlock(dim_mid, dim_map, ks=1, st=1, norm="bn", activation="none"),
         )
 
     def _do_vector_quantize(self, feature_groups):
@@ -1433,7 +1472,9 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         use_cosine_sim=False,
         **vq_kwargs,
     ):
-        super().__init__(dim_middle, dim_feature, input_type, value_no_draw, unit_feature_vector=use_cosine_sim)
+        super().__init__(
+            dim_middle, dim_feature, input_type, value_no_draw, unit_feature_vector=use_cosine_sim
+        )
         self.codebook_size = codebook_size
         self.use_cosine_sim = use_cosine_sim
         self.vq_layer = nn.ModuleList(
@@ -1493,3 +1534,8 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                 "vq_cluster_size_q90": cluster_size_q90,
             }
         return feature_groups, aux_losses, aux_outputs
+
+    @property
+    def name(self):
+        m, f = self.model_size
+        return f"flat_square7x7_nnue_v4_{m}m{f}f{self.codebook_size}vq"

@@ -15,6 +15,15 @@ def seed_everything(seed: int):
     torch.backends.cudnn.benchmark = True
 
 
+def set_performance_level(level: int):
+    if not (0 <= level <= 3):
+        raise ValueError(f"Performance level must in [0,3], got {level}.")
+    torch.backends.cudnn.deterministic = level == 0
+    torch.backends.cudnn.benchmark = level >= 1
+    torch.backends.cudnn.allow_tf32 = level >= 1
+    torch.set_float32_matmul_precision("medium" if level >= 3 else "high" if level >= 2 else "highest")
+
+
 def add_dict_to(total_dict, dict_to_add):
     for k, v in dict_to_add.items():
         if k in total_dict:

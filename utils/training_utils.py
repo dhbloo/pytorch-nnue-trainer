@@ -107,6 +107,10 @@ def build_data_loader(
         assert isinstance(dataset, IterableDataset), "batch_by_boardsize must be used with IterableDataset"
         dataset = BatchByBoardSizeDataset(dataset, batch_size)
 
+    # Default to pin_memory=True for better performance
+    if "pin_memory" not in kwargs:
+        kwargs["pin_memory"] = True
+
     dataloader = DataLoader(
         dataset,
         batch_size,
