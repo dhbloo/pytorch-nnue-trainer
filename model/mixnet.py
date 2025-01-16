@@ -16,10 +16,6 @@ from .blocks import (
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
 
-###########################################################
-# Mix6Net adopted from https://github.com/hzyhhzy/gomoku_nnue/blob/87603e908cb1ae9106966e3596830376a637c21a/train_pytorch/model.py#L736
-###########################################################
-
 
 def tuple_op(f, x):
     return tuple((f(xi) if xi is not None else None) for xi in x)
@@ -123,6 +119,8 @@ class Mapping(nn.Module):
 
 @MODELS.register("mix6")
 class Mix6Net(nn.Module):
+    """Mix6Net adopted from https://github.com/hzyhhzy/gomoku_nnue/blob/87603e908cb1ae9106966e3596830376a637c21a/train_pytorch/model.py#L736"""
+
     def __init__(self, dim_middle=128, dim_policy=16, dim_value=32, map_max=30, input_type="basic-nostm"):
         super().__init__()
         self.model_size = (dim_middle, dim_policy, dim_value)
@@ -1255,11 +1253,13 @@ class Mix10Net(nn.Module):
         dim_dwconv=32,
         input_type="basicns",
         one_mapping=False,
+        spherical_feature=False,
     ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
         self.input_type = input_type
         self.one_mapping = one_mapping
+        self.spherical_feature = spherical_feature
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
         assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
@@ -1334,6 +1334,10 @@ class Mix10Net(nn.Module):
             feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
             feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
             feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
+
+        # normalize feature onto hypersphere of radius 16
+        if self.spherical_feature:
+            feature = F.normalize(feature, p=2, dim=2) * 16
 
         # clamp feature for int quantization
         feature = torch.clamp(feature, min=-16, max=511 / 32)  # int16, scale=32, [-16,16]
@@ -1495,8 +1499,8 @@ class Mix10Net(nn.Module):
         # value head
         value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
         value_large, value_large_uncertainty = self.value_head_large(feature, value_small_feature)
-        value_large_uncertainty = F.softplus(value_large_uncertainty, threshold=10)
-        value_relative_uncertainty = F.sigmoid(value_relative_uncertainty)
+        value_large_uncertainty = F.softplus(value_large_uncertainty.float(), threshold=10)
+        value_relative_uncertainty = F.sigmoid(value_relative_uncertainty.float())
 
         # policy head
         policy = self.policy_head(feature, value_small_feature)

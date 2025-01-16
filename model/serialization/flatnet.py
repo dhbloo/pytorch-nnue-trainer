@@ -456,8 +456,8 @@ class FlatSquare7x7NNUEv2Serializer(BaseSerializer):
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv2, device: torch.device):
         mapping4x4, mapping4x3 = self._export_feature_map(model, device)
-        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = self._export_value(
-            model
+        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = (
+            self._export_value(model)
         )
 
         o: io.RawIOBase = out
@@ -610,8 +610,8 @@ class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv3, device: torch.device):
         mapping3x4 = self._export_feature_map(model, device)
-        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = self._export_value(
-            model
+        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = (
+            self._export_value(model)
         )
 
         o: io.RawIOBase = out
@@ -655,23 +655,25 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
     The corresponding C-language struct layout:
     struct FlatSquare7x7NNUEv4Weight {
         // mapping features
-        int8_t  mapping4x4[3][43046721][FeatureDim];
+        alignas(32) int8_t  mapping4x4[3][43046721][FeatureDim];
 
         // nnue layers weights
-        int8_t  l1_weight[32][FeatureDim];
-        int32_t l1_bias[32];
-        int8_t  l2_weight[32][32];
-        int32_t l2_bias[32];
-        int8_t  l3_weight[4][32];
-        int32_t l3_bias[4];
+        alignas(32) int8_t  l1_weight[32][FeatureDim];
+        alignas(32) int32_t l1_bias[32];
+        alignas(32) int8_t  l2_weight[32][32];
+        alignas(32) int32_t l2_bias[32];
+        alignas(32) int8_t  l3_weight[4][32];
+        alignas(32) int32_t l3_bias[4];
     };
     """
 
-    def __init__(self, s_input=256, s_weight=128, batch_size=16384, **kwargs):
+    def __init__(self, s_input=256, s_weight=128, batch_size=8192, compile=True, enable_amp=True, **kwargs):
         super().__init__(**kwargs)
         self.s_input = s_input
         self.s_weight = s_weight
         self.batch_size = batch_size
+        self.enable_amp = enable_amp
+        self.compile = (lambda m: torch.compile(m, mode="reduce-overhead")) if compile else (lambda m: m)
 
     @property
     def is_binary(self) -> bool:
@@ -684,9 +686,13 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
     def arch_hash(self, model) -> int:
         raise NotImplementedError()
 
-    def _get_mapping4x4_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
-        inputs = torch.zeros(indices.shape[0], 2, 4, 4)
+    def _get_mapping4x4_input(self, start_idx: int, end_idx: int, device: torch.device) -> torch.Tensor:
+        indices = torch.arange(start_idx, end_idx, dtype=torch.int32, device=device)
+        inputs = torch.zeros(
+            (indices.shape[0], 2, 4, 4),
+            dtype=torch.float16 if self.enable_amp else torch.float32,
+            device=device,
+        )
         for i in range(4 * 4):
             bit = (indices // 3**i) % 3
             inputs[:, 0, i // 4, i % 4] = bit == 1
@@ -697,21 +703,24 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
     def _export_feature_map(self, model: FlatSquare7x7NNUEv4, device: torch.device):
         num_mappings = len(model.mapping4x4)
         dim_feature = model.model_size[1]
-        mapping4x4 = torch.zeros((num_mappings, 3**16, dim_feature), device=device)
-        for i_start in tqdm(range(0, 3**16, self.batch_size)):
-            i_end = min(i_start + self.batch_size, 3**16)
-            chunk4x4_input = self._get_mapping4x4_input(i_start, i_end).to(device)
-            for j in range(num_mappings):
-                feature = model.mapping4x4[j](chunk4x4_input)
-                feature = feature.squeeze(-1).squeeze(-1)
-                if model.unit_feature_vector:
-                    feature = F.normalize(feature, p=2, dim=-1)
-                feature = torch.clamp(feature, min=-1, max=127 / 128)
-                mapping4x4[j, i_start:i_end] = feature
+
+        # compute mapping4x4's features
+        model_mapping4x4 = [self.compile(model.mapping4x4[j]) for j in range(num_mappings)]
+        mapping4x4 = torch.zeros((num_mappings, 3**16, dim_feature), dtype=torch.int8, device=device)
+        with torch.autocast(device.type, enabled=self.enable_amp):
+            for i_start in tqdm(range(0, 3**16, self.batch_size)):
+                i_end = min(i_start + self.batch_size, 3**16)
+                chunk4x4_input = self._get_mapping4x4_input(i_start, i_end, device)
+                for j in range(num_mappings):
+                    feature = model_mapping4x4[j](chunk4x4_input)
+                    feature = feature.squeeze(-1).squeeze(-1)
+                    if model.unit_feature_vector:
+                        feature = F.normalize(feature, p=2, dim=-1)
+                    feature = feature.mul_(128).round_().clamp_(-128, 127)
+                    mapping4x4[j, i_start:i_end] = feature.to(torch.int8)
 
         mapping4x4 = mapping4x4.cpu().numpy()
-        ascii_hist(f"mapping4x4", mapping4x4)
-        mapping4x4 = np.clip(np.around(mapping4x4 * 128), -128, 127).astype(np.int8)
+        ascii_hist(f"mapping4x4_quantized", mapping4x4)
 
         return mapping4x4
 
@@ -748,29 +757,27 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv4, device: torch.device):
         mapping4x4 = self._export_feature_map(model, device)
-        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = self._export_value(
-            model
+        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = (
+            self._export_value(model)
         )
 
-        o: io.RawIOBase = out
-
         # int8_t mapping4x4[3][43046721][FeatureDim];
-        o.write(mapping4x4.astype("<i1").tobytes())  # (3, 43046721, F)
+        aligned_write(out, mapping4x4.astype("<i1").tobytes(), alignment=32)  # (3, 43046721, F)
 
         # float l1_weight[32][FeatureDim];
         # float l1_bias[32];
-        o.write(linear1_weight.astype("<i1").tobytes())  # (32, F)
-        o.write(linear1_bias.astype("<i4").tobytes())  # (32,)
+        aligned_write(out, linear1_weight.astype("<i1").tobytes(), alignment=32)  # (32, F)
+        aligned_write(out, linear1_bias.astype("<i4").tobytes(), alignment=32)  # (32,)
 
         # float l2_weight[32][32];
         # float l2_bias[32];
-        o.write(linear2_weight.astype("<i1").tobytes())  # (32, 32)
-        o.write(linear2_bias.astype("<i4").tobytes())  # (32,)
+        aligned_write(out, linear2_weight.astype("<i1").tobytes(), alignment=32)  # (32, 32)
+        aligned_write(out, linear2_bias.astype("<i4").tobytes(), alignment=32)  # (32,)
 
         # float l3_weight[4][32];
         # float l3_bias[4];
-        o.write(linear3_weight.astype("<i1").tobytes())  # (4, 32)
-        o.write(linear3_bias.astype("<i4").tobytes())  # (4,)
+        aligned_write(out, linear3_weight.astype("<i1").tobytes(), alignment=32)  # (4, 32)
+        aligned_write(out, linear3_bias.astype("<i4").tobytes(), alignment=32)  # (4,)
 
 
 @SERIALIZERS.register("flat_square7x7_nnue_v4_vq")
@@ -794,11 +801,13 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
     };
     """
 
-    def __init__(self, s_input=256, s_weight=128, batch_size=16384, **kwargs):
+    def __init__(self, s_input=256, s_weight=128, batch_size=16384, compile=True, enable_amp=True, **kwargs):
         super().__init__(**kwargs)
         self.s_input = s_input
         self.s_weight = s_weight
         self.batch_size = batch_size
+        self.enable_amp = enable_amp
+        self.compile = (lambda m: torch.compile(m, mode="reduce-overhead")) if compile else (lambda m: m)
 
     @property
     def is_binary(self) -> bool:
@@ -811,9 +820,13 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
     def arch_hash(self, model) -> int:
         raise NotImplementedError()
 
-    def _get_mapping4x4_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
-        inputs = torch.zeros(indices.shape[0], 2, 4, 4)
+    def _get_mapping4x4_input(self, start_idx: int, end_idx: int, device: torch.device) -> torch.Tensor:
+        indices = torch.arange(start_idx, end_idx, dtype=torch.int32, device=device)
+        inputs = torch.zeros(
+            (indices.shape[0], 2, 4, 4),
+            dtype=torch.float16 if self.enable_amp else torch.float32,
+            device=device,
+        )
         for i in range(4 * 4):
             bit = (indices // 3**i) % 3
             inputs[:, 0, i // 4, i % 4] = bit == 1
@@ -827,21 +840,23 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
         dim_feature = model.model_size[1]
         assert num_codes <= 2**16, f"Only support maximum {2**16} codes now."
 
-        # compute mapping4x4's indices
+        # compute mapping4x4's features
+        model_mapping4x4 = [self.compile(model.mapping4x4[j]) for j in range(num_mappings)]
         mapping4x4_indices = torch.zeros((num_mappings, 3**16), dtype=torch.int, device=device)
-        for i_start in tqdm(range(0, 3**16, self.batch_size)):
-            i_end = min(i_start + self.batch_size, 3**16)
-            chunk4x4_input = self._get_mapping4x4_input(i_start, i_end).to(device)
-            for j in range(num_mappings):
-                feature = model.mapping4x4[j](chunk4x4_input)
-                feature = feature.squeeze(-1).squeeze(-1)
-                if model.unit_feature_vector:
-                    feature = F.normalize(feature, p=2, dim=-1)
-                feature = torch.clamp(feature, min=-1, max=127 / 128)
+        with torch.autocast(device.type, enabled=self.enable_amp):
+            for i_start in tqdm(range(0, 3**16, self.batch_size)):
+                i_end = min(i_start + self.batch_size, 3**16)
+                chunk4x4_input = self._get_mapping4x4_input(i_start, i_end, device)
+                for j in range(num_mappings):
+                    feature = model_mapping4x4[j](chunk4x4_input)
+                    feature = feature.squeeze(-1).squeeze(-1)
+                    if model.unit_feature_vector:
+                        feature = F.normalize(feature, p=2, dim=-1)
+                    feature = torch.clamp(feature, min=-1, max=127 / 128)
 
-                feature_quantized, info = model.vq_layer[j](feature)
-                embed_indices = info["embed_indices"].int()
-                mapping4x4_indices[j, i_start:i_end] = embed_indices
+                    feature_quantized, info = model.vq_layer[j](feature)
+                    embed_indices = info["embed_indices"].int()
+                    mapping4x4_indices[j, i_start:i_end] = embed_indices
 
         assert torch.all((mapping4x4_indices >= 0) & (mapping4x4_indices < num_codes)), (
             f"mapping4x4_indices.min()={mapping4x4_indices.min().item()}, "
@@ -895,8 +910,8 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv4VQ, device: torch.device):
         mapping4x4_indices, mapping4x4_features = self._export_feature_map(model, device)
-        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = self._export_value(
-            model
+        linear1_weight, linear1_bias, linear2_weight, linear2_bias, linear3_weight, linear3_bias = (
+            self._export_value(model)
         )
 
         # uint16_t mapping4x4_indices[3][43046721];
