@@ -407,6 +407,142 @@ class Conv1dLine4Block(nn.Module):
         return x
 
 
+class Conv2dSymBlock(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        out_dim: int,
+        ks: int,
+        st: int,
+        padding=0,
+        norm="none",
+        activation="relu",
+        bias=True,
+        groups=1,
+        activation_first=False,
+        quant=False,
+        input_quant_scale=128,
+        input_quant_bits=8,
+        weight_quant_scale=128,
+        weight_quant_bits=8,
+        bias_quant_scale=None,
+        bias_quant_bits=32,
+    ):
+        super().__init__()
+        self.activation_first = activation_first
+        self.norm = build_norm2d_layer(norm, out_dim)
+        self.activation = build_activation_layer(activation)
+
+        self.in_channels = in_dim
+        self.out_channels = out_dim
+        self.kernel_size = ks
+        self.stride = st
+        self.padding = padding  # zero padding
+        self.groups = groups
+
+        # Compute num_cells = 1 + 2 + ... + ks
+        self.num_cells = ks * (ks + 1) // 2
+        self.weight = nn.Parameter(torch.empty((self.num_cells, out_dim, in_dim // groups)))
+
+        half_ks = (self.kernel_size + 1) // 2
+        self.weight_index = []
+        for y in range(self.kernel_size):
+            for x in range(self.kernel_size):
+                i, j = y, x
+                if i >= half_ks:
+                    i = self.kernel_size - i - 1
+                if j >= half_ks:
+                    j = self.kernel_size - j - 1
+                if i > j:
+                    i, j = j, i
+                self.weight_index.append(i * half_ks + j - i * (i + 1) // 2)
+
+        if bias:
+            self.bias = nn.Parameter(torch.empty(out_dim))
+        else:
+            self.register_parameter("bias", None)
+
+        self.quant = quant
+        if quant:
+            self.input_quant_scale = input_quant_scale
+            self.input_quant_bits = input_quant_bits
+            self.weight_quant_scale = weight_quant_scale
+            self.weight_quant_bits = weight_quant_bits
+            self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
+            self.bias_quant_bits = bias_quant_bits
+
+    def reset_parameters(self):
+        init_weight = torch.empty(
+            (self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size)
+        )
+        nn.init.kaiming_uniform_(init_weight, a=math.sqrt(5))
+
+        # fill the weight tensor with the upper triangular part of the kernel
+        half_ks = (self.kernel_size + 1) // 2
+        for i in range(half_ks):
+            for j in range(i, half_ks):
+                idx = i * half_ks + j - i * (i + 1) // 2
+                self.weight.data[idx, :, :] = init_weight[:, :, i, j]
+
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(init_weight)
+            if fan_in != 0:
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(self.bias, -bound, bound)
+
+    def get_kernel_weight(self):
+        kernel = [self.weight[i] for i in self.weight_index]
+        kernel = torch.stack(kernel, dim=2)
+        kernel = kernel.reshape(
+            self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size
+        )
+        return kernel
+
+    def forward(self, x):
+        if self.activation_first:
+            if self.norm:
+                x = self.norm(x)
+            if self.activation:
+                x = self.activation(x)
+
+        w = self.get_kernel_weight()
+        b = self.bias
+
+        if self.quant:
+            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
+            w = fake_quant(w, self.weight_quant_scale, num_bits=self.weight_quant_bits)
+            if b is not None:
+                b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
+            if (
+                self.quant == "pixel-dwconv" or self.quant == "pixel-dwconv-floor"
+            ):  # pixel-wise quantization in depthwise conv
+                assert self.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
+                batch_size, _, h_in, w_in = x.shape
+                h_out = (h_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+                w_out = (w_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+                x = F.unfold(x, self.kernel_size, 1, self.padding, self.stride)
+                x = fake_quant(
+                    x * w.view(-1)[None, :, None],
+                    self.bias_quant_scale,
+                    num_bits=self.bias_quant_bits,
+                    floor=(self.quant == "pixel-dwconv-floor"),
+                )
+                x = x.reshape(batch_size, self.out_channels, -1, h_out * w_out).sum(2)
+                x = F.fold(x, (h_out, w_out), (1, 1))
+                x = x + b[None, :, None, None]
+            else:
+                x = F.conv2d(x, w, b, self.stride, self.padding, 1, self.groups)
+        else:
+            x = F.conv2d(x, w, b, self.stride, self.padding, 1, self.groups)
+
+        if not self.activation_first:
+            if self.norm:
+                x = self.norm(x)
+            if self.activation:
+                x = self.activation(x)
+        return x
+
+
 class ResBlock(nn.Module):
     def __init__(
         self,
