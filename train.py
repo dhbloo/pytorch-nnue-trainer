@@ -58,7 +58,7 @@ def parse_args_and_init():
     parser.add("--loss_type", default="CE+CE", help="Loss type")
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
-    parser.add("--batch_size", type=int, default=128, help="Batch size")
+    parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
     parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add("--weight_decay", type=float, default=1e-7, help="Weight decay")
     parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
@@ -217,6 +217,11 @@ def calc_loss(
             raise ValueError(f"Unsupported policy loss: {policy_loss_type}")
 
     # ===============================================================
+    # policy reg loss
+    def get_policy_reg_loss(policy: torch.Tensor):
+        return torch.mean(policy).square()
+
+    # ===============================================================
     # value uncertainty loss
     def get_value_uncertainty_gt(value: torch.Tensor):
         # stop gradient for value
@@ -265,33 +270,46 @@ def calc_loss(
     }
 
     if policy_reg_lambda is not None:
-        policy_reg = torch.mean(policy).square()
+        policy_reg = get_policy_reg_loss(policy)
         total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict["policy_reg"] = policy_reg.detach()
 
     if aux_losses is not None:
         for aux_loss_name, aux_loss in aux_losses.items():
+            aux_loss_print_name = f"{aux_loss_name}_loss"
+            aux_loss_weight = None
+            if f"{aux_loss_name}_lambda" in extra_args:
+                aux_loss_weight = float(extra_args[f"{aux_loss_name}_lambda"])
+
             # use pre-defined loss terms if aux_loss is a tuple of (string, inputs)
             if isinstance(aux_loss, tuple) and len(aux_loss) == 2:
                 aux_loss_type, aux_loss_input = aux_loss
                 if aux_loss_type == "value_loss":
                     aux_loss = get_value_loss(aux_loss_input)
+                    if aux_loss_weight is None:
+                        aux_loss_weight = value_lambda
                 elif aux_loss_type == "policy_loss":
                     aux_loss = get_policy_loss(aux_loss_input)
+                    if aux_loss_weight is None:
+                        aux_loss_weight = policy_lambda
                 elif aux_loss_type == "value_uncertainty_loss":
                     aux_loss = get_value_uncertainty_loss(*aux_loss_input)
                 elif aux_loss_type == "value_relative_uncertainty_loss":
                     aux_loss = get_value_relative_uncertainty_loss(*aux_loss_input)
+                elif aux_loss_type == "policy_reg":
+                    if aux_loss_weight is None and policy_reg_lambda is None:
+                        continue
+                    aux_loss = get_policy_reg_loss(aux_loss_input)
+                    aux_loss_print_name = aux_loss_name
+                    if aux_loss_weight is None:
+                        aux_loss_weight = policy_reg_lambda
                 else:
                     raise ValueError(f"Unsupported predefined aux loss: {aux_loss}")
 
-            if f"{aux_loss_name}_lambda" in extra_args:
-                aux_loss_weight = float(extra_args[f"{aux_loss_name}_lambda"])
-            else:
+            if aux_loss_weight is None:
                 aux_loss_weight = 1.0
-
             total_loss += aux_loss * aux_loss_weight
-            loss_dict[f"{aux_loss_name}_loss"] = aux_loss.detach()
+            loss_dict[aux_loss_print_name] = aux_loss.detach()
 
     if kd_results is not None:
         # also get a true loss from real data
@@ -377,7 +395,7 @@ def training_loop(
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
-        log_filename = os.path.join(rundir, "training_log.json")
+        log_filename = os.path.join(rundir, "training_log.jsonl")
 
     profile_ctx = nullcontext()
     if profile:
@@ -408,11 +426,16 @@ def training_loop(
         )
 
     # load train and validation dataset
+    batch_size_per_process = batch_size // accelerator.num_processes
     train_dataset = build_dataset(
         dataset_type, train_datas, shuffle=not no_shuffle, pipeline_args=data_pipelines, **dataset_args
     )
     train_loader = build_data_loader(
-        train_dataset, batch_size, num_workers=num_worker, shuffle=not no_shuffle, **dataloader_args
+        train_dataset,
+        batch_size_per_process,
+        num_workers=num_worker,
+        shuffle=not no_shuffle,
+        **dataloader_args,
     )
     if val_datas:
         val_dataset = build_dataset(
@@ -423,7 +446,7 @@ def training_loop(
             **(dataset_args if val_dataset_type is None else val_dataset_args),
         )
         val_loader = build_data_loader(
-            val_dataset, batch_size, num_workers=num_worker, shuffle=False, **dataloader_args
+            val_dataset, batch_size_per_process, num_workers=num_worker, shuffle=False, **dataloader_args
         )
     else:
         val_dataset, val_loader = None, None
@@ -465,9 +488,7 @@ def training_loop(
     scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, last_it=it - 1, **lr_scheduler_args)
 
     # accelerate model training
-    model, optimizer, train_loader, scheduler = accelerator.prepare(
-        model, optimizer, train_loader, scheduler
-    )
+    model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
     if val_loader is not None:
         val_loader = accelerator.prepare_data_loader(val_loader)
 
@@ -511,7 +532,7 @@ def training_loop(
                 data = next(train_data_iter)
 
             it += 1
-            rows += batch_size * accelerator.num_processes
+            rows += batch_size
             data["train_progress"] = it / iterations
 
             # evaulate teacher model for knowledge distillation
@@ -667,7 +688,7 @@ def training_loop(
                         val_aux_dict[k] = torch.sum(aux_tensor).item() / num_val_batches
 
                     val_elasped = time.time() - val_start_time
-                    num_val_entries = num_val_batches * batch_size
+                    num_val_entries = num_val_batches * batch_size_per_process
                     # log validation results
                     log_value_dict(tb_logger, "validation", val_loss_dict, it, rows)
                     if val_aux_dict:

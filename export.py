@@ -195,7 +195,7 @@ def export_onnx(output, model, export_args, **kwargs):
     )
 
 
-def export_binary(output, output_type, model_type, model, export_args, use_cpu, no_header=False, **kwargs):
+def export_serialization(output, output_type, model_type, model, export_args, use_cpu, no_header=False, **kwargs):
     serializer = build_serializer(model_type, **export_args)
     device = torch.device("cuda" if not use_cpu and torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -253,6 +253,8 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, **kw
             raise RuntimeError("Either checkpoint or rundir must be specified.")
         # try to find the latest checkpoint
         checkpoint = find_latest_model_file(rundir, f"ckpt_{model.name}")
+        if checkpoint is None:
+            raise RuntimeError(f"No checkpoint found in {rundir}")
     elif not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
 
@@ -271,18 +273,22 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, **kw
     elif export_type == "onnx":
         output = output or get_default_output_filename(checkpoint, "onnx")
         export_onnx(output, model, **kwargs)
+    elif export_type == "txt":
+        output = output or get_default_output_filename(checkpoint, "txt")
+        kwargs["export_args"].setdefault("text_output", True)
+        export_serialization(output, "raw", model_type, model, **kwargs)
     elif export_type == "bin":
         output = output or get_default_output_filename(checkpoint, "bin")
-        export_binary(output, "raw", model_type, model, **kwargs)
+        export_serialization(output, "raw", model_type, model, **kwargs)
     elif export_type == "bin-noheader":
         output = output or get_default_output_filename(checkpoint, "bin")
-        export_binary(output, "raw", model_type, model, **kwargs, no_header=True)
+        export_serialization(output, "raw", model_type, model, **kwargs, no_header=True)
     elif export_type == "bin-lz4":
         output = output or get_default_output_filename(checkpoint, "bin.lz4")
-        export_binary(output, "lz4", model_type, model, **kwargs)
+        export_serialization(output, "lz4", model_type, model, **kwargs)
     elif export_type == "bin-lz4-noheader":
         output = output or get_default_output_filename(checkpoint, "bin.lz4")
-        export_binary(output, "lz4", model_type, model, **kwargs, no_header=True)
+        export_serialization(output, "lz4", model_type, model, **kwargs, no_header=True)
     else:
         raise ValueError(f"Unsupported export: {export_type}")
 

@@ -1,11 +1,12 @@
 import torch
 import numpy as np
 import io
+from tqdm import tqdm
 from zlib import crc32
 from math import ceil
 from utils.misc_utils import ascii_hist
 from . import BaseSerializer, SERIALIZERS
-from ..mixnet import Mix6Net, Mix6QNet, Mix7Net, Mix8Net, Mix9Net
+from ..mixnet import Mix6Net, Mix6QNet, Mix7Net, Mix8Net, Mix9Net, Mix10Net
 
 
 def generate_base3_permutation(length):
@@ -2325,3 +2326,480 @@ class Mix9NetSerializer(BaseSerializer):
             o.write(policy_output_bias.astype("<f4").tobytes())
             # char  __padding_to_64bytes_1[44];
             o.write(np.zeros(44, dtype="<i1").tobytes())
+
+
+@SERIALIZERS.register("mix10")
+class Mix10NetSerializer(BaseSerializer):
+    """
+    Mix10Net binary serializer.
+
+    The corresponding C++ language struct layout:
+    template <int OutSize, int InSize>
+    struct LinearWeight
+    {
+        int8_t  weight[OutSize * InSize];
+        int32_t bias[OutSize];
+    };
+
+    struct Mix10Weight
+    {
+        // 1  mapping layer
+        int16_t mapping[2][ShapeNum][FeatureDim];
+
+        // 2  Depthwise conv
+        int16_t feature_dwconv_weight[9][FeatDWConvDim];
+        int16_t feature_dwconv_bias[FeatDWConvDim];
+
+        struct HeadBucket
+        {
+            // 3  Small Policy dynamic pointwise conv
+            LinearWeight<FeatureDim, FeatureDim>                        policy_small_pwconv_weight_l1;
+            LinearWeight<PolicySOutDim *(PolicySInDim + 1), FeatureDim> policy_small_pwconv_weight_l2;
+
+            // 4  Large Policy dynamic pointwise conv
+            LinearWeight<FeatureDim * 2, FeatureDim> policy_large_pwconv_weight_shared;
+            LinearWeight<PolicyLMidDim *(PolicyLInDim + 1), FeatureDim * 2> policy_large_pwconv_weight_1;
+            LinearWeight<PolicyLOutDim *(PolicyLMidDim + 1), FeatureDim * 2> policy_large_pwconv_weight_2;
+
+            // 5  Small Value Head MLP (layer 1,2,3)
+            LinearWeight<FeatureDim, FeatureDim> value_small_l1;
+            LinearWeight<FeatureDim, FeatureDim> value_small_l2;
+            LinearWeight<32, FeatureDim>         value_small_l3;
+            LinearWeight<4, 32>                  value_small_l4;
+
+            char __padding_to_64bytes_0[48];
+
+            // 6  Large Value Gate & Group MLP
+            LinearWeight<FeatureDim * 2, FeatureDim> value_gate;
+            LinearWeight<FeatureDim, FeatureDim>     value_corner;
+            LinearWeight<FeatureDim, FeatureDim>     value_edge;
+            LinearWeight<FeatureDim, FeatureDim>     value_center;
+            LinearWeight<FeatureDim, FeatureDim>     value_quad;
+
+            // 7  Large Value Head MLP (layer 1,2,3)
+            LinearWeight<FeatureDim, FeatureDim * 5> value_l1;
+            LinearWeight<32, FeatureDim>             value_l2;
+            LinearWeight<4, 32>                      value_l3;
+
+            // 8  Policy output linear
+            float policy_small_output_weight[PolicySOutDim];
+            float policy_large_output_weight[PolicyLOutDim];
+            float policy_small_output_bias;
+            float policy_large_output_bias;
+
+            char __padding_to_64bytes_1[40];
+        } buckets[NumHeadBucket];
+    };
+    """
+
+    def __init__(self, rule="freestyle", board_size=None, text_output=False, **kwargs):
+        if board_size is None:
+            boardsizes = [15]
+        elif isinstance(board_size, (list, tuple)):
+            boardsizes = list(board_size)
+        else:
+            boardsizes = [board_size]
+        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+        self.line_length = 11
+        self.text_output = text_output
+        self.map_table_export_batch_size = 4096
+
+    @property
+    def is_binary(self) -> bool:
+        return not self.text_output
+
+    def arch_hash(self, model: Mix10Net) -> int:
+        assert model.input_plane.dim_plane == 2
+        _, dim_feature, dim_dwconv = model.model_size
+        hash = crc32(b"Mix10Net")
+        hash ^= crc32(model.input_type.encode("utf-8"))
+        print(f"Mix10 ArchHashBase: {hex(hash)}")
+
+        assert dim_feature % 8 == 0, f"dim_feature must be a multiply of 8"
+        assert dim_dwconv % 8 == 0, f"dim_dwconv must be a multiply of 8"
+        hash ^= (dim_feature // 8) | ((dim_dwconv // 8) << 8)
+        return hash
+
+    def _export_map_table(self, model: Mix10Net, device, line, mapping_idx):
+        """
+        Export line -> feature mapping table.
+
+        Args:
+            line: shape (N, Length)
+        """
+        N, L = line.shape
+        us, opponent = line == 1, line == 2
+        line = np.stack((us, opponent), axis=0)[np.newaxis]  # [1, C=2, N, L]
+        line = torch.tensor(line, dtype=torch.float32, device=device)
+
+        batch_size = self.map_table_export_batch_size
+        batch_num = 1 + (N - 1) // batch_size
+        map_table = []
+        for i in range(batch_num):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, N)
+
+            mapping = getattr(model, f"mapping{mapping_idx}")
+            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]  # [dim_feature, batch, L]
+            feature = torch.permute(feature, (1, 2, 0)).cpu().numpy()  # [batch, L, dim_feature]
+            map_table.append(feature)
+
+        map_table = np.concatenate(map_table, axis=0)  # [N, L, dim_feature]
+        return map_table
+
+    def _export_feature_map(self, model: Mix10Net, device, mapping_idx):
+        # use line encoding to generate feature map
+        from dataset.pipeline.line_encoding import (
+            get_total_num_encoding,
+            get_encoding_usage_flags,
+            transform_lines_to_line_encoding,
+        )
+
+        L = self.line_length
+        dim_feature = model.model_size[1]
+        num_encoding = get_total_num_encoding(L)
+        usage_flags = get_encoding_usage_flags(L)  # [N] bool, track usage of each feature
+        feature_map = np.zeros((num_encoding, dim_feature), dtype=np.float32)  # [N, dim_feature]
+
+        # generate line features
+        for l in reversed(range(1, L + 1)):
+            lines = generate_base3_permutation(l)
+            idxs = transform_lines_to_line_encoding(lines, L)  # [n, 11]
+            map_table = self._export_map_table(model, device, lines, mapping_idx)
+            rows = np.arange(idxs.shape[0])[:, None]  # [n, 1]
+            feature_map[idxs, :] = map_table[rows, np.arange(l), :]
+
+        ascii_hist(f"feature map {mapping_idx}", feature_map)
+        feature_map_clipped = np.clip(feature_map, a_min=-16, a_max=511 / 32)
+        num_params_clipped = np.sum(feature_map != feature_map_clipped)
+        feature_map_quant = np.around(feature_map_clipped * 32).astype(np.int16)  # [-512, 511]
+        print(
+            f"feature map: used {usage_flags.sum()} features of {len(usage_flags)}, "
+            + f": clipped {num_params_clipped}/{feature_map.size}"
+            + f", quant_range = {(feature_map_quant.min(), feature_map_quant.max())}"
+        )
+        return feature_map_quant, usage_flags
+
+    def _export_feature_dwconv(self, model: Mix10Net):
+        conv_weight = model.feature_dwconv.conv.weight.cpu().numpy()  # [FeatureDWConvDim,1,3,3]
+        conv_bias = model.feature_dwconv.conv.bias.cpu().numpy()  # [FeatureDWConvDim]
+        conv_weight = conv_weight.reshape(conv_weight.shape[0], -1).transpose()  # [9, FeatureDWConvDim]
+        ascii_hist("feature dwconv weight", conv_weight)
+        ascii_hist("feature dwconv bias", conv_bias)
+
+        conv_weight_clipped = np.clip(conv_weight, a_min=-32768 / 65536, a_max=32767 / 65536)
+        conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
+        weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
+        bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
+        conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
+        conv_bias_quant = np.clip(np.around(conv_bias_clipped * 128), -32768, 32767).astype(np.int16)
+        print(
+            f"feature dwconv: weight clipped {weight_num_params_clipped}/{conv_weight.size}"
+            + f", bias clipped {bias_num_params_clipped}/{conv_bias.size}"
+            + f", weight_quant_range = {(conv_weight_quant.min(), conv_weight_quant.max())}"
+            + f", bias_quant_range = {(conv_bias_quant.min(), conv_bias_quant.max())}"
+        )
+
+        # Make sure that the dwconv will not overflow
+        assert np.all(
+            np.abs(conv_weight_clipped).sum(0) / 2 * 16 * 4 * 128 < 32767
+        ), f"feature dwconv would overflow! (maxsum={np.abs(conv_weight_clipped).sum(0).max()})"
+
+        return conv_weight_quant, conv_bias_quant
+
+    def _export_policy_small_pwconv(self, model: Mix10Net):
+        # policy pw conv dynamic weight layer 1
+        l1_weight = model.policy_small_pwconv_weight[0].fc.weight.cpu().numpy()
+        l1_bias = model.policy_small_pwconv_weight[0].fc.bias.cpu().numpy()
+        ascii_hist("policy small pwconv l1 weight", l1_weight)
+        ascii_hist("policy small pwconv l1 bias", l1_bias)
+
+        # policy pw conv dynamic weight layer 2
+        l2_weight = model.policy_small_pwconv_weight[1].fc.weight.cpu().numpy()
+        l2_bias = model.policy_small_pwconv_weight[1].fc.bias.cpu().numpy()
+        ascii_hist("policy small pwconv l2 weight", l2_weight)
+        ascii_hist("policy small pwconv l2 bias", l2_bias)
+
+        # policy PReLU activation
+        policy_output_weight = model.policy_small_output.weight.cpu().squeeze().numpy()
+        policy_output_bias = model.policy_small_output.bias.cpu().numpy()
+        ascii_hist("policy small output weight", policy_output_weight)
+        ascii_hist("policy small output bias", policy_output_bias)
+
+        return (
+            np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            policy_output_weight / (128 * 128 * 128),
+            policy_output_bias,
+        )
+    
+    def _export_policy_large_pwconv(self, model: Mix10Net):
+        # policy pw conv dynamic weight layer 0
+        sh_weight = model.policy_large_pwconv_weight_shared.fc.weight.cpu().numpy()
+        sh_bias = model.policy_large_pwconv_weight_shared.fc.bias.cpu().numpy()
+        ascii_hist("policy large pwconv layer shared weight", sh_weight)
+        ascii_hist("policy large pwconv layer shared bias", sh_bias)
+
+        # policy pw conv dynamic weight 1
+        l1_weight = model.policy_large_pwconv_weight_1.fc.weight.cpu().numpy()
+        l1_bias = model.policy_large_pwconv_weight_1.fc.bias.cpu().numpy()
+        ascii_hist("policy large pwconv 1 weight", l1_weight)
+        ascii_hist("policy large pwconv 1 bias", l1_bias)
+
+        # policy pw conv dynamic weight 2
+        l2_weight = model.policy_large_pwconv_weight_2.fc.weight.cpu().numpy()
+        l2_bias = model.policy_large_pwconv_weight_2.fc.bias.cpu().numpy()
+        ascii_hist("policy large pwconv 2 weight", l2_weight)
+        ascii_hist("policy large pwconv 2 bias", l2_bias)
+
+        # policy PReLU activation
+        policy_output_weight = model.policy_large_output.weight.cpu().squeeze().numpy()
+        policy_output_bias = model.policy_large_output.bias.cpu().numpy()
+        ascii_hist("policy large output weight", policy_output_weight)
+        ascii_hist("policy large output bias", policy_output_bias)
+
+        return (
+            np.clip(np.around(sh_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(sh_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            policy_output_weight / (128 * 128 * 128),
+            policy_output_bias,
+        )
+
+    def _export_linear(self, model: Mix10Net, prefix: str):
+        block = eval(f"model.{prefix}", {"model": model})
+        weight = block.fc.weight.cpu().numpy()
+        bias = block.fc.bias.cpu().numpy()
+        ascii_hist(f"{prefix}: weight", weight)
+        ascii_hist(f"{prefix}: bias", bias)
+
+        return (
+            np.clip(np.around(weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        )
+
+    def serialize(self, out: io.IOBase, model: Mix10Net, device):
+        if model.one_mapping:
+            feature_map0, usage_flags0 = self._export_feature_map(model, device, 0)
+        else:
+            feature_map1, usage_flags1 = self._export_feature_map(model, device, 1)
+            feature_map2, usage_flags2 = self._export_feature_map(model, device, 2)
+        feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
+
+        (
+            policy_small_pwconv_weight_l1_weight,
+            policy_small_pwconv_weight_l1_bias,
+            policy_small_pwconv_weight_l2_weight,
+            policy_small_pwconv_weight_l2_bias,
+            policy_small_output_weight,
+            policy_small_output_bias,
+        ) = self._export_policy_small_pwconv(model)
+
+        (
+            policy_large_pwconv_weight_shared_weight,
+            policy_large_pwconv_weight_shared_bias,
+            policy_large_pwconv_weight_1_weight,
+            policy_large_pwconv_weight_1_bias,
+            policy_large_pwconv_weight_2_weight,
+            policy_large_pwconv_weight_2_bias,
+            policy_large_output_weight,
+            policy_large_output_bias,
+        ) = self._export_policy_large_pwconv(model)
+
+        small_l1_weights = self._export_linear(model, "value_linear_small[0]")
+        small_l2_weights = self._export_linear(model, "value_linear_small[1]")
+        small_l3_weights = self._export_linear(model, "value_small_output[0]")
+        small_l4_weights = self._export_linear(model, "value_small_output[1]")
+
+        gate_weights = self._export_linear(model, "value_gate")
+        corner_weights = self._export_linear(model, "value_corner")
+        edge_weights = self._export_linear(model, "value_edge")
+        center_weights = self._export_linear(model, "value_center")
+        quad_weights = self._export_linear(model, "value_quad")
+
+        l1_weights = self._export_linear(model, "value_linear_large")
+        l2_weights = self._export_linear(model, "value_large_output[0]")
+        l3_weights = self._export_linear(model, "value_large_output[1]")
+
+        if self.text_output:
+            def write_mapping_table(name, mapping, usage_flags):
+                print(name, file=out)
+                print(usage_flags.sum(), file=out)
+                for i, (f, used) in tqdm(enumerate(zip(mapping.astype("i2"), usage_flags)), 
+                                         total=len(usage_flags)):
+                    if used:
+                        print(i, end=" ", file=out)
+                        f.tofile(out, sep=" ")
+                        print(file=out)
+
+            if model.one_mapping:
+                write_mapping_table("featuremap0", feature_map0, usage_flags0)
+            else:
+                write_mapping_table("featuremap1", feature_map1, usage_flags1)
+                write_mapping_table("featuremap2", feature_map2, usage_flags2)
+
+            print("feature_dwconv_weight", file=out)
+            feat_dwconv_weight.astype("i2").tofile(out, sep=" ")
+            print(file=out)
+            print("feature_dwconv_bias", file=out)
+            feat_dwconv_bias.astype("i2").tofile(out, sep=" ")
+            print(file=out)
+
+            def print_linear_block(name, weight, bias):
+                print(f"{name}_weight", file=out)
+                weight.astype("i1").tofile(out, sep=" ")
+                print(file=out)
+                print(f"{name}_bias", file=out)
+                bias.astype("i4").tofile(out, sep=" ")
+                print(file=out)
+
+            print_linear_block("policy_small_pwconv_weight_l1", 
+                               policy_small_pwconv_weight_l1_weight, 
+                               policy_small_pwconv_weight_l1_bias)
+            print_linear_block("policy_small_pwconv_weight_l2",
+                               policy_small_pwconv_weight_l2_weight,
+                               policy_small_pwconv_weight_l2_bias)
+            
+            print_linear_block("policy_large_pwconv_weight_shared",
+                               policy_large_pwconv_weight_shared_weight,
+                               policy_large_pwconv_weight_shared_bias)
+            print_linear_block("policy_large_pwconv_weight_1",
+                               policy_large_pwconv_weight_1_weight,
+                               policy_large_pwconv_weight_1_bias)
+            print_linear_block("policy_large_pwconv_weight_2",
+                               policy_large_pwconv_weight_2_weight,
+                               policy_large_pwconv_weight_2_bias)
+
+            print_linear_block("value_small_l1", *small_l1_weights)
+            print_linear_block("value_small_l2", *small_l2_weights)
+            print_linear_block("value_small_l3", *small_l3_weights)
+            print_linear_block("value_small_l4", *small_l4_weights)
+
+            print_linear_block("value_gate", *gate_weights)
+            print_linear_block("value_corner", *corner_weights)
+            print_linear_block("value_edge", *edge_weights)
+            print_linear_block("value_center", *center_weights)
+            print_linear_block("value_quad", *quad_weights)
+
+            print_linear_block("value_l1", *l1_weights)
+            print_linear_block("value_l2", *l2_weights)
+            print_linear_block("value_l3", *l3_weights)
+
+            print("policy_small_output_weight", file=out)
+            policy_small_output_weight.astype("f4").tofile(out, sep=" ")
+            print(file=out)
+            print("policy_large_output_weight", file=out)
+            policy_large_output_weight.astype("f4").tofile(out, sep=" ")
+            print(file=out)
+            print("policy_small_output_bias", file=out)
+            policy_small_output_bias.astype("f4").tofile(out, sep=" ")
+            print(file=out)
+            print("policy_large_output_bias", file=out)
+            policy_large_output_bias.astype("f4").tofile(out, sep=" ")
+            print(file=out)
+        else:
+            o: io.RawIOBase = out
+
+            # Since each quantized feature is in [-512, 511] range, they only uses 10 bits,
+            # here we write compressed uint64 streams to save space.
+            def write_feature_map_compressed(feature_map, feature_bits=10):
+                feature_map_i16 = feature_map.astype("<i2")  # (442503, FC)
+                feature_map_i16 = feature_map_i16.reshape(-1)  # (442503*FC,)
+                bitmask = np.uint64(2**feature_bits - 1)
+                uint64 = np.uint64(0)
+                bits_used = 0
+                uint64_written = 0
+                for i in tqdm(range(feature_map_i16.shape[0])):
+                    v = feature_map_i16[i].astype(np.uint64) & bitmask
+                    uint64 |= v << np.uint64(bits_used)
+                    if 64 - bits_used >= feature_bits:
+                        bits_used += feature_bits
+                    else:
+                        o.write(uint64.tobytes())
+                        uint64_written += 1
+                        uint64 = v >> np.uint64(64 - bits_used)
+                        bits_used = feature_bits - (64 - bits_used)
+                if bits_used > 0:
+                    o.write(uint64.tobytes())
+                    uint64_written += 1
+                print(f"write_feature_map_compressed: {feature_map_i16.shape[0]} -> {uint64_written} uint64")
+
+            if model.one_mapping:
+                # int16_t mapping[ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map0)
+            else:
+                # int16_t mapping[2][ShapeNum][FeatureDim];
+                write_feature_map_compressed(feature_map1)
+                write_feature_map_compressed(feature_map2)
+
+            # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
+            # int16_t feature_dwconv_bias[FeatureDWConvDim];
+            o.write(feat_dwconv_weight.astype("<i2").tobytes())
+            o.write(feat_dwconv_bias.astype("<i2").tobytes())
+
+            def write_linear(weight_and_bias, zero_padding=0):
+                weight, bias = weight_and_bias
+                if zero_padding > 0:
+                    weight = np.concatenate([weight, np.zeros((zero_padding, weight.shape[1]), dtype=np.int8)], axis=0)
+                    bias = np.concatenate([bias, np.zeros((zero_padding,), dtype=np.int32)], axis=0)
+                o.write(weight.astype("<i1").tobytes())
+                o.write(bias.astype("<i4").tobytes())
+
+            # LinearWeight<FeatureDim, FeatureDim>                        policy_small_pwconv_weight_l1;
+            # LinearWeight<PolicySOutDim *(PolicySInDim + 1), FeatureDim> policy_small_pwconv_weight_l2;
+            write_linear((policy_small_pwconv_weight_l1_weight, policy_small_pwconv_weight_l1_bias))
+            write_linear((policy_small_pwconv_weight_l2_weight, policy_small_pwconv_weight_l2_bias))
+
+            # LinearWeight<FeatureDim * 2, FeatureDim> policy_large_pwconv_weight_shared;
+            # LinearWeight<PolicyLMidDim *(PolicyLInDim + 1), FeatureDim * 2> policy_large_pwconv_weight_1;
+            # LinearWeight<PolicyLOutDim *(PolicyLMidDim + 1), FeatureDim * 2> policy_large_pwconv_weight_2;
+            write_linear((policy_large_pwconv_weight_shared_weight, policy_large_pwconv_weight_shared_bias))
+            write_linear((policy_large_pwconv_weight_1_weight, policy_large_pwconv_weight_1_bias))
+            write_linear((policy_large_pwconv_weight_2_weight, policy_large_pwconv_weight_2_bias))
+
+            # LinearWeight<FeatureDim, FeatureDim> value_small_l1;
+            # LinearWeight<FeatureDim, FeatureDim> value_small_l2;
+            # LinearWeight<32, FeatureDim>         value_small_l3;
+            # LinearWeight<4, 32>                  value_small_l4;
+            write_linear(small_l1_weights)
+            write_linear(small_l2_weights)
+            write_linear(small_l3_weights)
+            write_linear(small_l4_weights)
+
+            # char __padding_to_64bytes_0[48];
+            o.write(np.zeros(48, dtype="<i1").tobytes())
+
+            # LinearWeight<FeatureDim * 2, FeatureDim> value_gate;
+            # LinearWeight<FeatureDim, FeatureDim>     value_corner;
+            # LinearWeight<FeatureDim, FeatureDim>     value_edge;
+            # LinearWeight<FeatureDim, FeatureDim>     value_center;
+            # LinearWeight<FeatureDim, FeatureDim>     value_quad;
+            write_linear(gate_weights)
+            write_linear(corner_weights)
+            write_linear(edge_weights)
+            write_linear(center_weights)
+            write_linear(quad_weights)
+
+            # LinearWeight<FeatureDim, FeatureDim * 5> value_l1;
+            # LinearWeight<32, FeatureDim>             value_l2;
+            # LinearWeight<4, 32>                      value_l3;
+            write_linear(l1_weights)
+            write_linear(l2_weights)
+            write_linear(l3_weights)
+
+            # float policy_small_output_weight[PolicySOutDim];
+            # float policy_large_output_weight[PolicyLOutDim];
+            # float policy_small_output_bias;
+            # float policy_large_output_bias;
+            o.write(policy_small_output_weight.astype("<f4").tobytes())
+            o.write(policy_large_output_weight.astype("<f4").tobytes())
+            o.write(policy_small_output_bias.astype("<f4").tobytes())
+            o.write(policy_large_output_bias.astype("<f4").tobytes())
+
+            # char __padding_to_64bytes_1[40];
+            o.write(np.zeros(40, dtype="<i1").tobytes())

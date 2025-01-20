@@ -128,7 +128,9 @@ class QuantPReLU(nn.PReLU):
 
 
 class SwitchPReLU(nn.Module):
-    def __init__(self, num_parameters: int, num_experts: int, init: float = 0.25, device=None, dtype=None) -> None:
+    def __init__(
+        self, num_parameters: int, num_experts: int, init: float = 0.25, device=None, dtype=None
+    ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.num_parameters = num_parameters
@@ -143,7 +145,9 @@ class SwitchPReLU(nn.Module):
 
     def forward(self, input: torch.Tensor, route_index: torch.Tensor) -> torch.Tensor:
         neg_slope = self.get_weight(route_index)
-        neg_slope = neg_slope.view(neg_slope.shape[0], neg_slope.shape[1], *([1] * (input.ndim - neg_slope.ndim)))
+        neg_slope = neg_slope.view(
+            neg_slope.shape[0], neg_slope.shape[1], *([1] * (input.ndim - neg_slope.ndim))
+        )
         return torch.where(input >= 0, input, neg_slope * input)
 
 
@@ -186,7 +190,9 @@ class LinearBlock(nn.Module):
             w = fake_quant(self.fc.weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             if self.fc.bias is not None:
                 b = fake_quant(
-                    self.fc.bias, self.weight_quant_scale * self.input_quant_scale, num_bits=self.bias_quant_bits
+                    self.fc.bias,
+                    self.weight_quant_scale * self.input_quant_scale,
+                    num_bits=self.bias_quant_bits,
                 )
                 out = F.linear(x, w, b)
             else:
@@ -226,7 +232,12 @@ class Conv2dBlock(nn.Module):
         bias_quant_bits=32,
     ):
         super(Conv2dBlock, self).__init__()
-        assert pad_type in ["zeros", "reflect", "replicate", "circular"], f"Unsupported padding mode: {pad_type}"
+        assert pad_type in [
+            "zeros",
+            "reflect",
+            "replicate",
+            "circular",
+        ], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
         self.norm = build_norm2d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
@@ -271,8 +282,12 @@ class Conv2dBlock(nn.Module):
                 self.quant == "pixel-dwconv" or self.quant == "pixel-dwconv-floor"
             ):  # pixel-wise quantization in depthwise conv
                 assert self.conv.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
-                x_ = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups)
-                x = F.unfold(x, self.conv.kernel_size, self.conv.dilation, self.conv.padding, self.conv.stride)
+                x_ = F.conv2d(
+                    x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups
+                )
+                x = F.unfold(
+                    x, self.conv.kernel_size, self.conv.dilation, self.conv.padding, self.conv.stride
+                )
                 x = fake_quant(
                     x * w.view(-1)[None, :, None],
                     self.bias_quant_scale,
@@ -283,7 +298,9 @@ class Conv2dBlock(nn.Module):
                 x = F.fold(x, (x_.size(2), x_.size(3)), (1, 1))
                 x = x + b[None, :, None, None]
             else:
-                x = F.conv2d(x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups)
+                x = F.conv2d(
+                    x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups
+                )
         else:
             x = self.conv(x)
         if not self.activation_first:
@@ -347,7 +364,12 @@ class Conv1dLine4Block(nn.Module):
         zero = torch.zeros_like(self.weight[0])
         for i in range(self.kernel_size):
             for j in range(self.kernel_size):
-                if i == j or i + j == self.kernel_size - 1 or i == self.kernel_size // 2 or j == self.kernel_size // 2:
+                if (
+                    i == j
+                    or i + j == self.kernel_size - 1
+                    or i == self.kernel_size // 2
+                    or j == self.kernel_size // 2
+                ):
                     kernel.append(self.weight[weight_index])
                     weight_index += 1
                 else:
@@ -408,7 +430,15 @@ class ResBlock(nn.Module):
         self.activation = build_activation_layer(activation)
         self.conv = nn.Sequential(
             Conv2dBlock(
-                dim_in, dim_hidden, ks, st, padding, norm, activation, pad_type, activation_first=activation_first
+                dim_in,
+                dim_hidden,
+                ks,
+                st,
+                padding,
+                norm,
+                activation,
+                pad_type,
+                activation_first=activation_first,
             ),
             Conv2dBlock(
                 dim_hidden,
@@ -587,7 +617,13 @@ class SwitchLinear(nn.Module):
     """Switchable linear layer for MoE networks"""
 
     def __init__(
-        self, in_features: int, out_features: int, num_experts: int, bias: bool = True, device=None, dtype=None
+        self,
+        in_features: int,
+        out_features: int,
+        num_experts: int,
+        bias: bool = True,
+        device=None,
+        dtype=None,
     ) -> None:
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -678,7 +714,9 @@ class SwitchLinearBlock(nn.Module):
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
             w = fake_quant(weight, self.weight_quant_scale, num_bits=self.weight_quant_bits)
             if bias is not None:
-                b = fake_quant(bias, self.weight_quant_scale * self.input_quant_scale, num_bits=self.bias_quant_bits)
+                b = fake_quant(
+                    bias, self.weight_quant_scale * self.input_quant_scale, num_bits=self.bias_quant_bits
+                )
                 out = F.linear(x, w, b)
             else:
                 out = F.linear(x, w)
@@ -804,7 +842,12 @@ class SwitchConv2dBlock(nn.Module):
         bias_quant_bits=32,
     ):
         super().__init__()
-        assert pad_type in ["zeros", "reflect", "replicate", "circular"], f"Unsupported padding mode: {pad_type}"
+        assert pad_type in [
+            "zeros",
+            "reflect",
+            "replicate",
+            "circular",
+        ], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
         self.activation = build_activation_layer(activation)
         self.conv = SwitchConv2d(
@@ -844,7 +887,13 @@ class SwitchConv2dBlock(nn.Module):
                 bias = fake_quant(bias, self.bias_quant_scale, num_bits=self.bias_quant_bits)
                 bias = bias.reshape(-1)
             x = F.conv2d(
-                x, w, bias, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups * batch_size
+                x,
+                w,
+                bias,
+                self.conv.stride,
+                self.conv.padding,
+                self.conv.dilation,
+                self.conv.groups * batch_size,
             )
             x = x.view(batch_size, -1, x.size(-2), x.size(-1))
         else:
