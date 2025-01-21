@@ -76,7 +76,7 @@ class DirectionalConvResBlock(nn.Module):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim, dim, use_nonzero_padding)
         self.conv1x1 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.activation = nn.SiLU(inplace=True)
+        self.activation = nn.SiLU()
 
     def forward(self, x):
         residual = x
