@@ -1,9 +1,10 @@
+import os
+import yaml
 import torch
 import numpy as np
-from accelerate import Accelerator
 import configargparse
-import yaml
-import os
+from accelerate import Accelerator
+from accelerate.utils import send_to_device
 
 from model import build_model
 
@@ -19,6 +20,7 @@ def parse_args_and_init():
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add("--board_width", type=int, default=15, help="Board width")
     parser.add("--board_height", type=int, default=15, help="Board height")
+    parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
 
     args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
@@ -28,9 +30,12 @@ def parse_args_and_init():
 
 
 class Board:
+    BLACK_PLANE = 0
+    WHITE_PLANE = 1
+
     def __init__(self, board_width, board_height, fixed_side_input=False):
         self.board = np.zeros((2, board_height, board_width), dtype=np.int8)
-        self.side_to_move = 0
+        self.side_to_move = self.BLACK_PLANE
         self.move_history = []
         self.fixed_side_input = fixed_side_input
 
@@ -50,16 +55,18 @@ class Board:
         self.side_to_move = 1 - self.side_to_move
 
     def move(self, x, y):
-        assert self.is_legal(x, y), "Pos is not legal!"
+        if not self.is_legal(x, y):
+            raise ValueError("Pos is not legal!")
         self.board[self.side_to_move, y, x] = 1
         self.move_history.append((x, y, self.side_to_move))
         self.flip_side()
 
     def undo(self):
-        assert len(self.move_history) > 0, "Can not undo when board is empty!"
-        x, y, stm = self.move_history.pop()
-        self.board[stm, y, x] = 0
-        self.side_to_move = stm
+        if len(self.move_history) == 0:
+            raise ValueError("Can not undo when board is empty!")
+        x, y, side_to_move = self.move_history.pop()
+        self.board[side_to_move, y, x] = 0
+        self.side_to_move = side_to_move
 
     def is_legal(self, x, y):
         if x < 0 or x >= self.board.shape[2] or y < 0 or y >= self.board.shape[1]:
@@ -104,9 +111,11 @@ def debug_print(board, model, data):
 
     if hasattr(model, "forward_debug_print"):
         torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
-        value, policy, *retvals = model.forward_debug_print(data)
+        with torch.no_grad():
+            value, policy, *retvals = model.forward_debug_print(data)
     else:
-        value, policy, *retvals = model(data)
+        with torch.no_grad():
+            value, policy, *retvals = model(data)
 
     # remove batch dimension
     value = value.squeeze(0)
@@ -139,7 +148,9 @@ def input_move():
     return ord(x) - ord("A"), int(y) - 1
 
 
-def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_height, **kwargs):
+def test_play(
+    checkpoint, use_cpu, model_type, model_args, board_width, board_height, dataset_args, **kwargs
+):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
 
@@ -157,22 +168,21 @@ def test_play(checkpoint, use_cpu, model_type, model_args, board_width, board_he
 
     # accelerate model testing
     model = accelerator.prepare(model)
+    model.eval()
 
-    # test play loop
-    board = Board(board_width, board_height)
+    # construct the test board
+    board = Board(board_width, board_height, fixed_side_input=dataset_args.get("fixed_side_input", False))
 
-    with torch.no_grad():
-        model.eval()
-        while board.ply + 1 < board.width * board.height:
-            print(board)
+    # test debug loop
+    while board.ply + 1 < board.width * board.height:
+        print(board)
 
-            data = board.get_data()
-            for key in data.keys():
-                data[key] = data[key].to(accelerator.device)
-            debug_print(board, model, data)
+        data = board.get_data()
+        data = send_to_device(data, accelerator.device)
+        debug_print(board, model, data)
 
-            move = input_move()
-            board.move(*move)
+        move = input_move()
+        board.move(*move)
 
 
 if __name__ == "__main__":
