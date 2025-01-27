@@ -5,6 +5,120 @@ import torch.nn.functional as F
 from utils.quant_utils import fake_quant
 
 
+# ---------------------------------------------------------
+# Normalization Layers
+
+
+class LocalLayerNorm(nn.Module):
+    """
+    Local LayerNorm for inputs with varying spatial dimensions.
+
+    Args:
+        num_features (int): Number of channels (C).
+        eps (float): A small value added for numerical stability.
+        channelwise_affine (bool): If True, learnable affine parameters (scale and bias) are used.
+        bias (bool): If True, includes learnable bias.
+        data_format (str): The data format of the input feature tensor. Either "channels_first" or "channels_last".
+    """
+
+    def __init__(
+        self, num_features, eps=1e-5, channelwise_affine=True, bias=True, data_format="channels_first"
+    ):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.channelwise_affine = channelwise_affine
+        self.data_format = data_format
+        assert self.data_format in [
+            "channels_last",
+            "channels_first",
+        ], f"Unsupported data format: {self.data_format}"
+        if channelwise_affine:
+            self.weight = nn.Parameter(torch.empty(num_features))
+            if bias:
+                self.bias = nn.Parameter(torch.empty(num_features))
+            else:
+                self.register_parameter("bias", None)
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        if self.channelwise_affine:
+            nn.init.ones_(self.weight)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: input feature tensor (B, C, *) if channels_first, or (B, *, C) if channels_last.
+        """
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, (self.num_features,), self.weight, self.bias, self.eps)
+        else:
+            shape = [self.num_features] + [1] * (x.ndim - 2)
+            mean = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, unbiased=False, keepdim=True)
+            x = (x - mean) / torch.sqrt(var + self.eps)
+            if self.channelwise_affine:
+                x = x * self.weight.view(shape) + self.bias.view(shape)
+        return x
+
+
+def build_norm1d_layer(norm, num_features=None, norm_groups=None):
+    if norm == "bn":
+        assert isinstance(num_features, int)
+        return nn.BatchNorm1d(num_features)
+    elif norm == "in":
+        assert isinstance(num_features, int)
+        return nn.InstanceNorm1d(num_features)
+    elif norm == "gn":
+        assert isinstance(num_features, int)
+        assert isinstance(norm_groups, int)
+        return nn.GroupNorm(norm_groups, num_features)
+    elif norm.startswith("gn-"):
+        assert isinstance(num_features, int)
+        norm_groups = int(norm[3:])
+        return nn.GroupNorm(norm_groups, num_features)
+    elif norm == "ln":
+        assert isinstance(num_features, int)
+        return LocalLayerNorm(num_features)
+    elif norm == "none":
+        return None
+    else:
+        raise ValueError(f"Unsupported normalization: {norm}")
+
+
+def build_norm2d_layer(norm, num_features=None, norm_groups=None):
+    if norm == "bn":
+        assert isinstance(num_features, int)
+        return nn.BatchNorm2d(num_features)
+    elif norm == "in":
+        assert isinstance(num_features, int)
+        return nn.InstanceNorm2d(num_features)
+    elif norm == "gn":
+        assert isinstance(num_features, int)
+        assert isinstance(norm_groups, int)
+        return nn.GroupNorm(norm_groups, num_features)
+    elif norm.startswith("gn-"):
+        assert isinstance(num_features, int)
+        norm_groups = int(norm[3:])
+        return nn.GroupNorm(norm_groups, num_features)
+    elif norm == "ln":
+        assert isinstance(num_features, int)
+        return LocalLayerNorm(num_features)
+    elif norm == "none":
+        return None
+    else:
+        raise ValueError(f"Unsupported normalization: {norm}")
+
+
+# ---------------------------------------------------------
+# Activation Layers
+
+
 def build_activation_layer(activation):
     if activation == "relu":
         return nn.ReLU(inplace=True)
@@ -29,34 +143,6 @@ def build_activation_layer(activation):
         return None
     else:
         raise ValueError(f"Unsupported activation: {activation}")
-
-
-def build_norm1d_layer(norm, norm_dim=None):
-    if norm == "bn":
-        return nn.BatchNorm1d(norm_dim)
-    elif norm == "in":
-        return nn.InstanceNorm1d(norm_dim)
-    elif norm == "none":
-        return None
-    else:
-        raise ValueError(f"Unsupported normalization: {norm}")
-
-
-def build_norm2d_layer(norm, norm_dim=None):
-    if norm == "bn":
-        assert norm_dim is not None
-        return nn.BatchNorm2d(norm_dim)
-    elif norm == "in":
-        assert norm_dim is not None
-        return nn.InstanceNorm2d(norm_dim)
-    elif norm == "none":
-        return None
-    else:
-        raise ValueError(f"Unsupported normalization: {norm}")
-
-
-# ---------------------------------------------------------
-# Activation Layers
 
 
 class ClippedReLU(nn.Module):
@@ -282,21 +368,23 @@ class Conv2dBlock(nn.Module):
                 self.quant == "pixel-dwconv" or self.quant == "pixel-dwconv-floor"
             ):  # pixel-wise quantization in depthwise conv
                 assert self.conv.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
-                x_ = F.conv2d(
-                    x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups
-                )
-                x = F.unfold(
-                    x, self.conv.kernel_size, self.conv.dilation, self.conv.padding, self.conv.stride
-                )
+                assert isinstance(self.conv.padding, tuple)
+                batch_size, _, h_in, w_in = x.shape
+                p, d, k, s = self.conv.padding, self.conv.dilation, self.conv.kernel_size, self.conv.stride
+                h_out = (h_in + 2 * p[0] - d[0] * (k[0] - 1) - 1) // s[0] + 1
+                w_out = (w_in + 2 * p[1] - d[1] * (k[1] - 1) - 1) // s[1] + 1
+
+                x = F.unfold(x, k, d, p, s)
                 x = fake_quant(
                     x * w.view(-1)[None, :, None],
                     self.bias_quant_scale,
                     num_bits=self.bias_quant_bits,
                     floor=(self.quant == "pixel-dwconv-floor"),
                 )
-                x = x.reshape(x_.shape[0], x_.shape[1], -1, x_.size(2) * x_.size(3)).sum(2)
-                x = F.fold(x, (x_.size(2), x_.size(3)), (1, 1))
-                x = x + b[None, :, None, None]
+                x = x.reshape(batch_size, self.conv.out_channels, -1, h_out * w_out).sum(2)
+                x = F.fold(x, (h_out, w_out), (1, 1))
+                if b is not None:
+                    x = x + b[None, :, None, None]
             else:
                 x = F.conv2d(
                     x, w, b, self.conv.stride, self.conv.padding, self.conv.dilation, self.conv.groups
@@ -529,7 +617,8 @@ class Conv2dSymBlock(nn.Module):
                 )
                 x = x.reshape(batch_size, self.out_channels, -1, h_out * w_out).sum(2)
                 x = F.fold(x, (h_out, w_out), (1, 1))
-                x = x + b[None, :, None, None]
+                if b is not None:
+                    x = x + b[None, :, None, None]
             else:
                 x = F.conv2d(x, w, b, self.stride, self.padding, 1, self.groups)
         else:
@@ -541,65 +630,6 @@ class Conv2dSymBlock(nn.Module):
             if self.activation:
                 x = self.activation(x)
         return x
-
-
-class ResBlock(nn.Module):
-    def __init__(
-        self,
-        dim_in,
-        ks=3,
-        st=1,
-        padding=1,
-        norm="none",
-        activation="relu",
-        pad_type="zeros",
-        dim_out=None,
-        dim_hidden=None,
-        activation_first=False,
-    ):
-        super(ResBlock, self).__init__()
-        dim_out = dim_out or dim_in
-        dim_hidden = dim_hidden or min(dim_in, dim_out)
-
-        self.learned_shortcut = dim_in != dim_out
-        self.activation_first = activation_first
-        self.activation = build_activation_layer(activation)
-        self.conv = nn.Sequential(
-            Conv2dBlock(
-                dim_in,
-                dim_hidden,
-                ks,
-                st,
-                padding,
-                norm,
-                activation,
-                pad_type,
-                activation_first=activation_first,
-            ),
-            Conv2dBlock(
-                dim_hidden,
-                dim_out,
-                ks,
-                st,
-                padding,
-                norm,
-                activation if activation_first else "none",
-                pad_type,
-                activation_first=activation_first,
-            ),
-        )
-        if self.learned_shortcut:
-            self.conv_shortcut = Conv2dBlock(
-                dim_in, dim_out, 1, 1, norm=norm, activation=activation, activation_first=activation_first
-            )
-
-    def forward(self, x):
-        residual = self.conv_shortcut(x) if self.learned_shortcut else x
-        out = self.conv(x)
-        out += residual
-        if not self.activation_first and self.activation:
-            out = self.activation(out)
-        return out
 
 
 class HashLayer(nn.Module):

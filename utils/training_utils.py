@@ -8,34 +8,59 @@ from torch.utils.data import IterableDataset
 from torch.utils.data.dataloader import DataLoader
 
 
-def weights_init(init_type):
+def weights_init(init_cfg: dict):
     """Generate a init function given a init type"""
+    weight_init_type = init_cfg.get("weight_init_type", "kaiming")
+    if weight_init_type == "kaiming":
+        weight_init_method = init.kaiming_normal_
+        weight_init_args = {"a": 0, "mode": "fan_in"}
+    elif weight_init_type == "xavier":
+        weight_init_method = init.xavier_normal_
+        weight_init_args = {"gain": math.sqrt(2)}
+    elif weight_init_type == "orthogonal":
+        weight_init_method = init.orthogonal_
+        weight_init_args = {"gain": math.sqrt(2)}
+    elif weight_init_type == "normal":
+        weight_init_method = init.normal_
+        weight_init_args = {"mean": 0.0, "std": 0.02}
+    elif weight_init_type == "truncated_normal":
+        weight_init_method = init.trunc_normal_
+        weight_init_args = {"mean": 0.0, "std": 0.02}
+    elif weight_init_type == "constant":
+        weight_init_method = init.constant_
+        weight_init_args = {"val": 0.0}
+    elif weight_init_type == "default":
+        weight_init_method = lambda *args, **kwargs: None
+        weight_init_args = {}
+    else:
+        raise ValueError(f"Unsupported initialization: {weight_init_type}")
+    weight_init_args.update(init_cfg.get("weight_init_args", {}))
+
+    bias_init_type = init_cfg.get("bias_init_type", "constant")
+    if bias_init_type == "constant":
+        bias_init_method = init.constant_
+        bias_init_args = {"val": 0.0}
+    elif bias_init_type == "default":
+        bias_init_method = lambda *args, **kwargs: None
+        bias_init_args = {}
+    else:
+        raise ValueError(f"Unsupported initialization: {bias_init_type}")
+    bias_init_args.update(init_cfg.get("bias_init_args", {}))
 
     def init_fun(m):
+        """Note that the init function is called in the post order traversal fashion"""
         classname = m.__class__.__name__
-        # First we check if the layer has custom init method.
-        # If so, we just call it without our uniform initialization.
-        if hasattr(m, "custom_init"):
-            m.custom_init()
+        # First we check if the layer has custom initialization method.
+        # If so, we just call it without our initialization.
+        if hasattr(m, "initialize"):
+            m.initialize()
         # Call our unifrom initialization methods for all Conv and Linear layers
-        elif (classname.startswith("Conv") or classname.startswith("Linear")) and hasattr(m, "weight"):
-            if init_type == "gaussian":
-                init.normal_(m.weight.data, 0.0, 0.02)
-            elif init_type == "xavier":
-                init.xavier_normal_(m.weight.data, gain=math.sqrt(2))
-            elif init_type == "kaiming":
-                init.kaiming_normal_(m.weight.data, a=0, mode="fan_in")
-            elif init_type == "orthogonal":
-                init.orthogonal_(m.weight.data, gain=math.sqrt(2))
-            elif init_type == "normal":
-                init.normal_(m.weight.data, 0.0, 0.02)
-            elif init_type == "default":
-                pass
-            else:
-                raise ValueError(f"Unsupported initialization: {init_type}")
+        elif classname.startswith("Conv") or classname.startswith("Linear"):
+            if hasattr(m, "weight") and m.weight is not None:
+                weight_init_method(m.weight.data, **weight_init_args)
 
             if hasattr(m, "bias") and m.bias is not None:
-                init.constant_(m.bias.data, 0.0)
+                bias_init_method(m.bias.data, **bias_init_args)
 
     return init_fun
 
@@ -80,7 +105,9 @@ def build_lr_scheduler(optimizer, lr_schedule_type="constant", last_it=-1, **kwa
     elif lr_schedule_type == "step":
         step_size = kwargs.get("step_size", 50000)
         step_gamma = kwargs.get("step_gamma", 0.9)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=step_gamma, last_epoch=last_it)
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size, gamma=step_gamma, last_epoch=last_it
+        )
     else:
         raise ValueError(f"Unsupported lr scheduler: {lr_schedule_type}")
 

@@ -4,28 +4,23 @@
 
 ### Requirements
 
-+ 64-bit Python 3.9 and Pytorch 1.10 or later.
-+ Huggingface Accelerate 0.21.0 or later.
-+ Other python libraries: `configargparse tqdm tensorboard matplotlib pybind11 lz4`.
++ 64-bit Python 3.10 and Pytorch 2.3 or later.
++ Other python libraries: `accelerate configargparse tqdm tensorboard matplotlib pybind11 lz4 pykeops`.
 
-### Setup dataset pipeline 
+### Setup dataset pipeline
 
 After install all required packages in specified in requirements, it is necessary to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup the C++ compiling environment. Then install the dataset pipelines by doing the following commands.
 
-+ Line Encoding: Fast line encoding for transforming board features.
++ Line Encoding: Fast line encoding for transforming board features. Necessary if you want to train LineNet or export MixNet9 or later models.
 
   ```bash
-  cd dataset/pipeline/line_encoding_cpp
-  python setup.py build
-  python setup.py install
+  pip install dataset/pipeline/line_encoding_cpp
   ```
 
 + Forbidden Point (optional): Finding forbidden points for Renju rule. Can be skipped if you don't need to train a network for Renju rule.
 
   ```bash
-  cd dataset/pipeline/forbidden_point_cpp
-  python setup.py build
-  python setup.py install
+  pip install dataset/pipeline/forbidden_point_cpp
   ```
 
 ### Train a network
@@ -102,7 +97,7 @@ Export to (lz4 compressed) serialized binary that can be loaded in Rapfi:
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type bin-lz4 --export_args "{[extra export options]...}"
 ```
 
-Note that some NNUE serializer requires specifying exporting arguments, such as rule (options are `freestyle`, `standard`, `renju`), board size (usually a number between 5 and 22), etc. For example, to export a binary network file of `mix7` NNUE for Renju rule and 15x15 board size, you can run the following command:
+Note that some NNUE serializer requires specifying exporting arguments, such as rule (options are `freestyle`, `standard`, `renju`), board size (usually a number between 5 and 22), etc. For example, to export a binary network file of `mix9` NNUE for Renju rule and 15x15 board size, you can run the following command:
 
 ```bash
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type bin-lz4 --export_args "{rule: renju, board_size: 15}"
@@ -130,12 +125,12 @@ In order to improve the ease of managing weights for different rules and board s
 
 ```C
 struct Header {
-  uint32_t magic;         // 0xacd8cc6a = crc32("gomoku network weight version 1")
-  uint32_t arch_hash;     // architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
-  uint32_t rule_mask;     // applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
-  uint32_t boardsize_mask;// applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
-  uint32_t desc_len;      // length of desc string (=0 for no description)
-  char description[desc_len];	// weight description (encoded in utf-8)
+  uint32_t magic;             // 0xacd8cc6a = crc32("gomoku network weight version 1")
+  uint32_t arch_hash;         // architecture hash, which is hash of the network architecture (network type, num of channels, layers, ...)
+  uint32_t rule_mask;         // applicable rule bitmask (1=gomoku, 2=standard, 4=renju)
+  uint32_t boardsize_mask;    // applicable board size bitmask (lsb set at index i means board size i+1 is usable for this weight)
+  uint32_t desc_len;          // length of desc string (=0 for no description)
+  char description[desc_len]; // weight description (encoded in utf-8)
 }
 ```
 

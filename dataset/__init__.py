@@ -1,9 +1,9 @@
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.file_utils import make_file_list
-from utils.misc_utils import Register, import_submodules
+from utils.misc_utils import Registry, import_submodules
 from .pipeline import warp_dataset_with_pipeline
 
-DATASETS = Register("dataset")
+DATASETS = Registry("dataset")
 import_submodules(__name__, recursive=False)
 
 
@@ -71,7 +71,7 @@ def build_dataset(
     shuffle=False,
     pipeline_args=None,
     **kwargs,
-):
+) -> Dataset | IterableDataset:
     assert dataset_type in DATASETS, f"Unknown dataset type: {dataset_type}"
     dataset_cls = DATASETS[dataset_type]
 

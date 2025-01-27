@@ -293,10 +293,10 @@ class VectorQuantize(nn.Module):
                 codebook_transform = nn.Linear(dim_feature, dim_feature, bias=False)
                 if kmeans_init:
 
-                    def custom_init(self):
+                    def initialize(self):
                         nn.init.eye_(self.weight.data)
 
-                    setattr(codebook_transform, "custom_init", types.MethodType(custom_init, codebook_transform))
+                    setattr(codebook_transform, "initialize", types.MethodType(initialize, codebook_transform))
             self.code_transform = codebook_transform
 
         self.learnable_codebook = learnable_codebook and not self.ema_update

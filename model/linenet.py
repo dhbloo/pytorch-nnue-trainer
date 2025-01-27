@@ -135,7 +135,7 @@ class LineNNUEv1(nn.Module):
             LinearBlock(dim_value, 3, activation="none", quant=True),
         )
 
-    def custom_init(self):
+    def initialize(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
 
     def get_feature(self, data):

@@ -1,4 +1,4 @@
-from utils.misc_utils import Register, import_submodules
+from utils.misc_utils import Registry, import_submodules
 from abc import ABC, abstractmethod
 from io import IOBase
 from datetime import datetime
@@ -60,7 +60,7 @@ class BaseSerializer(ABC):
         raise NotImplementedError()
 
 
-SERIALIZERS = Register("serialization")
+SERIALIZERS = Registry("serialization")
 import_submodules(__name__, recursive=False)
 
 

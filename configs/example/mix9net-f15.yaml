@@ -1,0 +1,78 @@
+# An example config of training a mix9nnue model with freestyle 15 dataset
+
+# Path to save running logs and checkpoints
+# It is recommended to briefly record the config of the network in the rundir name
+rundir: run_dirs/mix9/basicns128m64f32p64v32d-f15
+
+
+# Dataset configs
+
+# For example, if you have a processed katago dataset (.npz files with bf, gf, vt, pt keys)
+dataset_type: iterative_processed_katago_numpy
+# Or you have a raw katago selfplay dataset (.npz files directly produced by katago)
+# dataset_type: katago_numpy
+# Or you have a packed binary dataset (.binpack or .binpack.lz4 files) produced by c-gomoku-cli sampling mode
+# dataset_type: packed_binary
+# Or you have a simple binary dataset (.bin or .bin.lz4 files) produced by c-gomoku-cli sampling mode
+# dataset_type: simple_binary
+
+dataset_args:
+  sample_rate: 1.0
+  apply_symmetry: true
+
+# Path to the splited dataset directory
+# For example, if you have dataset files in data/f15
+train_datas:
+- data/f15/train
+val_datas:
+- data/f15/val
+
+
+# Model configs
+
+model_type: mix9
+model_args:
+  dim_middle: 128
+  dim_feature: 64
+  dim_policy: 32
+  dim_value: 64
+  dim_dwconv: 32
+
+
+# Loss configs
+
+loss_args:
+  policy_reg_lambda: 0.001
+
+
+# Training configs
+
+batch_size: 2048
+iterations: 2000000
+save_interval: 50000
+learning_rate: 0.001
+weight_decay: 1.0e-7
+clip_grad_norm: 1.0
+
+lr_scheduler_type: step
+lr_scheduler_args:
+  step_size: 50000
+  step_gamma: 0.9
+
+
+# Distillation configs
+# If you have a pretrained tracher model, you can specify the distillation configs here
+# The distillation will be applied to the student model during training
+
+# Setup kd_model_type to enable distillation
+# kd_model_type: resnet
+kd_model_args:
+  num_blocks: 10
+  dim_feature: 128
+  head_type: v0
+  input_type: basic-nostm
+kd_checkpoint: <your path to the teacher model checkpoint>
+# The temperature of the distillation
+kd_T: 1.0
+# The weight of distillation loss (final loss = (1 - kd_alpha) * raw_data_loss + kd_alpha * distillation_loss)
+kd_alpha: 0.8

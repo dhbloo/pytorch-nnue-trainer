@@ -157,7 +157,7 @@ def test(
     state_dicts = torch.load(checkpoint, map_location=accelerator.device)
     model.load_state_dict(state_dicts["model"])
     epoch, it = state_dicts.get("epoch", 0), state_dicts.get("iteration", 0)
-    accelerator.print(f"Loaded from checkpoint: {checkpoint}, epoch: {epoch}, it: {it}")
+    accelerator.print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
 
     # accelerate model testing
     model, test_loader = accelerator.prepare(model, test_loader)

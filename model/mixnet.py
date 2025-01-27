@@ -769,7 +769,7 @@ class Mix9Net(nn.Module):
                 LinearBlock(dim_value, 3, activation="none", quant=True),
             )
 
-    def custom_init(self):
+    def initialize(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
 
     def get_feature(self, data, inv_side=False):
@@ -1250,7 +1250,7 @@ class Mix10Net(nn.Module):
             LinearBlock(32, 4, activation="none", quant=True),
         )
 
-    def custom_init(self):
+    def initialize(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
 
     def get_feature(self, data, inv_side=False):

@@ -124,16 +124,19 @@ def next_move(board, model, data):
     winrate = (value[0] - value[1] + 1) / 2
     drawrate = value[2]
 
-    movelist = torch.argsort(policy, descending=True)
-    for move in movelist:
+    sorted_policy, sorted_moves = torch.sort(policy, descending=True)
+    bestmove = None
+    bestmove_policy = None
+    for move, move_policy in zip(sorted_moves, sorted_policy):
         move = move.cpu().item()
-        move_x, move_y = move % board.width, move // board.width
+        move_y, move_x = divmod(move, board.width)
         if board.is_legal(move_x, move_y):
             bestmove = move
+            bestmove_policy = move_policy.cpu().item()
             break
-    bestmove_x, bestmove_y = bestmove % board.width, bestmove // board.width
+    bestmove_y, bestmove_x = divmod(bestmove, board.width)
 
-    return winrate, drawrate, (bestmove_x, bestmove_y)
+    return winrate, drawrate, (bestmove_x, bestmove_y), bestmove_policy
 
 
 def input_move():
@@ -164,7 +167,7 @@ def test_play(
     state_dicts = torch.load(checkpoint, map_location=accelerator.device)
     model.load_state_dict(state_dicts["model"])
     epoch, it = state_dicts.get("epoch", 0), state_dicts.get("iteration", 0)
-    accelerator.print(f"Loaded from checkpoint: {checkpoint}, epoch: {epoch}, it: {it}")
+    accelerator.print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
 
     # accelerate model testing
     model = accelerator.prepare(model)
@@ -180,8 +183,11 @@ def test_play(
         if move is None:
             data = board.get_data()
             data = send_to_device(data, accelerator.device)
-            winrate, drawrate, move = next_move(board, model, data)
-            print(f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, move: {output_move(move)}")
+            winrate, drawrate, move, move_policy = next_move(board, model, data)
+            print(
+                f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, "
+                f"move: {output_move(move)} (prob={move_policy:.4f})"
+            )
         board.move(*move)
 
 

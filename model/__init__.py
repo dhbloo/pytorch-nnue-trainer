@@ -1,6 +1,6 @@
-from utils.misc_utils import Register, import_submodules
+from utils.misc_utils import Registry, import_submodules
 
-MODELS = Register("model")
+MODELS = Registry("model")
 import_submodules(__name__, recursive=False)
 
 

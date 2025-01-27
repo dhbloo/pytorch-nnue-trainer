@@ -38,7 +38,7 @@ def log_value_dict(tb_logger, tag, value_dict, it, rows):
         tb_logger.add_scalar(f"{tag}_rows/{name}", value, rows)
 
 
-class Register:
+class Registry:
     def __init__(self, registry_name):
         self._dict = {}
         self._name = registry_name

@@ -54,7 +54,7 @@ def parse_args_and_init():
     parser.add("--optim_args", type=yaml.safe_load, default={}, help="Extra optimizer arguments")
     parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
     parser.add("--lr_scheduler_args", type=yaml.safe_load, default={}, help="Extra LR scheduler arguments")
-    parser.add("--init_type", default="kaiming", help="Initialization type")
+    parser.add("--init_cfg", type=yaml.safe_load, default={}, help="Init configuration")
     parser.add("--loss_type", default="CE+CE", help="Loss type")
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
@@ -123,9 +123,9 @@ def calc_loss(
     data,
     results,
     kd_results=None,
-    kd_T=None,
-    kd_alpha=None,
-    policy_reg_lambda=None,
+    kd_T=1.0,
+    kd_alpha=1.0,
+    policy_reg_lambda=0,
     value_policy_ratio=1,
     ignore_forbidden_point_policy=False,
     **extra_args,
@@ -269,7 +269,7 @@ def calc_loss(
         "policy_loss": policy_loss.detach(),
     }
 
-    if policy_reg_lambda is not None:
+    if policy_reg_lambda > 0:
         policy_reg = get_policy_reg_loss(policy)
         total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict["policy_reg"] = policy_reg.detach()
@@ -297,7 +297,7 @@ def calc_loss(
                 elif aux_loss_type == "value_relative_uncertainty_loss":
                     aux_loss = get_value_relative_uncertainty_loss(*aux_loss_input)
                 elif aux_loss_type == "policy_reg":
-                    if aux_loss_weight is None and policy_reg_lambda is None:
+                    if aux_loss_weight is None and policy_reg_lambda == 0:
                         continue
                     aux_loss = get_policy_reg_loss(aux_loss_input)
                     aux_loss_print_name = aux_loss_name
@@ -355,7 +355,7 @@ def training_loop(
     optim_args,
     lr_scheduler_type,
     lr_scheduler_args,
-    init_type,
+    init_cfg,
     loss_type,
     loss_args,
     iterations,
@@ -466,12 +466,12 @@ def training_loop(
         optimizer.load_state_dict(state_dicts["optimizer"])
         if accelerator.scaler is not None and "scalar" in state_dicts:
             accelerator.scaler.load_state_dict(state_dicts["scalar"])
-        accelerator.print(f"Loaded from checkpoint: {ckpt_filename}")
+        accelerator.print(f"Loaded from {ckpt_filename}")
         it = state_dicts.get("iteration", 0)
         epoch = state_dicts.get("epoch", 0)
         rows = state_dicts.get("rows", 0)
     else:
-        model.apply(weights_init(init_type))
+        model.apply(weights_init(init_cfg))
         it, epoch, rows = 0, 0, 0
         if load_from is not None:
             state_dicts = torch.load(load_from, map_location=accelerator.device)
@@ -497,7 +497,7 @@ def training_loop(
         kd_model = build_model(kd_model_type, **kd_model_args)
         kd_state_dicts = torch.load(kd_checkpoint, map_location=accelerator.device)
         kd_model.load_state_dict(kd_state_dicts["model"])
-        accelerator.print(f"Loaded teacher model {kd_model.name} from: {kd_checkpoint}")
+        accelerator.print(f"Loaded teacher model {kd_model.name} from {kd_checkpoint}")
 
         kd_model = accelerator.prepare_model(kd_model, evaluation_mode=True)
         if kd_use_train_mode:

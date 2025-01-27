@@ -34,8 +34,6 @@ def build_input_plane(input_type):
             with_stm = True
         feature_dim = int(input_type)
         return LinePatEmbeddingInputPlane(feature_dim, with_stm=with_stm)
-    elif input_type == "raw":
-        return lambda x: x  # identity transform
     else:
         raise ValueError(f"Unsupported input: {input_type}")
 
