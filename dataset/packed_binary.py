@@ -4,9 +4,8 @@ import ctypes
 import random
 import torch.utils.data
 import io
-from typing import Optional
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range
+from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range, post_process_data
 from utils.winrate_model import WinrateModel
 from . import DATASETS
 
@@ -41,8 +40,8 @@ class MoveData:
         self.evals = []
         self.is_ended = False
 
-    def __getitem__(self, index) -> tuple[Optional[Move], Optional[int]]:
-        """Returns none move for pass, and none eval for no eval."""
+    def __getitem__(self, index) -> tuple[Move, int | None]:
+        """Returns the pair of (move, eval). Eval is None if not available."""
         return (self.moves[index], self.evals[index])
 
     def __len__(self):
@@ -58,8 +57,9 @@ class MoveData:
 
         if entry_move.isLast:
             self.is_ended = True
-        move = None
-        if not entry_move.isPass:
+        if entry_move.isPass:
+            move = Move.PASS
+        else:
             move = Move((entry_move.move >> 5) & 31, entry_move.move & 31)
         eval = None if entry_move.isNoEval else entry_move.eval
         self.moves.append(move)
@@ -99,7 +99,12 @@ def read_entry(f: io.RawIOBase) -> EntryData:
     position = [Move((m >> 5) & 31, m & 31) for m in pos_array]
 
     entry = EntryData(
-        int(ehead.boardSize), Rule(ehead.rule), Result(ehead.result), int(ehead.totalPly), int(ehead.gameTag), position
+        int(ehead.boardSize),
+        Rule(ehead.rule),
+        Result(ehead.result),
+        int(ehead.totalPly),
+        int(ehead.gameTag),
+        position,
     )
 
     for _ in range(int(ehead.moveCount)):
@@ -116,29 +121,37 @@ class PackedBinaryDataset(IterableDataset):
 
     def __init__(
         self,
-        file_list,
-        rules,
-        boardsizes,
-        fixed_side_input,
-        has_pass_move=False,
-        value_lambda=0.0,
-        dynamic_value_lambda=True,
-        multipv_temperature=0.03,
-        use_mate_multipv=False,
-        winrate_model=None,
-        apply_symmetry=False,
-        shuffle=False,
-        sample_rate=1.0,
-        max_worker_per_file=2,
+        file_list: list[str],
+        rules: set[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        has_pass_move: bool = False,
+        apply_symmetry: bool = False,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 2,
+        value_td_lambda: float = 0.0,
+        dynamic_value_lambda: bool = True,
+        multipv_temperature: float = 0.05,
+        use_mate_multipv: bool = False,
+        winrate_model_args: dict = {},
         **kwargs
     ):
+        """
+        Args:
+            value_td_lambda: The weight of the soft target in the value target.
+                0.0 for pure hard target, 1.0 for pure soft target
+            dynamic_value_lambda: Decay value_td_lambda to zero as game stage increases
+            multipv_temperature: The temperature for the multipv softmax
+            use_mate_multipv: Whether to use mate score for multipv softmax
+        """
         super().__init__()
         self.file_list = file_list
         self.rules = rules
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.has_pass_move = has_pass_move
-        self.value_lambda = value_lambda
+        self.value_td_lambda = value_td_lambda
         self.dynamic_value_lambda = dynamic_value_lambda
         self.multipv_temperature = multipv_temperature
         self.use_mate_multipv = use_mate_multipv
@@ -146,7 +159,7 @@ class PackedBinaryDataset(IterableDataset):
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.max_worker_per_file = max_worker_per_file
-        self.winrate_model = winrate_model or WinrateModel()
+        self.winrate_model = WinrateModel(**winrate_model_args)
 
     @property
     def is_fixed_side_input(self):
@@ -162,6 +175,21 @@ class PackedBinaryDataset(IterableDataset):
         else:
             return open(filename, "rb")
 
+    def _setup_value_target(
+        self, result: Result, bestmove_eval: int | None, game_stage: float
+    ) -> np.ndarray:
+        wld_result = np.array(
+            [result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.float32
+        )
+        if self.value_td_lambda == 0 or bestmove_eval is None:
+            return wld_result
+        else:
+            wld_eval = self.winrate_model.eval_to_wld(bestmove_eval)
+            td_lambda = self.value_td_lambda
+            if self.dynamic_value_lambda:
+                td_lambda *= 1.0 - game_stage
+            return wld_result * (1 - td_lambda) + wld_eval * td_lambda
+
     def _setup_policy_target(self, boardsize: tuple[int, int], movedata: MoveData):
         H, W = boardsize
         policy = np.zeros(H * W + (1 if self.has_pass_move else 0), dtype=np.float32)
@@ -172,95 +200,33 @@ class PackedBinaryDataset(IterableDataset):
             len(movedata) == 1
             or self.multipv_temperature == 0.0
             or any(ev is None for ev in movedata.evals)
-            or (not self.use_mate_multipv and besteval >= self.winrate_model.eval_mate_threshold)
+            or (
+                not self.use_mate_multipv
+                and besteval is not None
+                and besteval >= self.winrate_model.eval_mate_threshold
+            )
         ):
-            if move is None and self.has_pass_move:
-                policy[-1] = 1.0
+            if move.is_pass:
+                if self.has_pass_move:
+                    policy[-1] = 1.0
             else:
                 policy[move.y * W + move.x] = 1.0
         # multipv
         else:
-            winrates = np.array([self.winrate_model.eval_to_winrate(ev) for ev in movedata.evals], dtype=np.float32)
-            winrates_exp = np.exp(winrates / self.multipv_temperature)
+            winrates = np.array(
+                [self.winrate_model.eval_to_winrate(ev) for ev in movedata.evals], dtype=np.float32
+            )
+            winrates_shifted = winrates - np.max(winrates)
+            winrates_exp = np.exp(winrates_shifted / self.multipv_temperature)
             winrates_softmax = winrates_exp / np.sum(winrates_exp)
-            for i, (move, _) in enumerate(movedata):
-                if move is None:
-                    policy[-1] = winrates_softmax[i]
+            for i, move in enumerate(movedata.moves):
+                if move.is_pass:
+                    if self.has_pass_move:
+                        policy[-1] = winrates_softmax[i]
                 else:
                     policy[move.y * W + move.x] = winrates_softmax[i]
 
         return policy if self.has_pass_move else policy.reshape(boardsize)
-
-    def _prepare_data(
-        self,
-        result: Result,
-        boardsize: tuple[int, int],
-        rule: Rule,
-        game_stage: float,
-        position: list[Optional[Move]],
-        movedata: MoveData,
-    ) -> dict:
-        ply = len(position)
-        stm_is_black = ply % 2 == 0
-        bestmove, eval = movedata[0]
-
-        # setup board input
-        board_input = np.zeros((2, boardsize[0], boardsize[1]), dtype=np.int8)
-        for i, m in enumerate(position):
-            if m is None:  # skip pass move
-                continue
-            if self.fixed_side_input:
-                side_idx = i % 2
-            else:
-                side_idx = 0 if i % 2 == ply % 2 else 1
-            board_input[side_idx, m.y, m.x] = 1
-
-        # make value target
-        if self.fixed_side_input and not stm_is_black:
-            result = Result.opposite(result)
-        wld_result = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.float32)
-        if self.value_lambda == 0:
-            value_target = wld_result
-        else:
-            value_lambda = self.value_lambda
-            if self.dynamic_value_lambda:
-                value_lambda = value_lambda * (1.0 - game_stage)
-            wld_eval = wld_result if eval is None else self.winrate_model.eval_to_wld(eval)
-            value_target = wld_result * (1 - value_lambda) + wld_eval * value_lambda
-
-        # make policy target
-        policy_target = self._setup_policy_target(boardsize, movedata)
-
-        # apply symmetry transformation
-        if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(boardsize)
-            picked_symmetry = np.random.choice(symmetries)
-            board_input = picked_symmetry.apply_to_array(board_input)
-            if self.has_pass_move:
-                policy_board = policy_target[:-1].reshape(boardsize)
-                policy_board = picked_symmetry.apply_to_array(policy_board)
-                policy_pass = policy_target[-1:]
-                policy_target = np.concatenate([policy_board.flatten(), policy_pass])
-            else:
-                policy_target = picked_symmetry.apply_to_array(policy_target)
-            position = [Move(*picked_symmetry.apply(m.pos, boardsize)) for m in position]
-
-        return {
-            # global info
-            "board_size": np.array(boardsize, dtype=np.int8),  # H, W
-            "rule": str(rule),
-            # inputs
-            "board_input": board_input,  # [C, H, W], C=(Black,White)
-            "stm_input": -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
-            # targets
-            "value_target": value_target,  # [3] (Black Win, White Win, Draw)
-            "policy_target": policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
-            # other infos
-            "position_string": "".join([str(m) for m in position]),
-            "last_move": position[-1].pos,
-            "ply": ply,
-            "raw_eval": float("nan") if eval is None else float(eval),
-        }
 
     def _process_entry(self, entry: EntryData) -> list[dict]:
         # Skip other rules and board sizes
@@ -270,22 +236,58 @@ class PackedBinaryDataset(IterableDataset):
         if boardsize not in self.boardsizes:
             return []
 
-        data_list = []
         current_result = entry.result
         current_position = entry.init_position.copy()
+        current_ply = len(current_position)
+        current_stm_input = -1 if current_ply % 2 == 0 else 1  # (Black = -1, White = 1)
+
+        # setup inital board input
+        current_board_input = np.zeros((2, boardsize[0], boardsize[1]), dtype=np.int8)
+        for move in current_position:
+            if not move.is_pass:
+                current_board_input[max(current_stm_input, 0), move.y, move.x] = 1
+            current_stm_input = -current_stm_input
+
+        data_list = []
         for moveidx, movedata in enumerate(entry.moves):
-            current_move, current_eval = movedata[0]
-            game_stage = min(max(moveidx / (len(entry.moves) - 1), 0.0), 1.0)
+            bestmove, bestmove_eval = movedata[0]
 
             # random skip data according to sample rate
             if random.random() < self.sample_rate:
-                data = self._prepare_data(
-                    current_result, boardsize, entry.rule, game_stage, current_position, movedata
-                )
+                game_stage = min(max(moveidx / (len(entry.moves) - 1), 0.0), 1.0)
+                value_target = self._setup_value_target(current_result, bestmove_eval, game_stage)
+                policy_target = self._setup_policy_target(boardsize, movedata)
+                if current_stm_input > 0:
+                    board_input = current_board_input[[1, 0]].copy()  # flip stm
+                else:
+                    board_input = current_board_input.copy()
+                data = {
+                    # global info
+                    "board_size": np.array(boardsize, dtype=np.int8),  # (2,) for H, W
+                    "rule_index": entry.rule.index,
+                    # inputs
+                    "board_input": board_input,  # [C, H, W], C=2 (Black,White)
+                    "stm_input": float(current_stm_input),  # [1] Black = -1, White = 1
+                    # targets
+                    "value_target": value_target,  # [3] (Black Win, White Win, Draw)
+                    "policy_target": policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
+                    # other infos
+                    "position": current_position,
+                    "ply": current_ply,
+                    "raw_eval": float("nan") if bestmove_eval is None else float(bestmove_eval),
+                }
+                data = post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+                transformed_position = data.pop("position")
+                data["position_string"] = "".join([str(m) for m in transformed_position])
+                data["last_move"] = transformed_position[-1].pos
                 data_list.append(data)
 
             current_result = Result.opposite(current_result)
-            current_position.append(current_move)
+            current_position.append(bestmove)
+            current_ply += 1
+            if not bestmove.is_pass:
+                current_board_input[max(current_stm_input, 0), bestmove.y, bestmove.x] = 1
+            current_stm_input = -current_stm_input
 
         return data_list
 

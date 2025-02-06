@@ -5,7 +5,7 @@ import random
 import torch.utils.data
 import io
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range
+from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range, post_process_data
 from . import DATASETS
 
 
@@ -73,14 +73,14 @@ class SimpleBinaryDataset(IterableDataset):
 
     def __init__(
         self,
-        file_list,
-        rules,
-        boardsizes,
-        fixed_side_input,
-        apply_symmetry=False,
-        shuffle=False,
-        sample_rate=1.0,
-        max_worker_per_file=2,
+        file_list: list[str],
+        rules: set[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        apply_symmetry: bool = False,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 2,
         **kwargs
     ):
         super().__init__()
@@ -123,45 +123,38 @@ class SimpleBinaryDataset(IterableDataset):
         if boardsize not in self.boardsizes:
             return None
 
-        stm_is_black = ply % 2 == 0
-
+        stm_input = -1 if ply % 2 == 0 else 1  # (Black = -1, White = 1)
         board_input = np.zeros((2, bsize, bsize), dtype=np.int8)
         for i, m in enumerate(position):
-            if self.fixed_side_input:
-                side_idx = i % 2
-            else:
-                side_idx = 0 if i % 2 == ply % 2 else 1
+            current_stm_input = -1 if i % 2 == 0 else 1
+            side_idx = 0 if current_stm_input == stm_input else 1
             board_input[side_idx, m.y, m.x] = 1
 
-        if self.fixed_side_input and not stm_is_black:
-            result = Result.opposite(result)
-        value_target = np.array([result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.int8)
-
-        policy_target = np.zeros(boardsize, dtype=np.int8)
+        value_target = np.array(
+            [result == Result.WIN, result == Result.LOSS, result == Result.DRAW], dtype=np.float32
+        )
+        policy_target = np.zeros(boardsize, dtype=np.float32)
         policy_target[move.y, move.x] = 1
 
-        if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(boardsize)
-            picked_symmetry = np.random.choice(symmetries)
-            board_input = picked_symmetry.apply_to_array(board_input)
-            policy_target = picked_symmetry.apply_to_array(policy_target)
-            position = [Move(*picked_symmetry.apply(m.pos, boardsize)) for m in position]
-
-        return {
+        data = {
             # global info
             "board_size": np.array(boardsize, dtype=np.int8),  # H, W
-            "rule": str(rule),
+            "rule_index": rule.index,
             # inputs
             "board_input": board_input,  # [C, H, W], C=(Black,White)
-            "stm_input": -1.0 if stm_is_black else 1.0,  # [1] Black = -1.0, White = 1.0
+            "stm_input": float(stm_input),  # [1] Black = -1.0, White = 1.0
             # targets
             "value_target": value_target,  # [3] (Black Win, White Win, Draw)
             "policy_target": policy_target,  # [H, W]
             # other infos
-            "position_string": "".join([str(m) for m in position]),
-            "last_move": position[-1].pos,
+            "position": position,
             "ply": ply,
         }
+        data = post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+        transformed_position = data.pop("position")
+        data["position_string"] = "".join([str(m) for m in transformed_position])
+        data["last_move"] = transformed_position[-1].pos
+        return data
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()

@@ -118,7 +118,7 @@ def build_data_loader(
     dataset,
     batch_size=1,
     shuffle=False,
-    shuffle_buffer_size=10000,
+    shuffle_buffer_size=16384,
     num_workers=0,
     drop_last=True,
     batch_by_boardsize=False,

@@ -1,23 +1,23 @@
 import numpy as np
 import torch.utils.data
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Symmetry, make_subset_range
+from utils.data_utils import make_subset_range, post_process_data
 from . import DATASETS
 
 
-@DATASETS.register("sparse_numpy")
-class SparseNumpyDataset(IterableDataset):
+@DATASETS.register("iterative_sparse_numpy")
+class IterativeSparseNumpyDataset(IterableDataset):
     FILE_EXTS = [".npz"]
 
     def __init__(
         self,
-        file_list,
-        boardsizes,
-        fixed_side_input,
-        apply_symmetry=False,
-        shuffle=False,
-        sample_rate=1.0,
-        max_worker_per_file=2,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        apply_symmetry: bool = False,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 2,
         **kwargs
     ):
         super().__init__()
@@ -120,26 +120,19 @@ class SparseNumpyDataset(IterableDataset):
             else:
                 data[key] = data_dict[key][index]
 
-        data["board_size"] = data["board_input"].shape[1:]
-        if data["board_size"] not in self.boardsizes:
+        board_size = tuple(data["board_input"].shape[1:])
+        if board_size not in self.boardsizes:
             return None
-        data["board_size"] = np.array(data["board_size"], dtype=np.int8)
+        data["board_size"] = np.array(board_size, dtype=np.int8)
 
+        data = post_process_data(data, self.fixed_side_input, self.apply_symmetry)
         # Flip side when stm is white
         if self.fixed_side_input and data["stm_input"] > 0:
-            data["board_input"] = np.flip(data["board_input"], axis=0).copy()
             data["sparse_feature_input"] = np.take(
-                data["sparse_feature_input"], [4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10], axis=0
+                data["sparse_feature_input"],
+                indices=[4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10],
+                axis=0,
             )
-            value_target = data["value_target"]
-            value_target[0], value_target[1] = value_target[1], value_target[0]
-
-        if self.apply_symmetry:
-            symmetries = Symmetry.available_symmetries(data["board_size"])
-            picked_symmetry = np.random.choice(symmetries)
-            data["board_input"] = picked_symmetry.apply_to_array(data["board_input"])
-            data["sparse_feature_input"] = picked_symmetry.apply_to_array(data["sparse_feature_input"])
-            data["policy_target"] = picked_symmetry.apply_to_array(data["policy_target"])
 
         # convert uint16 to int16, uint32 to int32 due to pytorch requirement
         # assert data['sparse_feature_input'].max() <= np.iinfo(np.int16).max

@@ -6,22 +6,22 @@ from . import DATASETS
 
 
 @DATASETS.register("katago_numpy")
-class KatagoNumpyDataset(IterableDataset):
+class KatagoNumpyDataset(Dataset):
     FILE_EXTS = [".npz"]
 
     def __init__(
         self,
-        file_list,
-        boardsizes,
-        fixed_side_input,
-        has_pass_move=False,
-        apply_symmetry=False,
-        shuffle=False,
-        sample_rate=1.0,
-        max_worker_per_file=1,
-        filter_stm=None,
-        filter_condition=None,
-        value_td_level=0,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        has_pass_move: bool = False,
+        apply_symmetry: bool = False,
+        filter_stm: int | None = None,
+        filter_condition: str | None = None,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 1,
+        value_td_level: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -40,13 +40,44 @@ class KatagoNumpyDataset(IterableDataset):
             filter_stm, int
         ), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
 
+        self.data_dict = {}
+
+        # Load data tensors from npz files
+        length_list = []
+        for filename in self.file_list:
+            data = np.load(filename)
+            data_dict, length = self._unpack_data(data)
+            length_list.append(length)
+
+            selected_indices = []
+            for i in range(length):
+                if tuple(data_dict["board_size"][i]) in self.boardsizes:
+                    selected_indices.append(i)
+
+            for k in data_dict:
+                data_dict[k] = data_dict[k][selected_indices, ...]
+
+            for k in data_dict:
+                if k not in self.data_dict:
+                    self.data_dict[k] = [data_dict[k]]
+                else:
+                    self.data_dict[k].append(data_dict[k])
+
+        # Concatenate tensors across files
+        for k in self.data_dict:
+            if len(self.data_dict[k]) > 1:
+                self.data_dict[k] = np.concatenate(self.data_dict[k], axis=0)
+            else:
+                self.data_dict[k] = self.data_dict[k][0]
+
+        # Get length of dataset and assert length are equal for all keys
+        self.length = length_list[0]
+        assert self.length > 0, f"No valid data entry in dataset: {self.file_list}"
+        assert length_list.count(self.length) == len(length_list), "Unequal length of data in npz file"
+
     @property
     def is_fixed_side_input(self):
         return self.fixed_side_input
-
-    @property
-    def is_internal_shuffleable(self):
-        return True
 
     def _unpack_global_feature(self, packed_data):
         if packed_data.shape[1] == 1:
@@ -125,13 +156,48 @@ class KatagoNumpyDataset(IterableDataset):
             "policy_target": policy_target,
         }, len(board_size)
 
-    def _prepare_entry_data(self, data_dict, index):
-        data = {k: data_dict[k][index] for k in data_dict.keys()}
+    def __len__(self):
+        return self.length
 
-        if tuple(data["board_size"]) not in self.boardsizes:
-            return None
-
+    def __getitem__(self, index):
+        data = {k: self.data_dict[k][index] for k in self.data_dict}
         return post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+
+
+@DATASETS.register("iterative_katago_numpy")
+class IterativeKatagoNumpyDataset(IterableDataset):
+    """
+    Similar to KatagoNumpyDataset but with iterative loading.
+    This is useful when the dataset is too large to fit into memory.
+    """
+
+    FILE_EXTS = [".npz"]
+
+    def __init__(
+        self,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 1,
+        **kwargs,
+    ):
+        self.file_list = file_list
+        self.boardsizes = boardsizes
+        self.fixed_side_input = fixed_side_input
+        self.shuffle = shuffle
+        self.sample_rate = sample_rate
+        self.max_worker_per_file = max_worker_per_file
+        self.extra_kwargs = kwargs
+
+    @property
+    def is_fixed_side_input(self):
+        return self.fixed_side_input
+
+    @property
+    def is_internal_shuffleable(self):
+        return True
 
     def __iter__(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -147,33 +213,44 @@ class KatagoNumpyDataset(IterableDataset):
             shuffle=self.shuffle,
         ):
             filename = self.file_list[file_index]
-            data_dict, length = self._unpack_data(np.load(filename))
-
+            dataset = KatagoNumpyDataset(
+                file_list=[filename],
+                boardsizes=self.boardsizes,
+                fixed_side_input=self.fixed_side_input,
+                **self.extra_kwargs,
+            )
             for index in make_subset_range(
-                length,
+                len(dataset),
                 partition_num=worker_per_file,
                 partition_idx=worker_id % worker_per_file,
                 shuffle=self.shuffle,
                 sample_rate=self.sample_rate,
             ):
-                data = self._prepare_entry_data(data_dict, index)
-                if data is not None:
-                    yield data
+                yield dataset[index]
 
 
 @DATASETS.register("processed_katago_numpy")
 class ProcessedKatagoNumpyDataset(Dataset):
+    """
+    Dataset with processed npz files from katago.
+    Each npz file should contain the following keys:
+    - bf: board feature (N, C, H, W)
+    - gf: global feature (N, 1) for side to move (black = -1.0, white = 1.0)
+    - vt: value target (N, 3) for win, loss, draw
+    - pt: policy target (N, H*W) or (N, H*W+1) if has_pass_move
+    """
+
     FILE_EXTS = [".npz"]
 
     def __init__(
         self,
-        file_list,
-        boardsizes,
-        fixed_side_input,
-        has_pass_move=False,
-        apply_symmetry=False,
-        filter_stm=None,
-        filter_condition=None,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        has_pass_move: bool = False,
+        apply_symmetry: bool = False,
+        filter_stm: int | None = None,
+        filter_condition: str | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -195,7 +272,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
             data = np.load(filename)
 
             # Skip other board size file
-            if data["bf"].shape[2:] not in self.boardsizes:
+            if tuple(data["bf"].shape[2:]) not in self.boardsizes:
                 continue
 
             for k in self.data_dict:
@@ -226,7 +303,9 @@ class ProcessedKatagoNumpyDataset(Dataset):
         assert len(self.boardsize) == 2
 
         if filter_stm is not None:
-            assert isinstance(filter_stm, int), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
+            assert isinstance(
+                filter_stm, int
+            ), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
             assert "gf" in self.data_dict, "gf tensor is required for filtering stm"
             self.length = filter_data_by_condition(f"gf[:, 0] == {filter_stm}", self.data_dict)
         if filter_condition is not None:
@@ -256,7 +335,8 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
         # Ignore pass move for 1d policy target
         if not self.has_pass_move and policy_target.ndim == 1:
-            policy_target = policy_target[:-1].reshape(*board_input.shape[1:])
+            _, h, w = board_input.shape
+            policy_target = policy_target[:-1].reshape((h, w))
 
         return {
             "board_size": board_size,
@@ -276,24 +356,27 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
 @DATASETS.register("iterative_processed_katago_numpy")
 class IterativeProcessedKatagoNumpyDataset(IterableDataset):
+    """
+    Similar to ProcessedKatagoNumpyDataset but with iterative loading.
+    This is useful when the dataset is too large to fit into memory.
+    """
+
     FILE_EXTS = [".npz"]
 
     def __init__(
         self,
-        file_list,
-        boardsizes,
-        fixed_side_input,
-        apply_symmetry=False,
-        shuffle=False,
-        sample_rate=1.0,
-        max_worker_per_file=2,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        fixed_side_input: bool = False,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        max_worker_per_file: int = 1,
         **kwargs,
     ):
         super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
-        self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.max_worker_per_file = max_worker_per_file
@@ -325,7 +408,6 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
                 file_list=[filename],
                 boardsizes=self.boardsizes,
                 fixed_side_input=self.fixed_side_input,
-                apply_symmetry=self.apply_symmetry,
                 **self.extra_kwargs,
             )
             for index in make_subset_range(

@@ -16,28 +16,52 @@ class Rule(Enum):
     STANDARD = 1
     RENJU = 4
 
+    @property
+    def index(self) -> int:
+        Indices = [0, 1, None, None, 2]
+        return Indices[self.value]
+
     def __str__(self) -> str:
         RuleName = ["freestyle", "standard", None, None, "renju"]
         return RuleName[self.value]
 
+    @staticmethod
+    def from_str(rule_str: str) -> "Rule":
+        RuleStr = {"freestyle": Rule.FREESTYLE, "standard": Rule.STANDARD, "renju": Rule.RENJU}
+        return RuleStr[rule_str]
+
+    @staticmethod
+    def from_index(rule_idx: int) -> "Rule":
+        RuleIndex = [Rule.FREESTYLE, Rule.STANDARD, Rule.RENJU]
+        return RuleIndex[rule_idx]
+
 
 class Move:
+    PASS: "Move"
+
     def __init__(self, x: int, y: int):
         self.x, self.y = x, y
 
     @property
+    def is_pass(self):
+        return self.x < 0 and self.y < 0
+
+    @property
     def pos(self):
-        return (self.x, self.y)
+        return np.array([self.x, self.y])
 
     @property
     def value(self):
-        return (self.x << 5) | self.y
+        return (self.x << 5) | self.y if not self.is_pass else -1
 
     def __repr__(self):
-        return f"({self.x},{self.y})"
+        return f"({self.x},{self.y})" if not self.is_pass else "(pass)"
 
     def __str__(self):
-        return chr(self.x + ord("a")) + str(self.y + 1)
+        return chr(self.x + ord("a")) + str(self.y + 1) if not self.is_pass else "pass"
+
+
+Move.PASS = Move(-1, -1)
 
 
 class Symmetry(Enum):
@@ -78,6 +102,8 @@ class Symmetry(Enum):
 
     def apply_to_move(self, move: Move, boardsize: tuple[int, int]) -> Move:
         """Apply symmetry transformation to a move (x, y)"""
+        if move.is_pass:
+            return move
         assert self in Symmetry.available_symmetries(boardsize)
         sx, sy = boardsize
         sx, sy = sx - 1, sy - 1
@@ -167,13 +193,19 @@ def make_subset_range(length, partition_num, partition_idx, shuffle=False, sampl
                 yield index
 
 
-def post_process_data(data: dict, fixed_side_input=False, symmetry_type=None, symmetry_index=None) -> dict:
+def post_process_data(
+    data: dict,
+    fixed_side_input=False,
+    symmetry_type=None,
+    symmetry_index=None,
+    move_sequence: list[Move] | None = None,
+) -> dict:
     """
     Apply post processing to the data dict that contains some numpy arrays.
     Keys to be processed:
         board_input: int8 ndarray of shape (C, H, W).
         value_target: float ndarray of shape (3), win-loss-draw probability.
-        policy_target: int8 ndarray of shape (H, W) or (H*W+1) for pass move.
+        policy_target: int8 ndarray of shape (H, W) or (H*W+1) with pass move.
         position: a list of Move objects. (optional)
     Other keys are kept as they are, and some may be used to help processing:
         board_size: int8 ndarray of shape (2), height and width.
@@ -185,6 +217,8 @@ def post_process_data(data: dict, fixed_side_input=False, symmetry_type=None, sy
             first channel is always black and the second channel is always white.
         symmetry_type: The type of symmetry to apply to the data. False for no symmetry.
         symmetry_index: The index of the symmetry to apply to the data. None for random.
+        move_sequence: A list of Move objects representing the move sequence. If provided,
+            the moves in the sequence will also be transformed by the symmetry.
     """
     if fixed_side_input and data["stm_input"] > 0:
         # Flip side when stm is white
@@ -202,18 +236,22 @@ def post_process_data(data: dict, fixed_side_input=False, symmetry_type=None, sy
 
         # Apply symmetry to the board_input, policy_target
         data["board_input"] = picked_symmetry.apply_to_array(data["board_input"])
-        if data["policy_target"].ndim == 1 and data["policy_target"].shape[0] == np.prod(data["board_size"]) + 1:
+        if data["policy_target"].ndim == 1:
+            assert (
+                data["policy_target"].shape[0] == np.prod(data["board_size"]) + 1
+            ), f"Invalid policy target shape ({data['policy_target'].shape}) for symmetry, must be (H*W+1)"
             policy_target_sym = data["policy_target"][:-1].reshape((-1, *data["board_size"]))
             policy_target_sym = picked_symmetry.apply_to_array(policy_target_sym)
             policy_target_sym = policy_target_sym.reshape((policy_target_sym.shape[0], -1))
-            data["policy_target"] = np.append([policy_target_sym, data["policy_target"][-1:]])
+            data["policy_target"] = np.concatenate([policy_target_sym, data["policy_target"][-1:]])
         else:
             data["policy_target"] = picked_symmetry.apply_to_array(data["policy_target"])
 
         # Apply symmetry to the optional position
         if "position" in data:
-            for i, m in enumerate(data["position"]):
-                data["position"][i] = picked_symmetry.apply_to_move(m, data["board_size"])
+            data["position"] = [
+                picked_symmetry.apply_to_move(m, data["board_size"]) for m in data["position"]
+            ]
 
     return data
 

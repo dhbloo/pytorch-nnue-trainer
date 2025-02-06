@@ -89,8 +89,8 @@ def build_dataset(
 
     dataset = dataset_cls(
         file_list=file_list,
-        rules=rules,
-        boardsizes=boardsizes,
+        rules=set(rules),
+        boardsizes=set(boardsizes),
         fixed_side_input=fixed_side_input,
         shuffle=shuffle,
         **kwargs,
