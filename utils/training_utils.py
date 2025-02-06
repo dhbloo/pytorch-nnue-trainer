@@ -173,32 +173,53 @@ def weight_clipping(named_parameters, clip_parameters):
             p.data.copy_(p_data_fp32)
 
 
-def cross_entropy_with_softlabel(input, target, reduction="mean", adjust=False, weight=None):
+def cross_entropy_with_softlabel(
+    input, target, reduction="mean", weight=None, focal_gamma=0.0, use_kl_divergence=False, eps=1e-8
+):
     """
-    :param input: (batch, *)
-    :param target: (batch, *) same shape as input,
-        each item must be a valid distribution: target[i, :].sum() == 1.
-    :param adjust: subtract soft-label bias from the loss
-    :param weight: (batch, *) same shape as input,
-        if not none, a weight is specified for each loss item
+    :param input: (batch, *) logits before sigmoid/softmax activation.
+    :param target: (batch, *) same shape as input, must be a valid distribution
+        (sum(target[i, ...]) == 1) for multi-class classification or in [0, 1] for binary classification.
+    :param weight: (batch, *) same shape as input. If specified, a weight is applied for each category.
+        If used in binary classification, this is treated as positive weight.
+    :param focal_gamma: focal loss gamma parameter. Default to 0 as disabled.
+    :param use_kl_divergence: subtract soft-label bias from the loss
+    :param eps: small value to prevent log(0) when target is 0. Default to 1e-8.
     """
-    input = input.view(input.shape[0], -1)
-    target = target.view(target.shape[0], -1)
-    if weight is not None:
-        weight = weight.view(weight.shape[0], -1)
+    assert (
+        focal_gamma == 0.0 or use_kl_divergence is False
+    ), "Focal loss and KL divergence cannot be used together."
 
-    logprobs = F.log_softmax(input, dim=1)
-    if weight is not None:
-        logprobs = logprobs * weight
-    batchloss = -torch.sum(target * logprobs, dim=1)
-
-    if adjust:
-        eps = 1e-8
-        bias = target * torch.log(target + eps)
+    if input.ndim > 1:
+        # Cross-entropy Loss
+        input = input.view(input.shape[0], -1)
+        target = target.view(target.shape[0], -1)
         if weight is not None:
-            bias = bias * weight
-        bias = torch.sum(bias, dim=1)
-        batchloss += bias
+            target = target * weight.view(weight.shape[0], -1)
+
+        logprobs = F.log_softmax(input, dim=1)
+        if focal_gamma > 0.0:
+            focal_weight = (1 - torch.exp(logprobs)) ** focal_gamma
+            logprobs = logprobs * focal_weight
+        batchloss = -torch.sum(target * logprobs, dim=1)
+
+        if use_kl_divergence:
+            logprobs_target = torch.log(torch.clamp(target, min=eps))
+            batchloss += torch.sum(target * logprobs_target, dim=1)
+    else:
+        # Binary Cross-entropy Loss
+        batchloss = F.binary_cross_entropy_with_logits(input, target, reduction="none", pos_weight=weight)
+
+        if focal_gamma > 0.0:
+            probs = torch.sigmoid(input)
+            pt = target * probs + (1 - target) * (1 - probs)
+            focal_weight = (1 - pt) ** focal_gamma
+            batchloss = batchloss * focal_weight
+
+        if use_kl_divergence:
+            logprobs_target = torch.log(torch.clamp(target, min=eps))
+            loginvprobs_target = torch.log(torch.clamp(1 - target, min=eps))
+            batchloss += target * logprobs_target + (1 - target) * loginvprobs_target
 
     if reduction == "none":
         return batchloss

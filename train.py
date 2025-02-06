@@ -55,7 +55,7 @@ def parse_args_and_init():
     parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
     parser.add("--lr_scheduler_args", type=yaml.safe_load, default={}, help="Extra LR scheduler arguments")
     parser.add("--init_cfg", type=yaml.safe_load, default={}, help="Init configuration")
-    parser.add("--loss_type", default="CE+CE", help="Loss type")
+    parser.add("--loss_type", default="KL+KL", help="Loss type")
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
     parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
@@ -128,6 +128,8 @@ def calc_loss(
     policy_reg_lambda=0,
     value_policy_ratio=1,
     ignore_forbidden_point_policy=False,
+    value_focal_gamma=0,
+    policy_focal_gamma=0,
     **extra_args,
 ):
     value_loss_type, policy_loss_type = loss_type.split("+")
@@ -173,13 +175,10 @@ def calc_loss(
     # ===============================================================
     # value loss
     def get_value_loss(value: torch.Tensor):
-        if value_loss_type == "CE":
-            if value.ndim == 1:
-                loss_bce = F.binary_cross_entropy_with_logits(value, value_target)
-                base_bce = F.binary_cross_entropy_with_logits(value_target + 1e-8, value_target)
-                return loss_bce - base_bce
-            else:
-                return cross_entropy_with_softlabel(value, value_target, adjust=True)
+        if value_loss_type == "KL":
+            return cross_entropy_with_softlabel(value, value_target, use_kl_divergence=True)
+        elif value_loss_type == "CE":
+            return cross_entropy_with_softlabel(value, value_target, focal_gamma=value_focal_gamma)
         elif value_loss_type == "MSE":
             if value.ndim == 1:
                 return F.mse_loss(torch.sigmoid(value), value_target)
@@ -201,9 +200,19 @@ def calc_loss(
         else:
             policy_loss_weight = None
 
-        if policy_loss_type == "CE":
+        if policy_loss_type == "KL":
             return cross_entropy_with_softlabel(
-                policy, policy_target, adjust=True, weight=policy_loss_weight
+                policy,
+                policy_target,
+                weight=policy_loss_weight,
+                use_kl_divergence=True,
+            )
+        elif policy_loss_type == "CE":
+            return cross_entropy_with_softlabel(
+                policy,
+                policy_target,
+                weight=policy_loss_weight,
+                focal_gamma=policy_focal_gamma,
             )
         elif policy_loss_type == "MSE":
             policy_softmaxed = torch.softmax(policy, dim=1)
@@ -320,6 +329,8 @@ def calc_loss(
             policy_reg_lambda=policy_reg_lambda,
             value_policy_ratio=value_policy_ratio,
             ignore_forbidden_point_policy=ignore_forbidden_point_policy,
+            value_focal_gamma=value_focal_gamma,
+            policy_focal_gamma=policy_focal_gamma,
         )
 
         # merge real loss and knowledge distillation loss

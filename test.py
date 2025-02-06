@@ -12,7 +12,7 @@ from dataset import build_dataset
 from model import build_model
 from train import calc_loss
 from utils.training_utils import build_data_loader
-from utils.misc_utils import add_dict_to, seed_everything
+from utils.misc_utils import add_dict_to, seed_everything, set_performance_level
 
 
 def parse_args_and_init():
@@ -142,6 +142,7 @@ def test(
     rundir = os.path.dirname(checkpoint)
     ckpt_filename_noext = os.path.splitext(os.path.basename(checkpoint))[0]
     log_filename = os.path.join(rundir, f"{ckpt_filename_noext}_test_result.json")
+    set_performance_level(0)
 
     # use accelerator
     accelerator = Accelerator(cpu=use_cpu)

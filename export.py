@@ -10,6 +10,7 @@ from model import build_model
 from model.serialization import build_serializer
 from utils.training_utils import build_data_loader
 from utils.file_utils import find_latest_model_file
+from utils.misc_utils import set_performance_level
 
 
 def parse_args_and_init():
@@ -245,6 +246,7 @@ def export_serialization(output, output_type, model_type, model, export_args, us
 
 
 def export(checkpoint, output, rundir, export_type, model_type, model_args, **kwargs):
+    set_performance_level(0)
     # construct the model
     model = build_model(model_type, **model_args)
 
