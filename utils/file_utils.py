@@ -1,13 +1,14 @@
 import os
 
 
-def make_file_list(data_paths, file_exts=None):
+def make_file_list(data_paths: list[str], file_exts: list[str] | None = None) -> list[str]:
     """
     Make a file list from a list of data paths.
-
     Args:
         data_path (list[str]): A list of data paths.
         file_exts (list[str]): A list of file extensions. If none, no filter will be apply.
+    Returns:
+        A list of file paths.
     """
     file_lists = []
     for path in data_paths:
@@ -24,7 +25,7 @@ def make_file_list(data_paths, file_exts=None):
     return file_lists
 
 
-def ensure_dir(path):
+def ensure_dir(path: str):
     """Create path by first checking its existence."""
     if not os.path.exists(path):
         print("Create folder ", path)
@@ -33,7 +34,7 @@ def ensure_dir(path):
         print(path, " already exists.")
 
 
-def ensure_dirs(paths):
+def ensure_dirs(paths: list[str] | str):
     """Create paths by first checking their existence."""
     if isinstance(paths, list) and not isinstance(paths, str):
         for path in paths:
@@ -42,10 +43,9 @@ def ensure_dirs(paths):
         ensure_dir(paths)
 
 
-def find_latest_model_file(dirname, prefix, ext=".pth"):
+def find_latest_model_file(dirname: str, prefix: str, ext: str = ".pth") -> str | None:
     """
     Find latest file (with largest postfix) in a directory with prefix and ext.
-
     Returns:
         The latest file name. None if not exists.
     """
@@ -64,10 +64,9 @@ def find_latest_model_file(dirname, prefix, ext=".pth"):
     return model_list[-1]
 
 
-def get_iteration_from_model_filename(model_name):
+def get_iteration_from_model_filename(model_name: str | None) -> int | None:
     """
     Get iteration number from model name.
-
     Returns:
         The iteration number. None if not exists.
     """

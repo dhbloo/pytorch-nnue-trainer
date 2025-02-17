@@ -105,7 +105,7 @@ def parse_args_and_init():
     parser.add("--profile_warmup_iters", type=int, default=100, help="Warmup iterations before profiling")
     parser.add("--profile_memory", action="store_true", help="Enable memory profiling")
 
-    args = parser.parse_args()  # parse args
+    args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
     os.makedirs(args.rundir, exist_ok=True)  # make run directory
     # write run config
@@ -448,16 +448,20 @@ def training_loop(
         shuffle=not no_shuffle,
         **dataloader_args,
     )
-    if val_datas:
+    if val_datas or val_dataset_type:
         val_dataset = build_dataset(
-            dataset_type if val_dataset_type is None else val_dataset_type,
+            val_dataset_type or dataset_type,
             val_datas,
             shuffle=False,
             pipeline_args=data_pipelines,
-            **(dataset_args if val_dataset_type is None else val_dataset_args),
+            **(val_dataset_args if val_dataset_type else dataset_args),
         )
         val_loader = build_data_loader(
-            val_dataset, batch_size_per_process, num_workers=num_worker, shuffle=False, **dataloader_args
+            val_dataset,
+            batch_size_per_process,
+            num_workers=num_worker,
+            shuffle=False,
+            **dataloader_args,
         )
     else:
         val_dataset, val_loader = None, None
