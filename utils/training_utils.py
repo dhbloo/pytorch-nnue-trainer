@@ -2,8 +2,8 @@ import math
 import random
 import torch
 import torch.nn.functional as F
-import torch.optim as optim
 import torch.nn.init as init
+import torch.optim as optim
 from torch.utils.data import IterableDataset
 from torch.utils.data.dataloader import DataLoader
 
@@ -65,7 +65,8 @@ def weights_init(init_cfg: dict):
     return init_fun
 
 
-def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
+def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.0, **kwargs):
+    parameters = model.parameters()
     if optim_type == "adamw":
         opt = optim.AdamW(
             parameters,
@@ -93,6 +94,23 @@ def build_optimizer(optim_type, parameters, lr, weight_decay=0.0, **kwargs):
             dampening=kwargs.get("dampening", 0.1),
             weight_decay=weight_decay,
         )
+    elif optim_type == "muon-adamw":
+        from utils.muon import Muon, get_params_for_muon
+        from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
+
+        muon_params_id_set = set(id(p) for p in get_params_for_muon(model))
+        muon_args = kwargs.pop("muon_args", {})
+        adamw_args = kwargs.pop("adamw_args", {"betas": (0.9, 0.999), "eps": 1e-8})
+        spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
+        spec_adamw = OptimizerSpec(optim.AdamW, adamw_args, None)
+        specs = [spec_muon, spec_adamw]
+        callback = None
+        if kwargs.pop("verbose", False):
+            callback = lambda p, spec_idx: print(
+                f"Adding param {p.shape} to optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
+            )
+        kwargs.update({"lr": lr, "weight_decay": weight_decay, "optimizer_selection_callback": callback})
+        opt = ChainedOptimizer(model.parameters(), specs, **kwargs)
     else:
         raise ValueError(f"Unsupported optimizer: {optim_type}")
 

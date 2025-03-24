@@ -60,7 +60,7 @@ def parse_args_and_init():
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
     parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
     parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
-    parser.add("--weight_decay", type=float, default=1e-7, help="Weight decay")
+    parser.add("--weight_decay", type=float, default=0, help="Weight decay")
     parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
     parser.add("--clip_grad_value", type=float, help="Gradient clipping max value")
     parser.add("--no_shuffle", action="store_true", help="Do not shuffle dataset")
@@ -469,7 +469,7 @@ def training_loop(
     # build model, optimizer
     model = build_model(model_type, **model_args)
     optimizer = build_optimizer(
-        optim_type, model.parameters(), lr=learning_rate, weight_decay=weight_decay, **optim_args
+        optim_type, model, lr=learning_rate, weight_decay=weight_decay, **optim_args
     )
 
     # load checkpoint if exists
