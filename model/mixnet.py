@@ -36,22 +36,32 @@ def avg4(a, b, c, d):
 
 
 class DirectionalConvLayer(nn.Module):
-    def __init__(self, dim_in, dim_out, use_nonzero_padding=False):
+    def __init__(self, dim_in, dim_out, use_nonzero_padding=False, use_channel_last=True):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
+        weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
+        self.weight = nn.Parameter(torch.empty(weight_shape))
         self.bias = nn.Parameter(torch.zeros((dim_out,)))
         nn.init.kaiming_normal_(self.weight)
         self.use_nonzero_padding = use_nonzero_padding
+        self.use_channel_last = use_channel_last
 
     def _conv1d_direction(self, x, dir):
-        kernel_size, dim_out, dim_in = self.weight.shape
+        if self.use_channel_last:
+            dim_out, dim_in, kernel_size = self.weight.shape
+        else:
+            kernel_size, dim_out, dim_in = self.weight.shape
         zero = torch.zeros((dim_out, dim_in), dtype=self.weight.dtype, device=self.weight.device)
 
+        if self.use_channel_last:
+            w_0_, w_1_, w_2_ = self.weight[..., 0], self.weight[..., 1], self.weight[..., 2]
+        else:
+            w_0_, w_1_, w_2_ = self.weight[0], self.weight[1], self.weight[2]
+
         weight_func_map = [
-            lambda w: (zero, zero, zero, w[0], w[1], w[2], zero, zero, zero),
-            lambda w: (zero, w[0], zero, zero, w[1], zero, zero, w[2], zero),
-            lambda w: (w[0], zero, zero, zero, w[1], zero, zero, zero, w[2]),
-            lambda w: (zero, zero, w[2], zero, w[1], zero, w[0], zero, zero),
+            lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
+            lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
+            lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
+            lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
         ]
         weight = torch.stack(weight_func_map[dir](self.weight), dim=2)
         weight = weight.reshape(dim_out, dim_in, kernel_size, kernel_size)
@@ -72,9 +82,9 @@ class DirectionalConvLayer(nn.Module):
 
 
 class DirectionalConvResBlock(nn.Module):
-    def __init__(self, dim, use_nonzero_padding=False):
+    def __init__(self, dim, **dirconv_kwargs):
         super().__init__()
-        self.d_conv = DirectionalConvLayer(dim, dim, use_nonzero_padding)
+        self.d_conv = DirectionalConvLayer(dim, dim, **dirconv_kwargs)
         self.conv1x1 = nn.Conv2d(dim, dim, kernel_size=1)
         self.activation = nn.SiLU()
 
@@ -106,11 +116,18 @@ class Conv0dResBlock(nn.Module):
 
 
 class Mapping(nn.Module):
-    def __init__(self, dim_in, dim_middle, dim_out, use_nonzero_padding=False):
+    def __init__(self, dim_in, dim_middle, dim_out, use_nonzero_padding=False, use_channel_last=True):
         super().__init__()
-        self.d_conv = DirectionalConvLayer(dim_in, dim_middle, use_nonzero_padding)
+        self.d_conv = DirectionalConvLayer(dim_in, dim_middle, use_nonzero_padding, use_channel_last)
         self.convs = nn.Sequential(
-            *[DirectionalConvResBlock(dim_middle, use_nonzero_padding) for _ in range(4)],
+            *[
+                DirectionalConvResBlock(
+                    dim_middle,
+                    use_nonzero_padding=use_nonzero_padding,
+                    use_channel_last=use_channel_last,
+                )
+                for _ in range(4)
+            ],
             Conv0dResBlock(dim_middle),
         )
         self.final_conv = nn.Conv2d(dim_middle, dim_out, kernel_size=1)
@@ -139,7 +156,7 @@ class Mix6Net(nn.Module):
         dim_out = dim_policy + dim_value
 
         self.input_plane = build_input_plane(input_type)
-        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out, use_channel_last=False)
         self.mapping_activation = ChannelWiseLeakyReLU(dim_out, bound=6)
 
         # policy nets
@@ -208,7 +225,7 @@ class Mix7Net(nn.Module):
         assert self.dim_dwconv <= dim_out, "Incorrect dim_dwconv!"
 
         self.input_plane = build_input_plane(input_type)
-        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_out, use_channel_last=False)
         self.mapping_activation = nn.PReLU(dim_out)
 
         # feature depth-wise conv
@@ -343,7 +360,7 @@ class Mix8Net(nn.Module):
         assert self.dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
 
         self.input_plane = build_input_plane(input_type)
-        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+        self.mapping = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=False)
         self.mapping_activation = QuantPReLU(
             dim_feature,
             input_quant_scale=1024,
@@ -685,6 +702,7 @@ class Mix9Net(nn.Module):
         no_star_block=False,
         no_dynamic_pwconv=False,
         no_value_group=False,
+        use_channel_last=True,
     ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
@@ -698,10 +716,16 @@ class Mix9Net(nn.Module):
 
         self.input_plane = build_input_plane(input_type)
         if one_mapping:
-            self.mapping0 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+            self.mapping0 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
         else:
-            self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
-            self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+            self.mapping1 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
+            self.mapping2 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
 
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(
@@ -1164,6 +1188,7 @@ class Mix10Net(nn.Module):
         input_type="basicns",
         one_mapping=False,
         spherical_feature=False,
+        use_channel_last=True,
     ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_dwconv)
@@ -1174,10 +1199,16 @@ class Mix10Net(nn.Module):
 
         self.input_plane = build_input_plane(input_type)
         if one_mapping:
-            self.mapping0 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+            self.mapping0 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
         else:
-            self.mapping1 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
-            self.mapping2 = Mapping(self.input_plane.dim_plane, dim_middle, dim_feature)
+            self.mapping1 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
+            self.mapping2 = Mapping(
+                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
+            )
 
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(
@@ -1473,7 +1504,9 @@ class Mix10Net(nn.Module):
 
         # value head
         value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
-        value_large, value_large_uncertainty, value_large_feature = self.value_head_large(feature, value_small_feature)
+        value_large, value_large_uncertainty, value_large_feature = self.value_head_large(
+            feature, value_small_feature
+        )
         value_large_uncertainty = F.softplus(value_large_uncertainty.float())
         value_relative_uncertainty = F.sigmoid(value_relative_uncertainty.float())
 
