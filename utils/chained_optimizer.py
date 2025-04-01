@@ -55,13 +55,10 @@ class ChainedOptimizer(Optimizer):
 
         # Initialize the optimizers
         for spec, selected_params in zip(optimizer_specs, params_for_optimizers):
-            optimizer = spec.class_type(
-                selected_params,
-                lr=lr,
-                weight_decay=weight_decay,
-                **common_kwargs,
-                **spec.init_args,
-            )
+            optimizer_args = {"lr": lr, "weight_decay": weight_decay}
+            optimizer_args.update(common_kwargs)
+            optimizer_args.update(spec.init_args)
+            optimizer = spec.class_type(selected_params, **optimizer_args)
             self.optimizers.append(optimizer)
 
     def state_dict(self) -> Dict[str, Any]:
@@ -86,7 +83,7 @@ class ChainedOptimizer(Optimizer):
             for optimizer_idx, param_group_idx in indices:
                 self.optimizers[optimizer_idx].param_groups[param_group_idx]["lr"] = param_group["lr"]
 
-    def step(self, closure) -> None:
+    def step(self, closure=None) -> None:
         self._copy_lr_to_optimizers()
         for opt in self.optimizers:
             opt.step(closure)

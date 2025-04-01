@@ -99,8 +99,10 @@ def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.
         from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
 
         muon_params_id_set = set(id(p) for p in get_params_for_muon(model))
-        muon_args = kwargs.pop("muon_args", {})
-        adamw_args = kwargs.pop("adamw_args", {"betas": (0.9, 0.999), "eps": 1e-8})
+        muon_args = {"weight_decay": 1e-2}
+        muon_args.update(kwargs.pop("muon_args", {}))
+        adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
+        adamw_args.update(kwargs.pop("adamw_args", {}))
         spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
         spec_adamw = OptimizerSpec(optim.AdamW, adamw_args, None)
         specs = [spec_muon, spec_adamw]
