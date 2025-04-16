@@ -14,6 +14,7 @@ class KatagoNumpyDataset(Dataset):
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
         has_pass_move: bool = False,
         apply_symmetry: bool = False,
         filter_stm: int | None = None,
@@ -28,6 +29,7 @@ class KatagoNumpyDataset(Dataset):
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.fixed_board_size = fixed_board_size
         self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
@@ -161,7 +163,7 @@ class KatagoNumpyDataset(Dataset):
 
     def __getitem__(self, index):
         data = {k: self.data_dict[k][index] for k in self.data_dict}
-        return post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+        return post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
 
 
 @DATASETS.register("iterative_katago_numpy")
@@ -247,6 +249,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
         has_pass_move: bool = False,
         apply_symmetry: bool = False,
         filter_stm: int | None = None,
@@ -257,6 +260,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.fixed_board_size = fixed_board_size
         self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
 
@@ -351,7 +355,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
     def __getitem__(self, index):
         data = self._prepare_data(index)
-        return post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+        return post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
 
 
 @DATASETS.register("iterative_processed_katago_numpy")

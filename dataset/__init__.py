@@ -100,14 +100,14 @@ class MultiIterativeDataset(IterableDataset):
 
 
 def build_dataset(
-    dataset_type,
-    data_paths,
-    rules=None,
-    boardsizes=None,
-    boardsize=None,
-    fixed_side_input=False,
-    shuffle=False,
-    pipeline_args=None,
+    dataset_type: str,
+    data_paths: list[str],
+    rules: None | list[str] = None,
+    boardsizes: None | int | tuple[int, int] | list[tuple[int, int]] = None,
+    fixed_side_input: bool = False,
+    fixed_board_size: None | int | tuple[int, int] = None,
+    shuffle: bool=False,
+    pipeline_args: None | dict = None,
     **kwargs,
 ) -> Dataset | IterableDataset:
     assert dataset_type in DATASETS, f"Unknown dataset type: {dataset_type}"
@@ -120,16 +120,24 @@ def build_dataset(
 
     rules = rules or ["freestyle", "standard", "renju"]
     if boardsizes is None:
-        if isinstance(boardsize, int):
-            boardsizes = [(boardsize, boardsize)]
-        else:
-            boardsizes = [(s, s) for s in range(9, 22)]
+        boardsizes = [(s, s) for s in range(9, 22)]
+    elif isinstance(boardsizes, int):
+        boardsizes = [(boardsizes, boardsizes)]
+    elif isinstance(boardsizes, tuple):
+        boardsizes = [boardsizes]
+    assert isinstance(boardsizes, list), f"boardsizes must be list of tuples, but got {boardsizes}"
+
+    if isinstance(fixed_board_size, int):
+        fixed_board_size = (fixed_board_size, fixed_board_size)
+    assert fixed_board_size is None or isinstance(fixed_board_size, tuple), \
+        f"fixed_board_size must be None or tuple, but got {fixed_board_size}"
 
     dataset = dataset_cls(
         file_list=file_list,
         rules=set(rules),
         boardsizes=set(boardsizes),
         fixed_side_input=fixed_side_input,
+        fixed_board_size=fixed_board_size,
         shuffle=shuffle,
         **kwargs,
     )

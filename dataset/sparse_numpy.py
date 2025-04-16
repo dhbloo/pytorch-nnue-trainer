@@ -14,6 +14,7 @@ class IterativeSparseNumpyDataset(IterableDataset):
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
         apply_symmetry: bool = False,
         shuffle: bool = False,
         sample_rate: float = 1.0,
@@ -24,6 +25,7 @@ class IterativeSparseNumpyDataset(IterableDataset):
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.fixed_board_size = fixed_board_size
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
         self.sample_rate = sample_rate
@@ -125,7 +127,7 @@ class IterativeSparseNumpyDataset(IterableDataset):
             return None
         data["board_size"] = np.array(board_size, dtype=np.int8)
 
-        data = post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+        data = post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
         # Flip side when stm is white
         if self.fixed_side_input and data["stm_input"] > 0:
             data["sparse_feature_input"] = np.take(

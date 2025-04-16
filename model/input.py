@@ -7,6 +7,10 @@ def build_input_plane(input_type):
         return BasicInputPlane(with_stm=True)
     elif input_type == "basic-nostm" or input_type == "basicns":
         return BasicInputPlane(with_stm=False)
+    elif input_type == "mask":
+        return MaskedInputPlane(with_stm=True)
+    elif input_type == "mask-nostm" or input_type == "maskns":
+        return MaskedInputPlane(with_stm=False)
     elif input_type.startswith("pcode"):
         input_type = input_type[5:]
         if input_type.endswith("-nostm"):
@@ -60,6 +64,26 @@ class BasicInputPlane(nn.Module):
     @property
     def dim_plane(self):
         return 2 + self.with_stm
+
+
+class MaskedInputPlane(BasicInputPlane):
+    def __init__(self, with_stm=True):
+        super().__init__(with_stm)
+
+    def forward(self, data):
+        input_plane = super().forward(data)
+
+        board_size = data["board_size"]
+        B, C, H, W = data["board_input"].shape
+
+        rows = torch.arange(H, device=input_plane.device).view(1, H, 1)  # [1, H, 1]
+        cols = torch.arange(W, device=input_plane.device).view(1, 1, W)  # [1, 1, W]
+
+        mask_rows = rows < board_size[:, 0].view(B, 1, 1)  # [B, H, 1]
+        mask_cols = cols < board_size[:, 1].view(B, 1, 1)  # [B, 1, W]
+        mask_plane = (mask_rows & mask_cols).unsqueeze(1)  # [B, 1, H, W]
+
+        return input_plane, mask_plane.to(input_plane.dtype)
 
 
 class PatternCodeEmbeddingInputPlane(BasicInputPlane):

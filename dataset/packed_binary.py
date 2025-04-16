@@ -5,7 +5,7 @@ import random
 import torch.utils.data
 import io
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range, post_process_data
+from utils.data_utils import Result, Move, Rule, make_subset_range, post_process_data
 from utils.winrate_model import WinrateModel
 from . import DATASETS
 
@@ -125,6 +125,7 @@ class PackedBinaryDataset(IterableDataset):
         rules: set[str],
         boardsizes: set[tuple[int, int]],
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
         has_pass_move: bool = False,
         apply_symmetry: bool = False,
         shuffle: bool = False,
@@ -150,6 +151,7 @@ class PackedBinaryDataset(IterableDataset):
         self.rules = rules
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
+        self.fixed_board_size = fixed_board_size
         self.has_pass_move = has_pass_move
         self.value_td_lambda = value_td_lambda
         self.dynamic_value_lambda = dynamic_value_lambda
@@ -276,7 +278,7 @@ class PackedBinaryDataset(IterableDataset):
                     "ply": current_ply,
                     "raw_eval": float("nan") if bestmove_eval is None else float(bestmove_eval),
                 }
-                data = post_process_data(data, self.fixed_side_input, self.apply_symmetry)
+                data = post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
                 transformed_position = data.pop("position")
                 data["position_string"] = "".join([str(m) for m in transformed_position])
                 data["last_move"] = transformed_position[-1].pos

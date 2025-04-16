@@ -196,9 +196,9 @@ def make_subset_range(length, partition_num, partition_idx, shuffle=False, sampl
 def post_process_data(
     data: dict,
     fixed_side_input=False,
+    fixed_board_size=None,
     symmetry_type=None,
     symmetry_index=None,
-    move_sequence: list[Move] | None = None,
 ) -> dict:
     """
     Apply post processing to the data dict that contains some numpy arrays.
@@ -215,10 +215,11 @@ def post_process_data(
         data: A dict containing numpy arrays.
         fixed_side_input: Whether to fix the side of the input, so that the
             first channel is always black and the second channel is always white.
+        fixed_board_size: The fixed board size to use. If None, the size of input plane
+            will be the same as the board size. Otherwise, the input plane will be padded
+            to the fixed board size.
         symmetry_type: The type of symmetry to apply to the data. False for no symmetry.
         symmetry_index: The index of the symmetry to apply to the data. None for random.
-        move_sequence: A list of Move objects representing the move sequence. If provided,
-            the moves in the sequence will also be transformed by the symmetry.
     """
     if fixed_side_input and data["stm_input"] > 0:
         # Flip side when stm is white
@@ -252,6 +253,41 @@ def post_process_data(
             data["position"] = [
                 picked_symmetry.apply_to_move(m, data["board_size"]) for m in data["position"]
             ]
+
+    if fixed_board_size is not None:
+        padded_h, padded_w = fixed_board_size
+        board_channels, board_h, board_w = data["board_input"].shape
+        data["board_input"] = np.pad(
+            data["board_input"],
+            ((0, 0), (0, padded_h - board_h), (0, padded_w - board_w)),
+            mode="constant",
+            constant_values=0,
+        )
+
+        if data["policy_target"].ndim == 1:
+            assert (
+                data["policy_target"].shape[0] == np.prod(data["board_size"]) + 1
+            ), f"Invalid policy target shape ({data['policy_target'].shape}) for symmetry, must be (H*W+1)"
+            policy_target_board = data["policy_target"][:-1].reshape((-1, *data["board_size"]))
+            policy_target_board = np.pad(
+                policy_target_board,
+                ((0, padded_h - board_h), (0, padded_w - board_w)),
+                mode="constant",
+                constant_values=0,
+            )
+            policy_target_board = policy_target_board.reshape((policy_target_board.shape[0], -1))
+            data["policy_target"] = np.concatenate([policy_target_board, data["policy_target"][-1:]])
+        else:
+            data["policy_target"] = np.pad(
+                data["policy_target"],
+                ((0, padded_h - board_h), (0, padded_w - board_w)),
+                mode="constant",
+                constant_values=0,
+            )
+
+        assert data["board_input"].shape == (board_channels, padded_h, padded_w)
+        assert data["policy_target"].shape == (padded_h, padded_w) or \
+            data["policy_target"].shape == (padded_h * padded_w + 1,)
 
     return data
 

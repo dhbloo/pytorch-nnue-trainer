@@ -2,11 +2,51 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 from utils.quant_utils import fake_quant
+
+# ---------------------------------------------------------
+
+
+def _conv1d_out_size(in_size: int, kernel_size: int, stride: int, padding: int, dilation: int) -> int:
+    """Compute the output size of a 1d convolution."""
+    return 1 + (in_size + 2 * padding - dilation * (kernel_size - 1) - 1) // stride
+
+
+def _convnd_out_size(
+    in_size: tuple[int, ...],
+    kernel_size: tuple[int, ...],
+    stride: None | tuple[int, ...] = None,
+    padding: None | tuple[int, ...] = None,
+    dilation: None | tuple[int, ...] = None,
+) -> tuple[int, ...]:
+    """Compute the output size of a Nd convolution."""
+    return tuple(
+        _conv1d_out_size(
+            in_size[i],
+            kernel_size[i],
+            1 if stride is None else stride[i],
+            0 if padding is None else padding[i],
+            1 if dilation is None else dilation[i],
+        )
+        for i in range(len(in_size))
+    )
 
 
 # ---------------------------------------------------------
 # Normalization Layers
+
+
+class BatchNorm(nn.BatchNorm2d):
+    def forward(self, input: Tensor, mask=None) -> Tensor:
+        # Pytorch's BatchNorm2d does not support mask, so we just call the parent class method
+        return super().forward(input)
+
+
+class GroupNorm(nn.GroupNorm):
+    def forward(self, input: Tensor, mask=None) -> Tensor:
+        # Pytorch's GroupNorm does not support mask, so we just call the parent class method
+        return super().forward(input)
 
 
 class LocalLayerNorm(nn.Module):
@@ -50,7 +90,7 @@ class LocalLayerNorm(nn.Module):
             if self.bias is not None:
                 nn.init.zeros_(self.bias)
 
-    def forward(self, x):
+    def forward(self, x: Tensor, mask=None) -> Tensor:
         """
         Args:
             x: input feature tensor (B, C, *) if channels_first, or (B, *, C) if channels_last.
@@ -67,48 +107,118 @@ class LocalLayerNorm(nn.Module):
         return x
 
 
-def build_norm1d_layer(norm, num_features=None, norm_groups=None):
-    if norm == "bn":
-        assert isinstance(num_features, int)
-        return nn.BatchNorm1d(num_features)
-    elif norm == "in":
-        assert isinstance(num_features, int)
-        return nn.InstanceNorm1d(num_features)
-    elif norm == "gn":
-        assert isinstance(num_features, int)
-        assert isinstance(norm_groups, int)
-        return nn.GroupNorm(norm_groups, num_features)
-    elif norm.startswith("gn-"):
-        assert isinstance(num_features, int)
-        norm_groups = int(norm[3:])
-        return nn.GroupNorm(norm_groups, num_features)
-    elif norm == "ln":
-        assert isinstance(num_features, int)
-        return LocalLayerNorm(num_features)
-    elif norm == "none":
-        return None
-    else:
-        raise ValueError(f"Unsupported normalization: {norm}")
+class MaskNorm(nn.Module):
+    """
+    Various kinds of normalization with masked input.
+    This class is simplified from original implementation of Katago:
+    https://github.com/lightvector/KataGo/blob/master/python/model_pytorch.py
+    Support of batch renorm is removed.
+
+    Available norm types:
+    bnorm - batch norm
+    fixup - fixup initialization https://arxiv.org/abs/1901.09321
+    fixscale - fixed scaling initialization. Normalization layers simply multiply a constant scalar according
+        to what batchnorm *would* do if all inputs were unit variance and all linear layers or convolutions
+        preserved variance.
+    fixscaleonenorm - fixed scaling normalization PLUS only have one batch norm layer in the entire net, at the end of the residual trunk.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        norm_type: str,
+        use_gamma: bool = True,
+        bnorm_epsilon: float = 1e-4,
+        bnorm_running_avg_momentum: float = 1e-3,
+    ):
+        super().__init__()
+        assert norm_type in ["bnorm", "fixup"], f"Invalid norm type {norm_type}"
+        self.num_features = num_features
+        self.norm_type = norm_type
+        self.epsilon = bnorm_epsilon
+        self.running_avg_momentum = bnorm_running_avg_momentum
+
+        self.scale = None
+        self.gamma = None
+        if use_gamma:
+            self.gamma = nn.Parameter(torch.ones(1, num_features, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+
+        if norm_type == "bnorm":
+            self.register_buffer("running_mean", torch.zeros(num_features))
+            self.register_buffer("running_std", torch.ones(num_features))
+
+    def set_scale(self, scale: None | float):
+        self.scale = scale
+
+    def _compute_bnorm_values(self, x: Tensor, mask: None | Tensor):
+        # Compute mean and standard variance over the areas in the mask
+        if mask is not None:
+            mask_sum = torch.sum(mask, dim=(0, 2, 3), keepdim=True)
+            mean = torch.sum(x * mask, dim=(0, 2, 3), keepdim=True) / mask_sum
+            zeromean_x = x - mean
+            var = torch.sum(torch.square(zeromean_x * mask), dim=(0, 2, 3), keepdim=True) / mask_sum
+        else:
+            mean = torch.mean(x, dim=(0, 2, 3), keepdim=True)
+            zeromean_x = x - mean
+            var = torch.var(zeromean_x, dim=(0, 2, 3), unbiased=False, keepdim=True)
+        std = torch.sqrt(var + self.epsilon)
+        return zeromean_x, mean, std
+
+    def _apply_gamma_beta_scale_mask(self, x: Tensor, mask: None | Tensor) -> Tensor:
+        if self.scale is not None:
+            if self.gamma is not None:
+                x *= self.gamma * self.scale
+            else:
+                x *= self.scale
+        elif self.gamma is not None:
+            x *= self.gamma
+        x += self.beta
+        if mask is not None:
+            x = x * mask
+        return x
+
+    def forward(self, x: Tensor, mask: None | Tensor) -> Tensor:
+        if self.norm_type == "bnorm":
+            assert x.ndim == 4 and x.shape[1] == self.num_features
+            if self.training:
+                zeromean_x, mean, std = self._compute_bnorm_values(x, mask)
+
+                detached_mean = mean.view(self.num_features).detach()
+                detached_std = std.view(self.num_features).detach()
+                with torch.no_grad():
+                    self.running_mean += self.running_avg_momentum * (detached_mean - self.running_mean)
+                    self.running_std += self.running_avg_momentum * (detached_std - self.running_std)
+
+                return self._apply_gamma_beta_scale_mask(zeromean_x / std, mask)
+            else:
+                zeromean_x = x - self.running_mean.view(1, self.num_features, 1, 1)
+                std = self.running_std.view(1, self.num_features, 1, 1)
+                return self._apply_gamma_beta_scale_mask(zeromean_x / std, mask)
+        else:
+            return self._apply_gamma_beta_scale_mask(x, mask)
 
 
-def build_norm2d_layer(norm, num_features=None, norm_groups=None):
+def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
+    assert isinstance(num_features, int)
     if norm == "bn":
-        assert isinstance(num_features, int)
-        return nn.BatchNorm2d(num_features)
-    elif norm == "in":
-        assert isinstance(num_features, int)
-        return nn.InstanceNorm2d(num_features)
+        return BatchNorm(num_features)
     elif norm == "gn":
-        assert isinstance(num_features, int)
         assert isinstance(norm_groups, int)
-        return nn.GroupNorm(norm_groups, num_features)
+        return GroupNorm(norm_groups, num_features)
     elif norm.startswith("gn-"):
-        assert isinstance(num_features, int)
         norm_groups = int(norm[3:])
-        return nn.GroupNorm(norm_groups, num_features)
+        return GroupNorm(norm_groups, num_features)
     elif norm == "ln":
-        assert isinstance(num_features, int)
         return LocalLayerNorm(num_features)
+    elif norm == "mask":
+        return MaskNorm(num_features, "fixup", use_gamma=True)
+    elif norm == "mask-nogamma":
+        return MaskNorm(num_features, "fixup", use_gamma=False)
+    elif norm == "maskbn":
+        return MaskNorm(num_features, "bnorm", use_gamma=True)
+    elif norm == "maskbn-nogamma":
+        return MaskNorm(num_features, "bnorm", use_gamma=False)
     elif norm == "none":
         return None
     else:
@@ -151,7 +261,7 @@ class ClippedReLU(nn.Module):
         self.inplace = inplace
         self.max = max
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: Tensor):
         if self.inplace:
             return x.clamp_(0, self.max)
         else:
@@ -198,7 +308,7 @@ class QuantPReLU(nn.PReLU):
         self.weight_quant_bits = weight_quant_bits
         self.weight_signed = weight_signed
 
-    def forward(self, input: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: Tensor) -> Tensor:
         input = fake_quant(
             input,
             self.input_quant_scale,
@@ -223,13 +333,13 @@ class SwitchPReLU(nn.Module):
         self.weight = nn.Parameter(torch.zeros((num_experts, num_parameters), **factory_kwargs))
         self.weight_fact = nn.Parameter(torch.full((1, num_parameters), init, **factory_kwargs))
 
-    def get_weight(self, route_index: torch.Tensor) -> torch.Tensor:
+    def get_weight(self, route_index: Tensor) -> Tensor:
         return F.embedding(route_index, self.weight) + self.weight_fact
 
-    def get_weight_at_idx(self, index: int) -> torch.Tensor:
+    def get_weight_at_idx(self, index: int) -> Tensor:
         return self.weight[index] + self.weight_fact[0]
 
-    def forward(self, input: torch.Tensor, route_index: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: Tensor, route_index: Tensor) -> Tensor:
         neg_slope = self.get_weight(route_index)
         neg_slope = neg_slope.view(
             neg_slope.shape[0], neg_slope.shape[1], *([1] * (input.ndim - neg_slope.ndim))
@@ -246,7 +356,6 @@ class LinearBlock(nn.Module):
         self,
         in_dim,
         out_dim,
-        norm="none",
         activation="relu",
         bias=True,
         quant=False,
@@ -266,7 +375,6 @@ class LinearBlock(nn.Module):
             self.weight_quant_bits = weight_quant_bits
             self.bias_quant_bits = bias_quant_bits
 
-        self.norm = build_norm1d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
 
     def forward(self, x):
@@ -286,8 +394,6 @@ class LinearBlock(nn.Module):
         else:
             out = self.fc(x)
 
-        if self.norm:
-            out = self.norm(out)
         if self.activation:
             out = self.activation(out)
         return out
@@ -352,10 +458,20 @@ class Conv2dBlock(nn.Module):
             self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
             self.bias_quant_bits = bias_quant_bits
 
-    def forward(self, x):
+    def _erode_mask(self, mask: Tensor) -> Tensor:
+        _, _, h_in, w_in = mask.shape
+        p, d, k, s = self.conv.padding, self.conv.dilation, self.conv.kernel_size, self.conv.stride
+        h_out, w_out = _convnd_out_size((h_in, w_in), k, s, p, d)
+        h_off, w_off = h_in - h_out, w_in - w_out
+        if h_off > 0 or w_off > 0:
+            return mask[:, :, h_off:, w_off:]
+        else:
+            return mask
+
+    def forward(self, x: Tensor, mask: None | Tensor = None) -> Tensor | tuple[Tensor, Tensor]:
         if self.activation_first:
             if self.norm:
-                x = self.norm(x)
+                x = self.norm(x, mask=mask)
             if self.activation:
                 x = self.activation(x)
         if self.quant:
@@ -371,8 +487,7 @@ class Conv2dBlock(nn.Module):
                 assert isinstance(self.conv.padding, tuple)
                 batch_size, _, h_in, w_in = x.shape
                 p, d, k, s = self.conv.padding, self.conv.dilation, self.conv.kernel_size, self.conv.stride
-                h_out = (h_in + 2 * p[0] - d[0] * (k[0] - 1) - 1) // s[0] + 1
-                w_out = (w_in + 2 * p[1] - d[1] * (k[1] - 1) - 1) // s[1] + 1
+                h_out, w_out = _convnd_out_size((h_in, w_in), k, s, p, d)
 
                 x = F.unfold(x, k, d, p, s)
                 x = fake_quant(
@@ -391,12 +506,17 @@ class Conv2dBlock(nn.Module):
                 )
         else:
             x = self.conv(x)
+        if mask is not None:
+            mask = self._erode_mask(mask)
         if not self.activation_first:
             if self.norm:
-                x = self.norm(x)
+                x = self.norm(x, mask=mask)
             if self.activation:
                 x = self.activation(x)
-        return x
+        if mask is not None:
+            return x, mask
+        else:
+            return x
 
 
 class Conv1dLine4Block(nn.Module):
@@ -606,8 +726,13 @@ class Conv2dSymBlock(nn.Module):
             ):  # pixel-wise quantization in depthwise conv
                 assert self.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
                 batch_size, _, h_in, w_in = x.shape
-                h_out = (h_in + 2 * self.padding - self.kernel_size) // self.stride + 1
-                w_out = (w_in + 2 * self.padding - self.kernel_size) // self.stride + 1
+                h_out, w_out = _convnd_out_size(
+                    (h_in, w_in),
+                    (self.kernel_size, self.kernel_size),
+                    (self.stride, self.stride),
+                    (self.padding, self.padding),
+                    None,
+                )
                 x = F.unfold(x, self.kernel_size, 1, self.padding, self.stride)
                 x = fake_quant(
                     x * w.view(-1)[None, :, None],
@@ -733,7 +858,7 @@ class SwitchGate(nn.Module):
         self.jitter_eps = jitter_eps
         self.no_scaling = no_scaling
 
-    def forward(self, route_logits: torch.Tensor) -> torch.Tensor:
+    def forward(self, route_logits: Tensor) -> tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
         """
         Apply switch gating to routing logits.
         Args:
@@ -817,7 +942,7 @@ class SwitchLinear(nn.Module):
             nn.init.uniform_(self.bias_fact, -bound, bound)
             nn.init.zeros_(self.bias)
 
-    def get_weight_and_bias(self, route_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_weight_and_bias(self, route_index: Tensor) -> tuple[Tensor, None | Tensor]:
         batch_size = route_index.shape[0]
         expert_weight = F.embedding(route_index, self.weight) + self.weight_fact
         expert_weight = expert_weight.view(batch_size, self.out_features, self.in_features)
@@ -827,7 +952,7 @@ class SwitchLinear(nn.Module):
             expert_bias = None
         return expert_weight, expert_bias
 
-    def get_weight_and_bias_at_idx(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_weight_and_bias_at_idx(self, index: int) -> tuple[Tensor, None | Tensor]:
         expert_weight = self.weight[index] + self.weight_fact[0]
         expert_weight = expert_weight.view(self.out_features, self.in_features)
         if self.bias is not None:
@@ -836,7 +961,7 @@ class SwitchLinear(nn.Module):
             expert_bias = None
         return expert_weight, expert_bias
 
-    def forward(self, input: torch.Tensor, route_index: torch.Tensor) -> torch.Tensor:
+    def forward(self, input: Tensor, route_index: Tensor) -> Tensor:
         expert_weight, expert_bias = self.get_weight_and_bias(route_index)
         output = torch.einsum("bmn,bn->bm", expert_weight, input)
         if expert_bias is not None:
@@ -874,7 +999,7 @@ class SwitchLinearBlock(nn.Module):
         # initialize activation
         self.activation = build_activation_layer(activation)
 
-    def forward(self, x: torch.Tensor, route_index: torch.Tensor):
+    def forward(self, x: Tensor, route_index: Tensor):
         if self.quant:
             weight, bias = self.fc.get_weight_and_bias(route_index)
             x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
@@ -945,7 +1070,7 @@ class SwitchConv2d(nn.Module):
             nn.init.uniform_(self.bias_fact, -bound, bound)
             nn.init.zeros_(self.bias)
 
-    def get_weight_and_bias(self, route_index: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_weight_and_bias(self, route_index: Tensor) -> tuple[Tensor, None | Tensor]:
         batch_size = route_index.shape[0]
         expert_weight = F.embedding(route_index, self.weight) + self.weight_fact
         expert_weight = expert_weight.view(batch_size, *self.weight_shape)
@@ -955,7 +1080,7 @@ class SwitchConv2d(nn.Module):
             expert_bias = None
         return expert_weight, expert_bias
 
-    def get_weight_and_bias_at_idx(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def get_weight_and_bias_at_idx(self, index: int) -> tuple[Tensor, None | Tensor]:
         expert_weight = (self.weight[index] + self.weight_fact[0]).view(self.weight_shape)
         if self.bias is not None:
             expert_bias = self.bias[index] + self.bias_fact[0]
@@ -963,7 +1088,7 @@ class SwitchConv2d(nn.Module):
             expert_bias = None
         return expert_weight, expert_bias
 
-    def forward(self, input: torch.Tensor, route_index: torch.Tensor):
+    def forward(self, input: Tensor, route_index: Tensor):
         if self.padding_mode != "zeros":
             input = F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode)
             padding = (0, 0)
@@ -1039,7 +1164,7 @@ class SwitchConv2dBlock(nn.Module):
             self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
             self.bias_quant_bits = bias_quant_bits
 
-    def forward(self, x: torch.Tensor, route_index: torch.Tensor):
+    def forward(self, x: Tensor, route_index: Tensor):
         if self.activation and self.activation_first:
             x = self.activation(x)
         if self.quant:

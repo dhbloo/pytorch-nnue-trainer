@@ -5,13 +5,14 @@ import torch.nn.functional as F
 from accelerate.state import PartialState
 from accelerate.utils import gather, reduce
 from pykeops.torch import LazyTensor
+from torch import Tensor
 
 
-def l2_norm(x: torch.Tensor) -> torch.Tensor:
+def l2_norm(x: Tensor) -> Tensor:
     return F.normalize(x, p=2, dim=-1, eps=1e-7)
 
 
-def l2_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
+def l2_dist(x: Tensor, y: Tensor) -> LazyTensor:
     """
     Compute the L2 distance between x and y.
     Args:
@@ -31,7 +32,7 @@ def l2_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
     return dists
 
 
-def cosine_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
+def cosine_dist(x: Tensor, y: Tensor) -> LazyTensor:
     """
     Compute the cosine similarity between x and y.
     Args:
@@ -46,7 +47,7 @@ def cosine_dist(x: torch.Tensor, y: torch.Tensor) -> LazyTensor:
     return dists
 
 
-def uniform_init(*shape) -> torch.Tensor:
+def uniform_init(*shape) -> Tensor:
     """Initialize a tensor with uniform random values."""
     codebook = torch.empty(shape)
     nn.init.kaiming_uniform_(codebook)
@@ -66,7 +67,7 @@ def uniform_lazy_tensor_2d(dim0, dim1, device) -> LazyTensor:
     return rand_xy_clamp
 
 
-def gumbel_sample(logits: LazyTensor, stochastic=False, temperature=1.0, training=True) -> torch.Tensor:
+def gumbel_sample(logits: LazyTensor, stochastic=False, temperature=1.0, training=True) -> Tensor:
     """
     Sample from a categorical distribution using the Gumbel-Softmax trick.
     Args:
@@ -89,14 +90,14 @@ def gumbel_sample(logits: LazyTensor, stochastic=False, temperature=1.0, trainin
     return ind
 
 
-def compute_perplexity(cluster_size: torch.Tensor) -> torch.Tensor:
+def compute_perplexity(cluster_size: Tensor) -> Tensor:
     probs = cluster_size / cluster_size.sum()
     entropy = probs * torch.log(probs + 1e-10)
     perplexity = torch.exp(-torch.sum(entropy))
     return perplexity
 
 
-def entropy_regularization(logits: LazyTensor, temperature=1.0) -> torch.Tensor:
+def entropy_regularization(logits: LazyTensor, temperature=1.0) -> Tensor:
     logits = logits * (1.0 / temperature)  # (N, codebook_size)
     logits_max_and_exp = logits.reduction("Max_SumShiftExp", dim=1)  # (N, 2)
     logits_max = logits_max_and_exp[:, 0].contiguous()
@@ -108,7 +109,7 @@ def entropy_regularization(logits: LazyTensor, temperature=1.0) -> torch.Tensor:
     return -entropy
 
 
-def sample_vectors(inputs: torch.Tensor, num_samples: int) -> torch.Tensor:
+def sample_vectors(inputs: Tensor, num_samples: int) -> Tensor:
     """Sample num_samples vectors from the input tensor (supports DDP)."""
     num_processes = PartialState().num_processes
     process_idx = PartialState().process_index
@@ -130,11 +131,11 @@ def sample_vectors(inputs: torch.Tensor, num_samples: int) -> torch.Tensor:
 
 
 def kmeans(
-    inputs: torch.Tensor,
+    inputs: Tensor,
     num_clusters: int,
     num_iters: int = 10,
     use_cosine_sim: bool = False,
-) -> torch.Tensor:
+) -> Tensor:
     """
     Perform K-means clustering on the input embeddings.
     This method supports working under distributed settings.
@@ -186,11 +187,11 @@ def kmeans(
     return means, bins
 
 
-def ema_inplace(tensor: torch.Tensor, new: torch.Tensor, decay: float) -> torch.Tensor:
+def ema_inplace(tensor: Tensor, new: Tensor, decay: float) -> Tensor:
     return tensor.lerp_(new, 1 - decay)
 
 
-def efficient_rotation_trick_transform(u: torch.Tensor, q: torch.Tensor, e: torch.Tensor) -> torch.Tensor:
+def efficient_rotation_trick_transform(u: Tensor, q: Tensor, e: Tensor) -> Tensor:
     """
     4.2 in https://arxiv.org/abs/2410.06424
     """
@@ -201,7 +202,7 @@ def efficient_rotation_trick_transform(u: torch.Tensor, q: torch.Tensor, e: torc
     ).squeeze(1)
 
 
-def rotate_to(src: torch.Tensor, tgt: torch.Tensor):
+def rotate_to(src: Tensor, tgt: Tensor):
     """
     Rotation trick STE (https://arxiv.org/abs/2410.06424) to get gradients through VQ layer.
     Inputs:
@@ -406,7 +407,7 @@ class VectorQuantize(nn.Module):
         return loss, loss_terms
 
     @property
-    def codebook(self) -> torch.Tensor:
+    def codebook(self) -> Tensor:
         if self.use_simvq:
             code = self.code_transform(self.embed)
         else:
@@ -418,14 +419,14 @@ class VectorQuantize(nn.Module):
         return code
 
     @property
-    def normalized_cluster_size(self) -> torch.Tensor:
+    def normalized_cluster_size(self) -> Tensor:
         return self.cluster_size * (self.codebook_size / self.cluster_size.sum())
 
-    def from_indices(self, indices: torch.Tensor) -> torch.Tensor:
+    def from_indices(self, indices: Tensor) -> Tensor:
         return F.embedding(indices, self.codebook)  # (..., dim_feature)
 
     @torch.compiler.disable
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: Tensor):
         """
         Get the quantized version x_q of the continuous input x.
         Args:
