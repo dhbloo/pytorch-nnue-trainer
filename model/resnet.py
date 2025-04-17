@@ -250,8 +250,7 @@ class ResNetv3(nn.Module):
         x, mask = self.conv_input(input_plane, mask_plane)
         for conv_block in self.conv_trunk:
             x, mask = conv_block(x, mask)
-        x = self.output_head(x, mask)
-        return x
+        return self.output_head(x, mask)
 
     @property
     def name(self):

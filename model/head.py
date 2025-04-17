@@ -52,5 +52,6 @@ class OutputHeadV0Mask(nn.Module):
         # policy head
         policy = self.policy_head(feature)
         policy = torch.squeeze(policy, dim=1)
-
-        return value, policy
+        
+        board_mask = torch.squeeze(mask, dim=1)
+        return value, policy, {}, {}, board_mask

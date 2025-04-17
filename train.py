@@ -138,6 +138,7 @@ def calc_loss(
     value, policy, *retvals = results
     aux_losses = retvals[0] if len(retvals) >= 1 else None
     aux_outputs = retvals[1] if len(retvals) >= 2 else None
+    board_mask = retvals[2] if len(retvals) >= 3 else None
 
     if kd_results is not None:
         # get value and policy target from teacher model
@@ -151,6 +152,11 @@ def calc_loss(
     policy_target = torch.flatten(policy_target, start_dim=1)
     policy = torch.flatten(policy, start_dim=1)
     assert policy_target.shape[1] == policy.shape[1]
+
+    # apply board region mask to policy, so after exp() they are close to zero
+    if board_mask is not None:
+        board_mask = torch.flatten(board_mask, start_dim=1)
+        policy = policy.masked_fill(board_mask == 0, -1e6)
 
     if kd_results is not None:
         # apply softmax to value and policy target according to temparature
@@ -227,8 +233,12 @@ def calc_loss(
 
     # ===============================================================
     # policy reg loss
-    def get_policy_reg_loss(policy: torch.Tensor):
-        return torch.mean(policy).square()
+    def get_policy_reg_loss(policy: torch.Tensor, mask: None | torch.Tensor):
+        if mask is not None:
+            policy_mean = torch.sum(policy * mask) / torch.sum(mask)
+        else:
+            policy_mean = torch.mean(policy)
+        return policy_mean.square()
 
     # ===============================================================
     # value uncertainty loss
@@ -279,11 +289,11 @@ def calc_loss(
     }
 
     if policy_reg_lambda > 0:
-        policy_reg = get_policy_reg_loss(policy)
+        policy_reg = get_policy_reg_loss(policy, board_mask)
         total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict["policy_reg"] = policy_reg.detach()
 
-    if aux_losses is not None:
+    if aux_losses:
         for aux_loss_name, aux_loss in aux_losses.items():
             aux_loss_print_name = f"{aux_loss_name}_loss"
             aux_loss_weight = None
@@ -340,7 +350,7 @@ def calc_loss(
         loss_dict.update(kd_loss_dict)
 
     aux_outputs_dict = {}
-    if aux_outputs is not None:
+    if aux_outputs:
         for aux_name, aux_output in aux_outputs.items():
             aux_outputs_dict[aux_name] = aux_output.detach()
 
