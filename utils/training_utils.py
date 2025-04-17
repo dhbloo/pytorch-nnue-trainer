@@ -138,7 +138,7 @@ def build_data_loader(
     dataset,
     batch_size=1,
     shuffle=False,
-    shuffle_buffer_size=16384,
+    shuffle_buffer_size=32768,
     num_workers=0,
     drop_last=True,
     batch_by_boardsize=False,
@@ -252,7 +252,7 @@ def cross_entropy_with_softlabel(
 
 
 class ShuffleDataset(IterableDataset):
-    def __init__(self, dataset, buffer_size):
+    def __init__(self, dataset : IterableDataset, buffer_size : int):
         super().__init__()
         self.dataset = dataset
         self.buffer_size = buffer_size
@@ -263,7 +263,7 @@ class ShuffleDataset(IterableDataset):
             dataset_iter = iter(self.dataset)
             for i in range(self.buffer_size):
                 shufbuf.append(next(dataset_iter))
-        except:
+        except StopIteration:
             self.buffer_size = len(shufbuf)
 
         try:

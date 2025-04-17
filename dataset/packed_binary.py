@@ -269,14 +269,14 @@ class PackedBinaryDataset(IterableDataset):
                     "rule_index": entry.rule.index,
                     # inputs
                     "board_input": board_input,  # [C, H, W], C=2 (Black,White)
-                    "stm_input": float(current_stm_input),  # [1] Black = -1, White = 1
+                    "stm_input": np.array(current_stm_input, dtype=np.float32),  # [1] Black = -1, White = 1
                     # targets
                     "value_target": value_target,  # [3] (Black Win, White Win, Draw)
                     "policy_target": policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
                     # other infos
                     "position": current_position,
                     "ply": current_ply,
-                    "raw_eval": float("nan") if bestmove_eval is None else float(bestmove_eval),
+                    "raw_eval": np.array(np.nan if bestmove_eval is None else bestmove_eval, dtype=np.float32),
                 }
                 data = post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
                 transformed_position = data.pop("position")

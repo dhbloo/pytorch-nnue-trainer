@@ -144,7 +144,7 @@ class SimpleBinaryDataset(IterableDataset):
             "rule_index": rule.index,
             # inputs
             "board_input": board_input,  # [C, H, W], C=(Black,White)
-            "stm_input": float(stm_input),  # [1] Black = -1.0, White = 1.0
+            "stm_input": np.array(stm_input, dtype=np.float32),  # [1] Black = -1.0, White = 1.0
             # targets
             "value_target": value_target,  # [3] (Black Win, White Win, Draw)
             "policy_target": policy_target,  # [H, W]
