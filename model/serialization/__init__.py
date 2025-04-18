@@ -1,7 +1,6 @@
 from utils.misc_utils import Registry, import_submodules
 from abc import ABC, abstractmethod
 from io import IOBase
-from datetime import datetime
 
 
 class BaseSerializer(ABC):
@@ -11,10 +10,7 @@ class BaseSerializer(ABC):
         super().__init__()
         self._rules = rules
         self._boardsizes = boardsizes
-        self._description = description
-        if self._description is None:
-            timestamp_str = datetime.now().strftime("%c")
-            self._description = f"Weight exported by pytorch-nnue-trainer at {timestamp_str}."
+        self._description = description or ""
 
     @property
     def is_binary(self) -> bool:

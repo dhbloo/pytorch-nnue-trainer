@@ -38,6 +38,27 @@ def log_value_dict(tb_logger, tag, value_dict, it, rows):
         tb_logger.add_scalar(f"{tag}_rows/{name}", value, rows)
 
 
+def deep_update_dict(base_dict: dict, new_dict: dict):
+    """Recursively update base_dict with new_dict (inplace).
+
+    :param base_dict: dict to be updated
+    :param new_dict: dict to update from
+    :return: updated base_dict
+    """
+    def recursive_update(dict1: dict, dict2: dict, key_prefix: str = ""):
+        for key, value in dict2.items():
+            if isinstance(value, dict) and key in base_dict:
+                full_key = key_prefix + "." + key if key_prefix else key
+                if not isinstance(base_dict[key], dict):
+                    raise TypeError(f"Key {full_key} in base_dict is not a dict.")
+                dict1[key] = recursive_update(base_dict[key], value, full_key)
+            else:
+                dict1[key] = value
+
+    recursive_update(base_dict, new_dict)
+    return base_dict
+
+
 class Registry:
     def __init__(self, registry_name):
         self._dict = {}

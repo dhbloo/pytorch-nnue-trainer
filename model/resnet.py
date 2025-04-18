@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 from . import MODELS
@@ -208,17 +209,20 @@ class ResNetv3(nn.Module):
         input_kernel_size=5,
         input_stride=1,
         input_padding=2,
+        input_norm="mask",
         trunk_kernel_size=3,
         trunk_stride=1,
         trunk_padding=1,
-        trunk_norm1="maskbn",
+        trunk_norm1="maskbn-nogamma",
         trunk_norm2="maskbn",
         trunk_activation="relu",
+        drop_mask=False,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
         self.head_type = head_type
         self.input_type = input_type
+        self.drop_mask = drop_mask
 
         self.input_plane = build_input_plane(input_type)
         self.conv_input = Conv2dBlock(
@@ -227,7 +231,7 @@ class ResNetv3(nn.Module):
             ks=input_kernel_size,
             st=input_stride,
             padding=input_padding,
-            norm="mask",
+            norm=input_norm,
             activation="none",
         )
         self.conv_trunk = nn.ModuleList()
@@ -237,20 +241,32 @@ class ResNetv3(nn.Module):
                 ks=trunk_kernel_size,
                 st=trunk_stride,
                 padding=trunk_padding,
-                conv1_norm=trunk_norm1 + "-nogamma",
+                conv1_norm=trunk_norm1,
                 conv2_norm=trunk_norm2,
                 activation=trunk_activation,
                 activation_first=True,
             )
             self.conv_trunk.append(block)
-        self.output_head = build_head(head_type + "-mask", dim_feature)
+        self.output_head = build_head(head_type, dim_feature)
 
     def forward(self, data):
-        input_plane, mask_plane = self.input_plane(data)
-        x, mask = self.conv_input(input_plane, mask_plane)
-        for conv_block in self.conv_trunk:
-            x, mask = conv_block(x, mask)
-        return self.output_head(x, mask)
+        if self.drop_mask:
+            input_plane = self.input_plane(data)
+            if isinstance(input_plane, tuple):
+                input_plane = input_plane[0]
+            assert isinstance(input_plane, torch.Tensor)
+            x = self.conv_input(input_plane)
+            for conv_block in self.conv_trunk:
+                x = conv_block(x)
+            value, policy = self.output_head(x)
+            return value, policy
+        else:
+            input_plane, mask_plane = self.input_plane(data)
+            x, mask = self.conv_input(input_plane, mask_plane)
+            for conv_block in self.conv_trunk:
+                x, mask = conv_block(x, mask)
+            value, policy, mask = self.output_head(x, mask)
+            return value, policy, {}, {}, mask
 
     @property
     def name(self):
