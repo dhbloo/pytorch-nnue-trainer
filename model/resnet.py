@@ -213,7 +213,7 @@ class ResNetv3(nn.Module):
         trunk_kernel_size=3,
         trunk_stride=1,
         trunk_padding=1,
-        trunk_norm1="maskbn-nogamma",
+        trunk_norm1="maskbn-noaffine",
         trunk_norm2="maskbn",
         trunk_activation="relu",
         drop_mask=False,
@@ -244,7 +244,7 @@ class ResNetv3(nn.Module):
                 conv1_norm=trunk_norm1,
                 conv2_norm=trunk_norm2,
                 activation=trunk_activation,
-                activation_first=True,
+                activation_first=False,
             )
             self.conv_trunk.append(block)
         self.output_head = build_head(head_type, dim_feature)

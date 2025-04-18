@@ -131,9 +131,10 @@ def export_jit(output, model, **kwargs):
 
 
 class OnnxModelIOv1(torch.nn.Module):
-    def __init__(self, warpped_model):
+    def __init__(self, warpped_model, apply_policy_softmax=False):
         super().__init__()
         self.warpped_model = warpped_model
+        self.apply_policy_softmax = apply_policy_softmax
 
     def get_io_version(self) -> int:
         return 1
@@ -158,7 +159,7 @@ class OnnxModelIOv1(torch.nn.Module):
         assert boardInputNCHW.ndim == 4, f"boardInputNCHW.shape={boardInputNCHW.shape}"
         assert globalInputNC.ndim == 2, f"globalInputNC.shape={globalInputNC.shape}"
         assert boardInputNCHW.shape[0] == globalInputNC.shape[0]
-        return (boardInputNCHW, globalInputNC)
+        return boardInputNCHW, globalInputNC
 
     def get_data_from_model_inputs(self, boardInputNCHW, globalInputNC):
         return {
@@ -167,14 +168,18 @@ class OnnxModelIOv1(torch.nn.Module):
         }
 
     def get_model_outputs(self, *retvals):
-        value, policy = retvals
+        value, policy, *extra_outputs = retvals
         assert value.ndim == 2 and value.shape[1] == 3, f"value.shape={value.shape}"
         assert policy.ndim == 3, f"policy.shape={policy.shape}"
         assert value.shape[0] == policy.shape[0]
-        return (value, policy)
+        if self.apply_policy_softmax:
+            policy_flat = torch.flatten(policy, start_dim=1)
+            policy_flat = torch.nn.functional.softmax(policy_flat, dim=1)
+            policy = torch.reshape(policy_flat, policy.shape)
+        return value, policy
 
-    def forward(self, *inputs):
-        input_data = self.get_data_from_model_inputs(*inputs)
+    def forward(self, boardInputNCHW, globalInputNC):
+        input_data = self.get_data_from_model_inputs(boardInputNCHW, globalInputNC)
         retvals = self.warpped_model(input_data)
         return self.get_model_outputs(*retvals)
 
@@ -224,7 +229,10 @@ def export_onnx(output, model, export_args, onnx_io_version=1, **kwargs):
 
     # Warp the model with ONNX input/output interface
     if onnx_io_version == 1:
-        model = OnnxModelIOv1(model)
+        model = OnnxModelIOv1(
+            model,
+            apply_policy_softmax=export_args.get("apply_policy_softmax", False),
+        )
     else:
         raise ValueError(f"Unsupported ONNX IO version {onnx_io_version}")
 
@@ -241,6 +249,7 @@ def export_onnx(output, model, export_args, onnx_io_version=1, **kwargs):
         input_names=model.get_input_names(),
         output_names=model.get_output_names(),
         dynamic_axes=model.get_dynamic_axes(),
+        dynamo=export_args.get("onnx_use_dynamo", False),
     )
 
     # Add metadata to the exported ONNX model
@@ -294,7 +303,9 @@ def export_serialization(
             description = serializer.description(model)
             timestamp_str = datetime.now().strftime("%c")
             commit_hash = _get_git_revision_short_hash()
-            description += f"Weight exported by pytorch-nnue-trainer (commit hash {commit_hash}) at {timestamp_str}."
+            description += (
+                f"Weight exported by pytorch-nnue-trainer (commit hash {commit_hash}) at {timestamp_str}."
+            )
             encoded_description = description.encode("utf-8")
 
             f.write(MAGIC.to_bytes(4, byteorder="little", signed=False))

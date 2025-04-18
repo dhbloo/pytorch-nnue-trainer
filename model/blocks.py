@@ -112,7 +112,6 @@ class MaskNorm(nn.Module):
     Various kinds of normalization with masked input.
     This class is simplified from original implementation of Katago:
     https://github.com/lightvector/KataGo/blob/master/python/model_pytorch.py
-    Support of batch renorm is removed.
 
     Available norm types:
     bnorm - batch norm
@@ -127,7 +126,7 @@ class MaskNorm(nn.Module):
         self,
         num_features: int,
         norm_type: str,
-        use_gamma: bool = True,
+        affine: bool = False,
         bnorm_epsilon: float = 1e-4,
         bnorm_running_avg_momentum: float = 1e-3,
     ):
@@ -135,69 +134,106 @@ class MaskNorm(nn.Module):
         assert norm_type in ["bnorm", "fixup"], f"Invalid norm type {norm_type}"
         self.num_features = num_features
         self.norm_type = norm_type
+        self.affine = affine
         self.epsilon = bnorm_epsilon
         self.running_avg_momentum = bnorm_running_avg_momentum
 
-        self.scale = None
-        self.gamma = None
-        if use_gamma:
-            self.gamma = nn.Parameter(torch.ones(1, num_features, 1, 1))
-        self.beta = nn.Parameter(torch.zeros(1, num_features, 1, 1))
+        self.register_parameter("scale", None)
+        if affine:
+            self.weight = nn.Parameter(torch.empty(num_features))
+            self.bias = nn.Parameter(torch.empty(num_features))
+        else:
+            self.register_parameter("weight", None)
+            self.register_parameter("bias", None)
 
         if norm_type == "bnorm":
             self.register_buffer("running_mean", torch.zeros(num_features))
-            self.register_buffer("running_std", torch.ones(num_features))
+            self.register_buffer("running_var", torch.ones(num_features))
+        else:
+            self.register_buffer("running_mean", None)
+            self.register_buffer("running_var", None)
+
+        self.reset_parameters()
+
+    def reset_running_stats(self):
+        if self.norm_type == "bnorm":
+            self.running_mean.zero_()
+            self.running_var.fill_(1.0)
+
+    def reset_parameters(self):
+        self.scale = None
+        if self.affine:
+            nn.init.ones_(self.weight)
+            nn.init.zeros_(self.bias)
+        self.reset_running_stats()
 
     def set_scale(self, scale: None | float):
-        self.scale = scale
-
-    def _compute_bnorm_values(self, x: Tensor, mask: None | Tensor):
-        # Compute mean and standard variance over the areas in the mask
-        if mask is not None:
-            mask_sum = torch.sum(mask, dim=(0, 2, 3), keepdim=True)
-            mean = torch.sum(x * mask, dim=(0, 2, 3), keepdim=True) / mask_sum
-            zeromean_x = x - mean
-            var = torch.sum(torch.square(zeromean_x * mask), dim=(0, 2, 3), keepdim=True) / mask_sum
+        if scale is not None:
+            self.scale = nn.Parameter(torch.full((), scale), requires_grad=False)
         else:
-            mean = torch.mean(x, dim=(0, 2, 3), keepdim=True)
-            zeromean_x = x - mean
-            var = torch.var(zeromean_x, dim=(0, 2, 3), unbiased=False, keepdim=True)
-        std = torch.sqrt(var + self.epsilon)
-        return zeromean_x, mean, std
+            self.scale = None
 
-    def _apply_gamma_beta_scale_mask(self, x: Tensor, mask: None | Tensor) -> Tensor:
-        if self.scale is not None:
-            if self.gamma is not None:
-                x *= self.gamma * self.scale
-            else:
-                x *= self.scale
-        elif self.gamma is not None:
-            x *= self.gamma
-        x += self.beta
+    def _compute_bnorm_stats(self, x: Tensor, mask: None | Tensor) -> tuple[Tensor, Tensor, Tensor]:
         if mask is not None:
-            x = x * mask
+            # Compute mean and variance over the areas in the mask
+            mask_sum = torch.sum(mask, dim=(0, 2, 3))
+            mean = torch.sum(x * mask, dim=(0, 2, 3)) / mask_sum
+            zeromean_x = x - mean.view(1, self.num_features, 1, 1)
+            var = torch.sum((zeromean_x * mask).square(), dim=(0, 2, 3)) / mask_sum
+        else:
+            mean = torch.mean(x, dim=(0, 2, 3))
+            zeromean_x = x - mean.view(1, self.num_features, 1, 1)
+            var = torch.mean(zeromean_x.square(), dim=(0, 2, 3))
+        return zeromean_x, mean, var
+
+    def _apply_affine_transform(self, x: Tensor) -> Tensor:
+        if self.scale is not None:
+            x *= self.scale
+        if self.affine:
+            x = x * self.weight.view(1, self.num_features, 1, 1) + self.bias.view(1, self.num_features, 1, 1)
         return x
 
     def forward(self, x: Tensor, mask: None | Tensor) -> Tensor:
         if self.norm_type == "bnorm":
             assert x.ndim == 4 and x.shape[1] == self.num_features
+
             if self.training:
-                zeromean_x, mean, std = self._compute_bnorm_values(x, mask)
-
-                detached_mean = mean.view(self.num_features).detach()
-                detached_std = std.view(self.num_features).detach()
+                zeromean_x, mean, var = self._compute_bnorm_stats(x, mask)
                 with torch.no_grad():
-                    self.running_mean += self.running_avg_momentum * (detached_mean - self.running_mean)
-                    self.running_std += self.running_avg_momentum * (detached_std - self.running_std)
-
-                return self._apply_gamma_beta_scale_mask(zeromean_x / std, mask)
+                    self.running_mean += self.running_avg_momentum * (mean.detach() - self.running_mean)
+                    self.running_var += self.running_avg_momentum * (var.detach() - self.running_var)
             else:
-                zeromean_x = x - self.running_mean.view(1, self.num_features, 1, 1)
-                std = self.running_std.view(1, self.num_features, 1, 1)
-                return self._apply_gamma_beta_scale_mask(zeromean_x / std, mask)
-        else:
-            return self._apply_gamma_beta_scale_mask(x, mask)
+                mean, var = self.running_mean, self.running_var
+                zeromean_x = x - mean.view(1, self.num_features, 1, 1)
+            
+            if not self.training and torch.onnx.is_in_onnx_export():
+                if self.scale is not None:
+                    if self.affine:
+                        weight = self.scale * self.weight
+                    else:
+                        weight = self.scale.view(1).expand(self.num_features)
+                else:
+                    weight = self.weight if self.affine else None
 
+                x = F.batch_norm(
+                    input=x,
+                    running_mean=mean,
+                    running_var=var,
+                    weight=weight,
+                    bias=self.bias if self.affine else None,
+                    training=False,
+                    momentum=self.running_avg_momentum,
+                    eps=self.epsilon,
+                )
+            else:
+                std = torch.sqrt(var + self.epsilon).view(1, self.num_features, 1, 1)
+                x = self._apply_affine_transform(zeromean_x / std)
+        else:
+            x = self._apply_affine_transform(x)
+        if mask is not None:
+            x = x * mask
+        return x
+                
 
 def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
     assert isinstance(num_features, int)
@@ -212,13 +248,13 @@ def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
     elif norm == "ln":
         return LocalLayerNorm(num_features)
     elif norm == "mask":
-        return MaskNorm(num_features, "fixup", use_gamma=True)
-    elif norm == "mask-nogamma":
-        return MaskNorm(num_features, "fixup", use_gamma=False)
+        return MaskNorm(num_features, "fixup", affine=False)
+    elif norm == "mask-affine":
+        return MaskNorm(num_features, "fixup", affine=True)
     elif norm == "maskbn":
-        return MaskNorm(num_features, "bnorm", use_gamma=True)
-    elif norm == "maskbn-nogamma":
-        return MaskNorm(num_features, "bnorm", use_gamma=False)
+        return MaskNorm(num_features, "bnorm", affine=True)
+    elif norm == "maskbn-noaffine":
+        return MaskNorm(num_features, "bnorm", affine=False)
     elif norm == "none":
         return None
     else:
