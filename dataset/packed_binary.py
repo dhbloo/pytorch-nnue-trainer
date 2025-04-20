@@ -269,7 +269,7 @@ class PackedBinaryDataset(IterableDataset):
                     "rule_index": entry.rule.index,
                     # inputs
                     "board_input": board_input,  # [C, H, W], C=2 (Black,White)
-                    "stm_input": np.array(current_stm_input, dtype=np.float32),  # [1] Black = -1, White = 1
+                    "stm_input": np.array([current_stm_input], dtype=np.float32),  # [1] Black = -1, White = 1
                     # targets
                     "value_target": value_target,  # [3] (Black Win, White Win, Draw)
                     "policy_target": policy_target,  # [H, W] or [H*W+1] (append pass at last channel)
