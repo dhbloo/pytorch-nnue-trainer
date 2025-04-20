@@ -175,7 +175,7 @@ class OnnxModelIOv1(torch.nn.Module):
         if self.apply_policy_softmax:
             policy_flat = torch.flatten(policy, start_dim=1)
             policy_flat = torch.nn.functional.softmax(policy_flat, dim=1)
-            policy = torch.reshape(policy_flat, policy.shape)
+            policy = policy_flat.reshape_as(policy)
         return value, policy
 
     def forward(self, boardInputNCHW, globalInputNC):
@@ -269,6 +269,14 @@ def export_onnx(output, model, export_args, onnx_io_version=1, **kwargs):
         f"\nproducer_version={onnx_model.producer_version} "
         f"\nir_version={onnx_model.ir_version} "
     )
+
+    # Run OnnxSlim if available
+    try:
+        import onnxslim
+        print("Running onnxslim to optimize the model...")
+        onnxslim.slim(output, output)
+    except:
+        pass
     print(f"Onnx model has been exported to {output}.")
 
 
