@@ -10,7 +10,7 @@ from dataset import build_dataset
 from model import build_model
 from model.serialization import build_serializer
 from utils.training_utils import build_data_loader
-from utils.file_utils import find_latest_model_file
+from utils.file_utils import find_latest_ckpt, load_torch_ckpt
 from utils.misc_utils import set_performance_level, deep_update_dict
 
 
@@ -111,30 +111,13 @@ def _get_git_revision_short_hash(fallback: str = "(unknown)") -> str:
         return fallback
 
 
-def export_pytorch(output, model):
-    state_dicts = {"model": model.state_dict()}
-    torch.save(state_dicts, output)
-    print(f"Pytorch model has been written to {output}")
-
-
-def export_jit(output, model, **kwargs):
-    data = _get_sample_data(**kwargs)
-    data = {
-        "board_size": data["board_size"],
-        "board_input": data["board_input"],
-        "stm_input": data["stm_input"],
-    }
-
-    jit_model = torch.jit.trace(model, data)
-    torch.jit.save(jit_model, output)
-    print(f"Jit model has been written to {output}")
-
-
-class OnnxModelIOv1(torch.nn.Module):
+class ModelIOv1(torch.nn.Module):
     def __init__(self, warpped_model, apply_policy_softmax=False):
         super().__init__()
         self.warpped_model = warpped_model
         self.apply_policy_softmax = apply_policy_softmax
+        if apply_policy_softmax:
+            print("Warning: Take extra care at the engine side when policy is softmaxed in graph.")
 
     def get_io_version(self) -> int:
         return 1
@@ -153,7 +136,7 @@ class OnnxModelIOv1(torch.nn.Module):
             "policy": {0: "batch_size", 1: "board_height", 2: "board_width"},
         }
 
-    def get_model_inputs(self, data):
+    def get_model_inputs(self, data: dict):
         boardInputNCHW = data["board_input"]
         globalInputNC = data["stm_input"]
         assert boardInputNCHW.ndim == 4, f"boardInputNCHW.shape={boardInputNCHW.shape}"
@@ -161,7 +144,7 @@ class OnnxModelIOv1(torch.nn.Module):
         assert boardInputNCHW.shape[0] == globalInputNC.shape[0]
         return boardInputNCHW, globalInputNC
 
-    def get_data_from_model_inputs(self, boardInputNCHW, globalInputNC):
+    def get_data_from_model_inputs(self, boardInputNCHW: torch.Tensor, globalInputNC: torch.Tensor):
         return {
             "board_input": boardInputNCHW,
             "stm_input": globalInputNC,
@@ -178,10 +161,31 @@ class OnnxModelIOv1(torch.nn.Module):
             policy = policy_flat.reshape_as(policy)
         return value, policy
 
-    def forward(self, boardInputNCHW, globalInputNC):
+    def forward(self, boardInputNCHW: torch.Tensor, globalInputNC: torch.Tensor):
         input_data = self.get_data_from_model_inputs(boardInputNCHW, globalInputNC)
         retvals = self.warpped_model(input_data)
         return self.get_model_outputs(*retvals)
+
+
+def _warp_model_io(model, model_io_version=1, apply_policy_softmax=False, **kwargs):
+    if model_io_version == 1:
+        return ModelIOv1(model, apply_policy_softmax=apply_policy_softmax)
+    else:
+        raise ValueError(f"Unsupported model IO version {model_io_version}")
+
+
+def export_torch_jit(output, model, **kwargs):
+    # Warp the model with defined input/output interface
+    model = _warp_model_io(model, **kwargs)
+
+    # Use the example inputs to trace the model with the given IO
+    sampled_data = _get_sample_data(**kwargs)
+    example_inputs = model.get_model_inputs(sampled_data)
+    scripted_model = torch.jit.trace(model.forward, example_inputs, strict=True)
+
+    # Save the traced model
+    torch.jit.save(scripted_model, output)
+    print(f"Scripted model has been written to {output}")
 
 
 def make_onnx_model_version(io_version: int, rules: list[str], boardsizes: list[int]) -> int:
@@ -203,7 +207,7 @@ def make_onnx_model_version(io_version: int, rules: list[str], boardsizes: list[
     return (io_version << 48) | (rule_mask << 32) | boardsize_mask
 
 
-def parse_model_version(model_version: int) -> tuple[int, list[str], list[int]]:
+def parse_onnx_model_version(model_version: int) -> tuple[int, list[str], list[int]]:
     io_version = (model_version >> 48) & 0xFFFF
     rule_mask = (model_version >> 32) & 0xFFFF
     boardsize_mask = model_version & 0xFFFFFFFF
@@ -224,17 +228,11 @@ def parse_model_version(model_version: int) -> tuple[int, list[str], list[int]]:
     return io_version, rules, boardsizes
 
 
-def export_onnx(output, model, export_args, onnx_io_version=1, **kwargs):
+def export_onnx(output, model, export_args, **kwargs):
     import onnx
 
-    # Warp the model with ONNX input/output interface
-    if onnx_io_version == 1:
-        model = OnnxModelIOv1(
-            model,
-            apply_policy_softmax=export_args.get("apply_policy_softmax", False),
-        )
-    else:
-        raise ValueError(f"Unsupported ONNX IO version {onnx_io_version}")
+    # Warp the model with defined input/output interface
+    model = _warp_model_io(model, **kwargs)
 
     # Output model to ONNX format
     model.eval()
@@ -273,6 +271,7 @@ def export_onnx(output, model, export_args, onnx_io_version=1, **kwargs):
     # Run OnnxSlim if available
     try:
         import onnxslim
+
         print("Running onnxslim to optimize the model...")
         onnxslim.slim(output, output)
     except:
@@ -352,7 +351,7 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, expo
         if rundir is None:
             raise RuntimeError("Either checkpoint or rundir must be specified.")
         # try to find the latest checkpoint
-        checkpoint = find_latest_model_file(rundir, f"ckpt_{model_name}")
+        checkpoint = find_latest_ckpt(rundir, f"ckpt_{model_name}")
         if checkpoint is None:
             raise RuntimeError(f"No checkpoint found in {rundir} (prefix=ckpt_{model_name})")
     elif not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
@@ -360,16 +359,13 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, expo
 
     # load checkpoint
     print(f"Loading model state from {checkpoint}")
-    state_dicts = torch.load(checkpoint, map_location="cpu")
-    model.load_state_dict(state_dicts["model"])
+    model_state_dict, _, _ = load_torch_ckpt(checkpoint)
+    model.load_state_dict(model_state_dict)
     model.eval()
 
-    if export_type == "pytorch":
-        output = output or _get_default_output_filename(checkpoint, "pth")
-        export_pytorch(output, model)
-    elif export_type == "jit":
+    if export_type == "torch-jit":
         output = output or _get_default_output_filename(checkpoint, "pt")
-        export_jit(output, model, **kwargs)
+        export_torch_jit(output, model, **kwargs)
     elif export_type == "onnx":
         output = output or _get_default_output_filename(checkpoint, "onnx")
         export_onnx(output, model, **kwargs)

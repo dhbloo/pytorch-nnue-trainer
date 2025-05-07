@@ -1,15 +1,21 @@
 # NNUE Trainer
 
-## Usage
+## Introduction
+
+This repository holds the training code for NNUE and various CNN models that can be used with Rapfi.
+
+## Installation
 
 ### Requirements
 
-+ 64-bit Python 3.10 and Pytorch 2.3 or later.
-+ Other python libraries: `accelerate configargparse tqdm tensorboard matplotlib pybind11 lz4 pykeops`.
++ Python 3.10+ and Pytorch 2.3+
++ Essential dependencies: `accelerate configargparse tqdm tensorboard lz4`.
++ Optional: `pybind11` if you want to install dataset pipelines.
++ Optional: `pykeops` if you want to use vector quantization module.
 
 ### Setup dataset pipeline
 
-After install all required packages in specified in requirements, it is necessary to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup the C++ compiling environment. Then install the dataset pipelines by doing the following commands.
+After install all required packages in specified in requirements, it is necessary to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup the C++ compiling environment. Then install the dataset pipelines by doing the following commands. Make sure you have installed `pybind11` before executing the following commands.
 
 + Line Encoding: Fast line encoding for transforming board features. Necessary if you want to train LineNet or export MixNet9 or later models.
 
@@ -22,6 +28,8 @@ After install all required packages in specified in requirements, it is necessar
   ```bash
   pip install dataset/pipeline/forbidden_point_cpp
   ```
+
+## Usage
 
 ### Train a network
 
@@ -43,7 +51,7 @@ Configs can also be specified in a yaml file to be reused for multiple runs, whi
 accelerate launch train.py -c configs/train_config.yaml
 ```
 
-Examples of config file can be found in `configs/example`.
+Some examples of config file can be found in `configs/example`.
 
 #### Resuming from a checkpoint
 

@@ -11,8 +11,9 @@ import os
 from dataset import build_dataset
 from model import build_model
 from train import calc_loss
+from utils.file_utils import load_torch_ckpt
 from utils.training_utils import build_data_loader
-from utils.misc_utils import add_dict_to, seed_everything, set_performance_level
+from utils.misc_utils import add_dict_to, seed_everything, set_performance_level, deep_update_dict
 
 
 def parse_args_and_init():
@@ -27,6 +28,7 @@ def parse_args_and_init():
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add("--test_model_args", type=yaml.safe_load, default={}, help="Override model args for testing")
     parser.add("--batch_size", type=int, default=128, help="Batch size")
     parser.add("--num_worker", type=int, default=8, help="Num of dataloader workers")
     parser.add("--seed", type=int, default=42, help="Random seed")
@@ -132,6 +134,7 @@ def test(
     dataloader_args,
     model_type,
     model_args,
+    test_model_args,
     batch_size,
     num_worker,
     max_batches,
@@ -152,12 +155,14 @@ def test(
     test_loader = build_data_loader(test_dataset, batch_size, num_workers=num_worker, shuffle=False, **dataloader_args)
 
     # build model
+    if test_model_args:
+        model_args = deep_update_dict(model_args, test_model_args)
     model = build_model(model_type, **model_args)
 
     # load checkpoint
-    state_dicts = torch.load(checkpoint, map_location=accelerator.device)
-    model.load_state_dict(state_dicts["model"])
-    epoch, it = state_dicts.get("epoch", 0), state_dicts.get("iteration", 0)
+    model_state_dict, _, metadata = load_torch_ckpt(checkpoint)
+    model.load_state_dict(model_state_dict)
+    epoch, it = metadata.get("epoch", "?"), metadata.get("iteration", "?")
     accelerator.print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
 
     # accelerate model testing

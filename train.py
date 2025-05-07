@@ -24,7 +24,7 @@ from utils.training_utils import (
     state_dict_drop_size_unmatched,
 )
 from utils.misc_utils import seed_everything, set_performance_level, add_dict_to, log_value_dict
-from utils.file_utils import find_latest_model_file, get_iteration_from_model_filename
+from utils.file_utils import make_dir, save_torch_ckpt, load_torch_ckpt, find_latest_ckpt, get_iteration_from_ckpt_filename
 
 
 def parse_args_and_init():
@@ -107,7 +107,7 @@ def parse_args_and_init():
 
     args, _ = parser.parse_known_args()  # parse args
     parser.print_values()  # print out values
-    os.makedirs(args.rundir, exist_ok=True)  # make run directory
+    make_dir(args.rundir)  # make run directory
     # write run config
     run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
     if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
@@ -484,25 +484,24 @@ def training_loop(
 
     # load checkpoint if exists
     model_name = model.name
-    ckpt_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
+    ckpt_filename = find_latest_ckpt(rundir, f"ckpt_{model_name}")
     if ckpt_filename:
-        state_dicts = torch.load(ckpt_filename, map_location=accelerator.device)
-        model.load_state_dict(state_dicts["model"])
-        optimizer.load_state_dict(state_dicts["optimizer"])
-        if accelerator.scaler is not None and "scalar" in state_dicts:
-            accelerator.scaler.load_state_dict(state_dicts["scalar"])
+        model_state_dict, training_state_dicts, metadata = load_torch_ckpt(ckpt_filename)
+        model.load_state_dict(model_state_dict)
+        optimizer.load_state_dict(training_state_dicts["optimizer"])
+        if accelerator.scaler is not None and "scalar" in training_state_dicts:
+            accelerator.scaler.load_state_dict(training_state_dicts["scalar"])
         accelerator.print(f"Loaded from {ckpt_filename}")
-        it = state_dicts.get("iteration", 0)
-        epoch = state_dicts.get("epoch", 0)
-        rows = state_dicts.get("rows", 0)
+        it = int(metadata.get("iteration", 0))
+        epoch = int(metadata.get("epoch", 0))
+        rows = int(metadata.get("rows", 0))
     else:
         model.apply(weights_init(init_cfg))
         it, epoch, rows = 0, 0, 0
         if load_from is not None:
-            state_dicts = torch.load(load_from, map_location=accelerator.device)
-            missing_keys, unexpected_keys = model.load_state_dict(
-                state_dict_drop_size_unmatched(model, state_dicts["model"]), strict=False
-            )
+            model_state_dict, _, _ = load_torch_ckpt(load_from)
+            model_state_dict = state_dict_drop_size_unmatched(model, model_state_dict)
+            missing_keys, unexpected_keys = model.load_state_dict(model_state_dict, strict=False)
             if len(unexpected_keys) > 0:
                 accelerator.print(f"unexpected keys in state_dict: {', '.join(unexpected_keys)}")
             if len(missing_keys) > 0:
@@ -520,8 +519,8 @@ def training_loop(
     # build teacher model if knowledge distillation model is on
     if kd_model_type is not None:
         kd_model = build_model(kd_model_type, **kd_model_args)
-        kd_state_dicts = torch.load(kd_checkpoint, map_location=accelerator.device)
-        kd_model.load_state_dict(kd_state_dicts["model"])
+        kd_model_state_dict, _, _ = load_torch_ckpt(kd_checkpoint)
+        kd_model.load_state_dict(kd_model_state_dict)
         accelerator.print(f"Loaded teacher model {kd_model.name} from {kd_checkpoint}")
 
         kd_model = accelerator.prepare_model(kd_model, evaluation_mode=True)
@@ -647,30 +646,27 @@ def training_loop(
                 last_it = it
                 last_time = time.time()
 
-            # snapshot saving
+            # checkpoint saving
             if (
                 it % save_interval == 0 or it % temp_save_interval == 0
             ) and accelerator.is_local_main_process:
-                # get latest snapshot filename
-                last_snapshot_filename = find_latest_model_file(rundir, f"ckpt_{model_name}")
+                # get latest checkpoint filename
+                last_ckpt_filename = find_latest_ckpt(rundir, f"ckpt_{model_name}")
 
-                # save snapshot at current iteration
-                state_dict = {
-                    "iteration": it,
-                    "epoch": epoch,
-                    "rows": rows,
-                    "model": unwarpped_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                }
+                # save a new checkpoint at current iteration
+                model_state_dict = unwarpped_model.state_dict()
+                training_state_dicts = {"optimizer": optimizer.state_dict()}
                 if accelerator.scaler is not None:
-                    state_dict["scalar"] = accelerator.scaler.state_dict()
-                torch.save(state_dict, os.path.join(rundir, f"ckpt_{model_name}_{it:08d}.pth"))
+                    training_state_dicts["scalar"] = accelerator.scaler.state_dict()
+                metadata_dict = {"iteration": str(it), "epoch": str(epoch), "rows": str(rows)}
+                save_torch_ckpt(os.path.join(rundir, f"ckpt_{model_name}_{it:07d}"),
+                                model_state_dict, training_state_dicts, metadata_dict)
 
-                # remove last temporary snapshot if it's not a snapshot iteration
-                if last_snapshot_filename is not None:
-                    last_snapshot_iter = get_iteration_from_model_filename(last_snapshot_filename)
+                # remove last snapshot if it's a temporary snapshot
+                if last_ckpt_filename is not None:
+                    last_snapshot_iter = get_iteration_from_ckpt_filename(last_ckpt_filename)
                     if last_snapshot_iter is None or last_snapshot_iter % save_interval != 0:
-                        os.remove(last_snapshot_filename)
+                        os.remove(last_ckpt_filename)
 
             # validation
             if it % val_interval == 0 and val_loader is not None:

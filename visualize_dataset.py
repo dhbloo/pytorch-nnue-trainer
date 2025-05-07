@@ -1,6 +1,3 @@
-from utils.training_utils import build_data_loader
-from utils.misc_utils import seed_everything
-from dataset import build_dataset
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
@@ -8,6 +5,10 @@ import matplotlib.patches as patches
 import configargparse
 import yaml
 import os
+from dataset import build_dataset
+from utils.file_utils import make_dir
+from utils.misc_utils import seed_everything
+from utils.training_utils import build_data_loader
 
 
 def visualize_entry(
@@ -173,7 +174,7 @@ def visualize_entry(
 def visualize_dataset(dataset, dataloader, max_entries=0, save_fig_dir=None):
     get_save_fig_path = lambda i: None
     if save_fig_dir is not None:
-        os.makedirs(save_fig_dir, exist_ok=True)
+        make_dir(save_fig_dir)
         get_save_fig_path = lambda i: os.path.join(save_fig_dir, f"{i}.png")
     index = 0
     for batch_data in dataloader:

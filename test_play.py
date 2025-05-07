@@ -7,17 +7,22 @@ from accelerate import Accelerator
 from accelerate.utils import send_to_device
 
 from model import build_model
+from utils.file_utils import load_torch_ckpt
+from utils.misc_utils import deep_update_dict
 
 
 def parse_args_and_init():
     parser = configargparse.ArgParser(
-        description="Test Play", config_file_parser_class=configargparse.YAMLConfigFileParser
+        description="Test Play (and Debug)",
+        config_file_parser_class=configargparse.YAMLConfigFileParser,
     )
     parser.add("-c", "--config", is_config_file=True, help="Config file path")
     parser.add("-p", "--checkpoint", required=True, help="Model checkpoint file to test")
+    parser.add("--debug", action="store_true", help="Enable debug printing")
     parser.add("--use_cpu", action="store_true", help="Use cpu only")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add("--test_model_args", type=yaml.safe_load, default={}, help="Override model args for testing")
     parser.add("--board_width", type=int, default=15, help="Board width")
     parser.add("--board_height", type=int, default=15, help="Board height")
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
@@ -139,6 +144,45 @@ def next_move(board, model, data):
     return winrate, drawrate, (bestmove_x, bestmove_y), bestmove_policy
 
 
+def debug_print(board, model, data):
+    # add batch dimension
+    for k in data:
+        if isinstance(data[k], torch.Tensor):
+            data[k] = torch.unsqueeze(data[k], dim=0)
+
+    if hasattr(model, "forward_debug_print"):
+        torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
+        with torch.no_grad():
+            value, policy, *retvals = model.forward_debug_print(data)
+    else:
+        with torch.no_grad():
+            value, policy, *retvals = model(data)
+
+    # remove batch dimension
+    value = value.squeeze(0)
+    policy = policy.squeeze(0)
+    with np.printoptions(precision=4, linewidth=120, suppress=True):
+        print(f"Raw Value: {value.cpu().numpy()}")
+    with np.printoptions(precision=2, linewidth=120, suppress=True):
+        print(f"Raw Policy: \n{policy.cpu().numpy()}")
+
+    # apply activation function
+    if value.shape[0] == 1:
+        value = torch.sigmoid(value)
+    elif value.shape[0] == 3:
+        value = torch.softmax(value, dim=0)
+    else:
+        raise ValueError(f"Invalid value shape: {value.shape}")
+    policy = torch.softmax(policy.flatten(), dim=0).reshape(policy.shape)
+    with np.printoptions(precision=4, linewidth=120, suppress=True):
+        if value.shape[0] == 1:
+            print(f"Sigmoided Value: {value.cpu().numpy()}")
+        elif value.shape[0] == 3:
+            print(f"Softmaxed Value: {value.cpu().numpy()}")
+    with np.printoptions(precision=2, linewidth=120, suppress=True):
+        print(f"Softmaxed Policy: \n{policy.cpu().numpy()}")
+
+
 def input_move():
     input_str = input("Input your move (empty for AI move): ")
     if input_str == "":
@@ -152,7 +196,16 @@ def output_move(move):
 
 
 def test_play(
-    checkpoint, use_cpu, model_type, model_args, board_width, board_height, dataset_args, **kwargs
+    checkpoint,
+    debug,
+    use_cpu,
+    model_type,
+    model_args,
+    test_model_args,
+    board_width,
+    board_height,
+    dataset_args,
+    **kwargs,
 ):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
@@ -161,12 +214,14 @@ def test_play(
     accelerator = Accelerator(cpu=use_cpu)
 
     # build model
+    if test_model_args:
+        model_args = deep_update_dict(model_args, test_model_args)
     model = build_model(model_type, **model_args)
 
     # load checkpoint if exists
-    state_dicts = torch.load(checkpoint, map_location=accelerator.device)
-    model.load_state_dict(state_dicts["model"])
-    epoch, it = state_dicts.get("epoch", 0), state_dicts.get("iteration", 0)
+    model_state_dict, _, metadata = load_torch_ckpt(checkpoint)
+    model.load_state_dict(model_state_dict)
+    epoch, it = metadata.get("epoch", "?"), metadata.get("iteration", "?")
     accelerator.print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
 
     # accelerate model testing
@@ -179,6 +234,12 @@ def test_play(
     # test play loop
     while board.ply + 1 < board.width * board.height:
         print(board)
+
+        if debug:
+            data = board.get_data()
+            data = send_to_device(data, accelerator.device)
+            debug_print(board, model, data)
+
         move = input_move()
         if move is None:
             data = board.get_data()
