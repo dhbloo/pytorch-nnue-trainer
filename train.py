@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs, ProfileKwargs
+from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs, ProfileKwargs, PartialState
 from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
@@ -39,7 +39,7 @@ def parse_args_and_init():
     parser.add("--use_cpu", action="store_true", help="Use cpu only")
     parser.add("--dataset_type", required=True, help="Dataset type")
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
-    parser.add("--val_dataset_type", help="Validate Dataset type (If not set, then it's same as train set)")
+    parser.add("--val_dataset_type", help="Validate dataset type (same as train set if not set)")
     parser.add(
         "--val_dataset_args", type=yaml.safe_load, default={}, help="Extra validate dataset arguments"
     )
@@ -59,12 +59,12 @@ def parse_args_and_init():
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
     parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
+    parser.add("--eval_bs_multipler", type=int, default=1, help="Eval batch size multipler")
     parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add("--weight_decay", type=float, default=0, help="Weight decay")
     parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
     parser.add("--clip_grad_value", type=float, help="Gradient clipping max value")
     parser.add("--no_shuffle", action="store_true", help="Do not shuffle dataset")
-    parser.add("--seed", type=int, default=42, help="Random seed")
     parser.add("--log_interval", type=int, default=100, help="Num iterations to log")
     parser.add("--show_interval", type=int, default=1000, help="Num iterations to display")
     parser.add("--save_interval", type=int, default=100000, help="Num iterations to save snapshot")
@@ -94,6 +94,7 @@ def parse_args_and_init():
     parser.add("--kd_use_train_mode", action="store_true", help="Set teacher to train mode")
     parser.add("--kd_disable_amp", action="store_true", help="Disable mixed precision for teacher")
     parser.add("--find_unused_parameters", action="store_true", help="Enable find_unused_parameters in DDP")
+    parser.add("--random_seed", type=int, default=42, help="Random seed")
     parser.add(
         "--performance_level",
         type=int,
@@ -106,14 +107,15 @@ def parse_args_and_init():
     parser.add("--profile_memory", action="store_true", help="Enable memory profiling")
 
     args, _ = parser.parse_known_args()  # parse args
-    parser.print_values()  # print out values
-    make_dir(args.rundir)  # make run directory
-    # write run config
-    run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
-    if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
-        parser.write_config_file(args, [run_cfg_filename])
-    seed_everything(args.seed)  # set seed
-    print("-" * 60)
+
+    if PartialState(cpu=args.use_cpu).is_local_main_process:
+        parser.print_values()  # print argument values
+        make_dir(args.rundir)  # make run directory
+        # write run config
+        run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
+        if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
+            parser.write_config_file(args, [run_cfg_filename])
+        print("-" * 60)
 
     return args
 
@@ -180,7 +182,7 @@ def calc_loss(
 
     # ===============================================================
     # value loss
-    def get_value_loss(value: torch.Tensor):
+    def get_value_loss(value: torch.Tensor) -> torch.Tensor:
         if value_loss_type == "KL":
             return cross_entropy_with_softlabel(value, value_target, use_kl_divergence=True)
         elif value_loss_type == "CE":
@@ -198,7 +200,7 @@ def calc_loss(
 
     # ===============================================================
     # policy loss
-    def get_policy_loss(policy: torch.Tensor):
+    def get_policy_loss(policy: torch.Tensor) -> torch.Tensor:
         # check if there is loss weight for policy at each empty cells
         if ignore_forbidden_point_policy:
             forbidden_point = torch.flatten(data["forbidden_point"], start_dim=1)  # [B, H*W]
@@ -233,7 +235,7 @@ def calc_loss(
 
     # ===============================================================
     # policy reg loss
-    def get_policy_reg_loss(policy: torch.Tensor, mask: None | torch.Tensor):
+    def get_policy_reg_loss(policy: torch.Tensor, mask: None | torch.Tensor) -> torch.Tensor:
         if mask is not None:
             policy_mean = torch.sum(policy * mask) / torch.sum(mask)
         else:
@@ -242,7 +244,7 @@ def calc_loss(
 
     # ===============================================================
     # value uncertainty loss
-    def get_value_uncertainty_gt(value: torch.Tensor):
+    def get_value_uncertainty_gt(value: torch.Tensor) -> torch.Tensor:
         # stop gradient for value
         value = value.detach()
 
@@ -259,14 +261,14 @@ def calc_loss(
         uncertainty_gt = torch.square(winrate - winrate_target)  # [B]
         return uncertainty_gt
 
-    def get_value_uncertainty_loss(uncertainty: torch.Tensor, value: torch.Tensor):
+    def get_value_uncertainty_loss(uncertainty: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
         uncertainty_gt = get_value_uncertainty_gt(value)
         uncertainty_loss = F.huber_loss(uncertainty, uncertainty_gt)  # [B]
         return uncertainty_loss
 
     def get_value_relative_uncertainty_loss(
         relative_uncertainty: torch.Tensor, value_smallnet: torch.Tensor, value_largenet: torch.Tensor
-    ):
+    ) -> torch.Tensor:
         uncertainty_gt_smallnet = get_value_uncertainty_gt(value_smallnet)
         uncertainty_gt_largenet = get_value_uncertainty_gt(value_largenet)
         relative_uncertainty_gt = uncertainty_gt_largenet / uncertainty_gt_smallnet
@@ -295,6 +297,7 @@ def calc_loss(
 
     if aux_losses:
         for aux_loss_name, aux_loss in aux_losses.items():
+            assert isinstance(aux_loss, torch.Tensor)
             aux_loss_print_name = f"{aux_loss_name}_loss"
             aux_loss_weight = None
             if f"{aux_loss_name}_lambda" in extra_args:
@@ -318,7 +321,7 @@ def calc_loss(
                 elif aux_loss_type == "policy_reg":
                     if aux_loss_weight is None and policy_reg_lambda == 0:
                         continue
-                    aux_loss = get_policy_reg_loss(aux_loss_input)
+                    aux_loss = get_policy_reg_loss(aux_loss_input, board_mask)
                     aux_loss_print_name = aux_loss_name
                     if aux_loss_weight is None:
                         aux_loss_weight = policy_reg_lambda
@@ -327,7 +330,7 @@ def calc_loss(
 
             if aux_loss_weight is None:
                 aux_loss_weight = 1.0
-            total_loss += aux_loss * aux_loss_weight
+            total_loss += float(aux_loss_weight) * aux_loss
             loss_dict[aux_loss_print_name] = aux_loss.detach()
 
     if kd_results is not None:
@@ -352,13 +355,14 @@ def calc_loss(
     aux_outputs_dict = {}
     if aux_outputs:
         for aux_name, aux_output in aux_outputs.items():
+            assert isinstance(aux_output, torch.Tensor)
             aux_outputs_dict[aux_name] = aux_output.detach()
 
     loss_dict["total_loss"] = total_loss.detach()
     return total_loss, loss_dict, aux_outputs_dict
 
 
-def training_loop(
+def train(
     rundir,
     load_from,
     use_cpu,
@@ -381,6 +385,7 @@ def training_loop(
     loss_args,
     iterations,
     batch_size,
+    eval_bs_multipler,
     num_worker,
     learning_rate,
     weight_decay,
@@ -401,6 +406,7 @@ def training_loop(
     kd_use_train_mode,
     kd_disable_amp,
     find_unused_parameters,
+    random_seed,
     performance_level,
     profile,
     profile_active_iters,
@@ -408,15 +414,18 @@ def training_loop(
     profile_memory,
     **kwargs,
 ):
-    # use accelerator
+    # initialize accelerator
     dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)
     accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config, kwargs_handlers=[ddp_kwargs])
+    seed_everything(random_seed)
     set_performance_level(performance_level)
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
         log_filename = os.path.join(rundir, "training_log.jsonl")
+    else:
+        tb_logger, log_filename = None, None
 
     profile_ctx = nullcontext()
     if profile:
@@ -468,7 +477,7 @@ def training_loop(
         )
         val_loader = build_data_loader(
             val_dataset,
-            batch_size_per_process,
+            batch_size_per_process * eval_bs_multipler,
             num_workers=num_worker,
             shuffle=False,
             **dataloader_args,
@@ -709,7 +718,7 @@ def training_loop(
                         val_aux_dict[k] = torch.sum(aux_tensor).item() / num_val_batches
 
                     val_elasped = time.time() - val_start_time
-                    num_val_entries = num_val_batches * batch_size_per_process
+                    num_val_entries = num_val_batches * batch_size_per_process * eval_bs_multipler
                     # log validation results
                     log_value_dict(tb_logger, "validation", val_loss_dict, it, rows)
                     if val_aux_dict:
@@ -742,4 +751,4 @@ def training_loop(
 
 if __name__ == "__main__":
     args = parse_args_and_init()
-    training_loop(**vars(args))
+    train(**vars(args))

@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from accelerate import Accelerator
+from accelerate import Accelerator, PartialState, DataLoaderConfiguration
 from tqdm.auto import tqdm
 import configargparse
 import yaml
@@ -17,27 +17,40 @@ from utils.misc_utils import add_dict_to, seed_everything, set_performance_level
 
 
 def parse_args_and_init():
-    parser = configargparse.ArgParser(description="Test", config_file_parser_class=configargparse.YAMLConfigFileParser)
+    parser = configargparse.ArgParser(
+        description="Test", config_file_parser_class=configargparse.YAMLConfigFileParser
+    )
     parser.add("-c", "--config", is_config_file=True, help="Config file path")
     parser.add("-p", "--checkpoint", required=True, help="Model checkpoint file to test")
-    parser.add("-d", "--datas", nargs="+", required=True, help="Test dataset file or directory paths")
+    parser.add(
+        "-d",
+        "--test_datas",
+        nargs="+",
+        help="Test dataset file or directory paths"
+        " (If not set, then the training set paths will be used)",
+    )
+    parser.add("--train_datas", nargs="+", help="Training dataset file or directory paths")
     parser.add("--do_cross_eval", action="store_true", help="Use the dataset to do cross eval check")
     parser.add("--use_cpu", action="store_true", help="Use cpu only")
-    parser.add("--dataset_type", required=True, help="Dataset type")
-    parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add("--test_dataset_type", help="Test dataset type (same as train set if not set)")
+    parser.add("--test_dataset_args", type=yaml.safe_load, default={}, help="Extra test dataset arguments")
+    parser.add("--dataset_type", help="Train dataset type")
+    parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra train dataset arguments")
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add("--test_model_args", type=yaml.safe_load, default={}, help="Override model args for testing")
     parser.add("--batch_size", type=int, default=128, help="Batch size")
+    parser.add("--eval_bs_multipler", type=int, default=4, help="Multiply batch size by this number")
     parser.add("--num_worker", type=int, default=8, help="Num of dataloader workers")
-    parser.add("--seed", type=int, default=42, help="Random seed")
     parser.add("--max_batches", type=int, help="Test the amount of batches only")
+    parser.add("--random_seed", type=int, default=42, help="Random seed")
 
     args, _ = parser.parse_known_args()  # parse args
-    parser.print_values()  # print out values
-    seed_everything(args.seed)  # set seed
-    print("-" * 60)
+
+    if PartialState(cpu=args.use_cpu).is_local_main_process:
+        parser.print_values()
+        print("-" * 60)
 
     return args
 
@@ -118,8 +131,12 @@ def calc_metric(data, results, do_cross_eval):
     if do_cross_eval:
         metrics["value_abserr_mean"] = torch.abs(value - value_target).mean().item()
         metrics["value_abserr_max"] = torch.abs(value - value_target).max().item()
-        metrics["value_relerr_mean"] = (torch.abs(value - value_target) / (torch.abs(value) + 1e-4)).mean().item()
-        metrics["value_relerr_max"] = (torch.abs(value - value_target) / (torch.abs(value) + 1e-4)).max().item()
+        metrics["value_relerr_mean"] = (
+            (torch.abs(value - value_target) / (torch.abs(value) + 1e-4)).mean().item()
+        )
+        metrics["value_relerr_max"] = (
+            (torch.abs(value - value_target) / (torch.abs(value) + 1e-4)).max().item()
+        )
 
     return metrics
 
@@ -128,7 +145,10 @@ def test(
     checkpoint,
     do_cross_eval,
     use_cpu,
-    datas,
+    test_datas,
+    train_datas,
+    test_dataset_type,
+    test_dataset_args,
     dataset_type,
     dataset_args,
     dataloader_args,
@@ -136,8 +156,10 @@ def test(
     model_args,
     test_model_args,
     batch_size,
+    eval_bs_multipler,
     num_worker,
     max_batches,
+    random_seed,
     **kwargs,
 ):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
@@ -145,14 +167,32 @@ def test(
     rundir = os.path.dirname(checkpoint)
     ckpt_filename_noext = os.path.splitext(os.path.basename(checkpoint))[0]
     log_filename = os.path.join(rundir, f"{ckpt_filename_noext}_test_result.json")
-    set_performance_level(0)
 
     # use accelerator
-    accelerator = Accelerator(cpu=use_cpu)
+    dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
+    accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config)
+    seed_everything(random_seed)
+    set_performance_level(0)
 
     # load test dataset
-    test_dataset = build_dataset(dataset_type, datas, shuffle=False, **dataset_args)
-    test_loader = build_data_loader(test_dataset, batch_size, num_workers=num_worker, shuffle=False, **dataloader_args)
+    if test_datas is None:
+        if train_datas is None:
+            raise RuntimeError("Test dataset must be set if train dataset is not set.")
+        test_datas = train_datas
+    if test_dataset_type is None:
+        if dataset_type is None:
+            raise RuntimeError("Test dataset type must be set if train dataset type is not set.")
+        test_dataset_type = dataset_type
+        test_dataset_args = dataset_args
+    batch_size_per_process = batch_size // accelerator.num_processes
+    test_dataset = build_dataset(test_dataset_type, test_datas, shuffle=False, **test_dataset_args)
+    test_loader = build_data_loader(
+        test_dataset,
+        batch_size_per_process * eval_bs_multipler,
+        num_workers=num_worker,
+        shuffle=False,
+        **dataloader_args,
+    )
 
     # build model
     if test_model_args:
@@ -167,13 +207,13 @@ def test(
 
     # accelerate model testing
     model, test_loader = accelerator.prepare(model, test_loader)
+    model.eval()
 
     # testing
     metric_dict = {}
     num_batches = 0
     start_time = time.time()
-    with torch.no_grad():
-        model.eval()
+    with torch.no_grad(), accelerator.autocast():
         for data in tqdm(test_loader, disable=not accelerator.is_local_main_process):
             results = model(data)
             metrics = calc_metric(data, results, do_cross_eval)
@@ -198,13 +238,14 @@ def test(
             metric_dict[k] = torch.sum(metric_tensor).item() / num_batches
 
         elasped = time.time() - start_time
-        num_entries = num_batches * batch_size
+        num_entries = num_batches * batch_size_per_process * eval_bs_multipler
         # log test results
         with open(log_filename, "w") as log:
             log_dict = {
-                "test_datas": datas,
-                "dataset_type": dataset_type,
-                "dataset_args": dataset_args,
+                "test_datas": test_datas,
+                "dataset_type": test_dataset_type,
+                "dataset_args": test_dataset_args,
+                "dataloader_args": dataloader_args,
                 "use_cpu": use_cpu,
                 "do_cross_eval": do_cross_eval,
                 "num_entries": num_entries,

@@ -3,7 +3,7 @@ import yaml
 import torch
 import numpy as np
 import configargparse
-from accelerate import Accelerator
+from accelerate import PartialState
 from accelerate.utils import send_to_device
 
 from model import build_model
@@ -28,8 +28,10 @@ def parse_args_and_init():
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
 
     args, _ = parser.parse_known_args()  # parse args
-    parser.print_values()  # print out values
-    print("-" * 60)
+    
+    if PartialState(cpu=args.use_cpu).is_local_main_process:
+        parser.print_values()
+        print("-" * 60)
 
     return args
 
@@ -210,9 +212,6 @@ def test_play(
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
 
-    # use accelerator
-    accelerator = Accelerator(cpu=use_cpu)
-
     # build model
     if test_model_args:
         model_args = deep_update_dict(model_args, test_model_args)
@@ -222,10 +221,12 @@ def test_play(
     model_state_dict, _, metadata = load_torch_ckpt(checkpoint)
     model.load_state_dict(model_state_dict)
     epoch, it = metadata.get("epoch", "?"), metadata.get("iteration", "?")
-    accelerator.print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
+    print(f"Loaded from {checkpoint}, epoch: {epoch}, it: {it}")
 
-    # accelerate model testing
-    model = accelerator.prepare(model)
+    # move model to device
+    device = PartialState(cpu=use_cpu).device
+    print(f"Test playing on device: {device}")
+    model.to(device)
     model.eval()
 
     # construct the test board
@@ -237,13 +238,13 @@ def test_play(
 
         if debug:
             data = board.get_data()
-            data = send_to_device(data, accelerator.device)
+            data = send_to_device(data, device)
             debug_print(board, model, data)
 
         move = input_move()
         if move is None:
             data = board.get_data()
-            data = send_to_device(data, accelerator.device)
+            data = send_to_device(data, device)
             winrate, drawrate, move, move_policy = next_move(board, model, data)
             print(
                 f"winrate: {winrate:.4f}, drawrate: {drawrate:.4f}, "
