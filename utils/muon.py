@@ -3,7 +3,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import Module, Parameter, Embedding
 from torch.optim.optimizer import required
-from typing import List
 
 
 def zeropower_via_newtonschulz5(G: Tensor, steps: int, use_baddbmm: bool) -> Tensor:
@@ -134,22 +133,23 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def get_params_for_muon(model: Module) -> List[Parameter]:
+def get_params_for_muon(model: Module) -> list[Parameter]:
     """
     Filter parameters of a module into two groups: those that can be optimized by Muon,
     and those that should be optimized by a standard optimizer.
     Args:
         model: The model to filter parameters for.
     Returns:
-        A list of parameters that should be optimized with muon.
+        A dict of named parameters that should be optimized with muon.
     """
     muon_params = []
 
     for module in model.modules():
-        for param in module.parameters(recurse=False):
+        for name, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
                 continue
-            if param.dim() >= 2 and not isinstance(module, Embedding):
+            if param.dim() >= 2 and not isinstance(module, Embedding) \
+                and not name.endswith(("emb", "embed", "embedding")):
                 muon_params.append(param)
 
     return muon_params

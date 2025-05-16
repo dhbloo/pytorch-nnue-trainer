@@ -198,7 +198,9 @@ def efficient_rotation_trick_transform(u: Tensor, q: Tensor, e: Tensor) -> Tenso
     e = e[:, None, :]  # (N, 1, dim_feature)
     w = l2_norm(u + q).detach()  # (N, dim_feature)
     return (
-        e - 2 * (e @ w[:, :, None] @ w[:, None, :]) + 2 * (e @ u[:, :, None].detach() @ q[:, None, :].detach())
+        e
+        - 2 * (e @ w[:, :, None] @ w[:, None, :])
+        + 2 * (e @ u[:, :, None].detach() @ q[:, None, :].detach())
     ).squeeze(1)
 
 
@@ -221,6 +223,17 @@ def rotate_to(src: Tensor, tgt: Tensor):
     rotated = rotated_tgt * (norm_tgt / norm_src.clamp(min=1e-6)).detach()
 
     return rotated
+
+
+def list_mean(xs: list):
+    if len(xs) == 0:
+        raise ValueError("Cannot compute mean of empty list")
+    if len(xs) == 1:
+        return xs[0]
+    sum = xs[0] + xs[1]
+    for i in range(2, len(xs)):
+        sum += xs[i]
+    return sum / len(xs)
 
 
 class VectorQuantize(nn.Module):
@@ -253,6 +266,7 @@ class VectorQuantize(nn.Module):
         entropy_reg_temp=0.01,
         use_simvq=False,
         codebook_transform=None,
+        convert_to_fp32=True,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -264,7 +278,9 @@ class VectorQuantize(nn.Module):
         self.ema_update = ema_update and not use_simvq
         self.ema_decay = ema_decay
         self.threshold_ema_dead_code = 0 if use_simvq else threshold_ema_dead_code
-        self.reset_cluster_size = threshold_ema_dead_code if reset_cluster_size is None else reset_cluster_size
+        self.reset_cluster_size = (
+            threshold_ema_dead_code if reset_cluster_size is None else reset_cluster_size
+        )
         self.commitment_weight = commitment_weight
         self.rotation_trick = rotation_trick
         self.stochastic_sampling = stochastic_sampling
@@ -272,12 +288,15 @@ class VectorQuantize(nn.Module):
         self.entropy_reg_weight = entropy_reg_weight
         self.entropy_reg_temp = entropy_reg_temp
         self.use_simvq = use_simvq
+        self.convert_to_fp32 = convert_to_fp32
 
         self.register_buffer("inited", torch.zeros([], dtype=torch.bool))
         self.register_buffer("cluster_size", torch.ones(codebook_size))
         if kmeans_init:
             embed = torch.zeros(codebook_size, dim_feature)
-            self._init_input_samples = codebook_size * kmeans_sample_multiplier // PartialState().num_processes
+            self._init_input_samples = (
+                codebook_size * kmeans_sample_multiplier // PartialState().num_processes
+            )
             self._init_input_batches = []
             self._init_input_count = 0
         elif use_simvq:
@@ -297,7 +316,9 @@ class VectorQuantize(nn.Module):
                     def initialize(self):
                         nn.init.eye_(self.weight.data)
 
-                    setattr(codebook_transform, "initialize", types.MethodType(initialize, codebook_transform))
+                    setattr(
+                        codebook_transform, "initialize", types.MethodType(initialize, codebook_transform)
+                    )
             self.code_transform = codebook_transform
 
         self.learnable_codebook = learnable_codebook and not self.ema_update
@@ -420,17 +441,28 @@ class VectorQuantize(nn.Module):
 
     @property
     def normalized_cluster_size(self) -> Tensor:
+        """
+        Returns:
+            normalized_cluster_size: Normalized cluster size of shape (codebook_size,).
+        """
         return self.cluster_size * (self.codebook_size / self.cluster_size.sum())
 
     def from_indices(self, indices: Tensor) -> Tensor:
+        """
+        Args:
+            indices: Indices of the embedding, long tensor of shape (N,).
+        Returns:
+            x_q: A quantized tensor of shape (N, dim_feature).
+        """
         return F.embedding(indices, self.codebook)  # (..., dim_feature)
 
     @torch.compiler.disable
-    def forward(self, x: Tensor):
+    def forward(self, x: Tensor, input_normalized: bool = False):
         """
         Get the quantized version x_q of the continuous input x.
         Args:
             x: A continuous tensor of shape (N, dim_feature).
+            input_normalized: Whether the input is already normalized to unit sphere.
         Returns:
             x_q: A quantized tensor of shape (N, dim_feature).
             info: A dictionary containing the following:
@@ -444,7 +476,10 @@ class VectorQuantize(nn.Module):
         assert x.ndim == 2, f"Wrong input ndim {x.ndim} != 2"
         assert x.shape[-1] == self.dim_feature, f"Wrong input dim {x.shape[-1]} != {self.dim_feature}"
 
-        if self.use_cosine_sim:
+        if self.convert_to_fp32:
+            x = x.float()
+
+        if self.use_cosine_sim and not input_normalized:
             x = l2_norm(x)
 
         if not self.inited:
@@ -501,3 +536,87 @@ class VectorQuantize(nn.Module):
             self._expire_codes(x)
 
         return x_q, info
+
+
+class ProductVectorQuantize(nn.Module):
+    """
+    Product Vector Quantization (PVQ) layer.
+    Args:
+        codebook_size: The number of embeddings in each codebook.
+        dim_feature: Total dimension of the embeddings.
+        num_coodbooks: Number of groups to split the input into.
+    """
+
+    def __init__(self, codebook_size, dim_feature, num_coodbooks, **kwargs):
+        super().__init__()
+        assert dim_feature % num_coodbooks == 0, "dim_feature must be divisible by num_coodbooks"
+        self.codebook_size = codebook_size
+        self.dim_feature = dim_feature
+        self.num_coodbooks = num_coodbooks
+        self.dim_feature_per_group = dim_feature // num_coodbooks
+        self.vq_modules = nn.ModuleList(
+            [
+                VectorQuantize(
+                    codebook_size=codebook_size,
+                    dim_feature=self.dim_feature_per_group,
+                    **kwargs,
+                )
+                for _ in range(num_coodbooks)
+            ]
+        )
+
+    @property
+    def normalized_cluster_size(self) -> Tensor:
+        """
+        Returns:
+            normalized_cluster_size: Normalized cluster size of shape (num_coodbooks, codebook_size,).
+        """
+        return torch.stack([vq.normalized_cluster_size for vq in self.vq_modules], dim=0)
+
+    def from_indices(self, indices: Tensor) -> Tensor:
+        """
+        Args:
+            indices: Indices of the embedding, long tensor of shape (N, num_coodbooks).
+        Returns:
+            x_q: A quantized tensor of shape (N, dim_feature).
+        """
+        assert indices.ndim == 2, f"Wrong input ndim {indices.ndim} != 2"
+        assert (
+            indices.shape[1] == self.num_coodbooks
+        ), f"Wrong input dim {indices.shape[-1]} != {self.num_coodbooks}"
+        x_q_groups = []
+        for i, vq in enumerate(self.vq_modules):
+            x_q = vq.from_indices(indices[:, i])
+            x_q_groups.append(x_q)
+        x_q = torch.cat(x_q_groups, dim=-1)
+        return x_q
+
+    def forward(self, x: Tensor):
+        assert x.ndim == 2, f"Wrong input ndim {x.ndim} != 2"
+        assert x.shape[1] == self.dim_feature, f"Wrong input dim {x.shape[-1]} != {self.dim_feature}"
+        x_groups = x.view(-1, self.num_coodbooks, self.dim_feature_per_group)
+        x_groups = x_groups.unbind(1)  # num_coodbooks * (N, dim_feature_per_group)
+
+        x_q_groups = []
+        info_groups = []
+        for i, vq in enumerate(self.vq_modules):
+            x_q, info = vq(x_groups[i].contiguous())
+            x_q_groups.append(x_q)
+            info_groups.append(info)
+
+        x_q = torch.stack(x_q_groups, dim=1)  # (N, num_coodbooks, dim_feature_per_group)
+        x_q = x_q.view(-1, self.dim_feature)  # (N, dim_feature)
+
+        aggregated_info, raw_info = None, None
+        if all(info is not None for info in info_groups):
+            raw_info = {k: [info_groups[i][k] for i in range(self.num_coodbooks)] for k in info_groups[0]}
+
+            mean_attributes = ["perplexity", "normalized_perplexity"]
+            mean_attributes += [key for key in raw_info.keys() if key.startswith("loss")]
+
+            aggregated_info = {key: list_mean(raw_info[key]) for key in mean_attributes}
+            aggregated_info["embed_indices"] = torch.stack(
+                raw_info["embed_indices"], dim=1
+            )  # (N, num_coodbooks)
+
+        return x_q, aggregated_info, raw_info

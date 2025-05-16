@@ -102,9 +102,10 @@ def parse_args_and_init():
         help="Performance level to use. A higher value will trade higher performance with less precision and reproducibility",
     )
     parser.add("--profile", action="store_true", help="Enable profiling")
-    parser.add("--profile_active_iters", type=int, default=100, help="Num iterations to profile")
-    parser.add("--profile_warmup_iters", type=int, default=100, help="Warmup iterations before profiling")
+    parser.add("--profile_active_iters", type=int, default=30, help="Num iterations to profile")
+    parser.add("--profile_warmup_iters", type=int, default=10, help="Warmup iterations before profiling")
     parser.add("--profile_memory", action="store_true", help="Enable memory profiling")
+    parser.add("--profile_finish_exit", action="store_true", help="Exit after profiling is finished")
 
     args, _ = parser.parse_known_args()  # parse args
 
@@ -297,7 +298,6 @@ def calc_loss(
 
     if aux_losses:
         for aux_loss_name, aux_loss in aux_losses.items():
-            assert isinstance(aux_loss, torch.Tensor)
             aux_loss_print_name = f"{aux_loss_name}_loss"
             aux_loss_weight = None
             if f"{aux_loss_name}_lambda" in extra_args:
@@ -330,6 +330,7 @@ def calc_loss(
 
             if aux_loss_weight is None:
                 aux_loss_weight = 1.0
+            assert isinstance(aux_loss, torch.Tensor)
             total_loss += float(aux_loss_weight) * aux_loss
             loss_dict[aux_loss_print_name] = aux_loss.detach()
 
@@ -412,6 +413,7 @@ def train(
     profile_active_iters,
     profile_warmup_iters,
     profile_memory,
+    profile_finish_exit,
     **kwargs,
 ):
     # initialize accelerator
@@ -435,7 +437,12 @@ def train(
                 dev_name = "cpu" if use_cpu else "cuda"
                 print(p.key_averages().table(sort_by=f"{dev_name}_time_total", row_limit=16))
                 print("Profile finished. Saving trace...")
-            torch.profiler.tensorboard_trace_handler(os.path.join(rundir, "profile_trace"), use_gzip=True)(p)
+                tracefile_path = os.path.join(rundir, "profile_trace")
+                torch.profiler.tensorboard_trace_handler(tracefile_path, use_gzip=True)(p)
+                print(f"Profile trace saved at {tracefile_path}.")
+            if profile_finish_exit:
+                accelerator.print("Exiting...")
+                exit(0)
 
         profile_ctx = accelerator.profile(
             ProfileKwargs(

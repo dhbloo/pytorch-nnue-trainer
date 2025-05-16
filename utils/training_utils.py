@@ -98,6 +98,7 @@ def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.
         from utils.muon import Muon, get_params_for_muon
         from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
 
+        params_id_to_name = {id(p): name for name, p in model.named_parameters()}
         muon_params_id_set = set(id(p) for p in get_params_for_muon(model))
         muon_args = {"weight_decay": 1e-2}
         muon_args.update(kwargs.pop("muon_args", {}))
@@ -109,7 +110,8 @@ def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.
         callback = None
         if kwargs.pop("verbose", False):
             callback = lambda p, spec_idx: print(
-                f"Adding param {p.shape} to optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
+                f"Adding param {params_id_to_name[id(p)]} ({p.shape}) to "
+                f"optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
             )
         kwargs.update({"lr": lr, "weight_decay": weight_decay, "optimizer_selection_callback": callback})
         opt = ChainedOptimizer(model.parameters(), specs, **kwargs)
@@ -252,7 +254,7 @@ def cross_entropy_with_softlabel(
 
 
 class ShuffleDataset(IterableDataset):
-    def __init__(self, dataset : IterableDataset, buffer_size : int):
+    def __init__(self, dataset: IterableDataset, buffer_size: int):
         super().__init__()
         self.dataset = dataset
         self.buffer_size = buffer_size

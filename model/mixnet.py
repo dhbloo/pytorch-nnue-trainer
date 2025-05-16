@@ -12,6 +12,7 @@ from .blocks import (
     SwitchLinearBlock,
     SwitchPReLU,
     SequentialWithExtraArguments,
+    build_activation_layer,
 )
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
@@ -36,7 +37,14 @@ def avg4(a, b, c, d):
 
 
 class DirectionalConvLayer(nn.Module):
-    def __init__(self, dim_in, dim_out, use_nonzero_padding=False, use_channel_last=True):
+    def __init__(
+        self,
+        dim_in,
+        dim_out,
+        use_nonzero_padding=False,
+        use_channel_last=True,
+        fix_direction_order=False,
+    ):
         super().__init__()
         weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
         self.weight = nn.Parameter(torch.empty(weight_shape))
@@ -44,6 +52,7 @@ class DirectionalConvLayer(nn.Module):
         nn.init.kaiming_normal_(self.weight)
         self.use_nonzero_padding = use_nonzero_padding
         self.use_channel_last = use_channel_last
+        self.fix_direction_order = fix_direction_order
 
     def _conv1d_direction(self, x, dir):
         if self.use_channel_last:
@@ -57,12 +66,21 @@ class DirectionalConvLayer(nn.Module):
         else:
             w_0_, w_1_, w_2_ = self.weight[0], self.weight[1], self.weight[2]
 
-        weight_func_map = [
-            lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
-            lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
-            lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
-            lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
-        ]
+        if self.fix_direction_order:
+            weight_func_map = [
+                lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
+                lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
+                lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
+                lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
+            ]
+        else:
+            weight_func_map = [
+                lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
+                lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
+                lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
+                lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
+            ]
+
         weight = torch.stack(weight_func_map[dir](self.weight), dim=2)
         weight = weight.reshape(dim_out, dim_in, kernel_size, kernel_size)
         if self.use_nonzero_padding:
@@ -82,11 +100,11 @@ class DirectionalConvLayer(nn.Module):
 
 
 class DirectionalConvResBlock(nn.Module):
-    def __init__(self, dim, **dirconv_kwargs):
+    def __init__(self, dim, activation, **dirconv_kwargs):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim, dim, **dirconv_kwargs)
         self.conv1x1 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.activation = nn.SiLU()
+        self.activation = build_activation_layer(activation)
 
     def forward(self, x):
         residual = x
@@ -99,11 +117,12 @@ class DirectionalConvResBlock(nn.Module):
 
 
 class Conv0dResBlock(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, activation, middle_dim_multipler=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.conv2 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.activation = nn.SiLU(inplace=True)
+        middle_dim = middle_dim_multipler * dim
+        self.conv1 = nn.Conv2d(dim, middle_dim, kernel_size=1)
+        self.conv2 = nn.Conv2d(middle_dim, dim, kernel_size=1)
+        self.activation = build_activation_layer(activation)
 
     def forward(self, x):
         residual = x
@@ -116,22 +135,38 @@ class Conv0dResBlock(nn.Module):
 
 
 class Mapping(nn.Module):
-    def __init__(self, dim_in, dim_middle, dim_out, use_nonzero_padding=False, use_channel_last=True):
+    def __init__(
+        self,
+        dim_in,
+        dim_middle,
+        dim_out,
+        use_channel_last=True,
+        fix_direction_order=False,
+        activation="silu",
+    ):
         super().__init__()
-        self.d_conv = DirectionalConvLayer(dim_in, dim_middle, use_nonzero_padding, use_channel_last)
+        self.d_conv = DirectionalConvLayer(
+            dim_in,
+            dim_middle,
+            use_nonzero_padding=False,
+            use_channel_last=use_channel_last,
+            fix_direction_order=fix_direction_order,
+        )
         self.convs = nn.Sequential(
             *[
                 DirectionalConvResBlock(
                     dim_middle,
-                    use_nonzero_padding=use_nonzero_padding,
+                    activation,
+                    use_nonzero_padding=False,
                     use_channel_last=use_channel_last,
+                    fix_direction_order=fix_direction_order,
                 )
                 for _ in range(4)
             ],
-            Conv0dResBlock(dim_middle),
+            Conv0dResBlock(dim_middle, activation),
         )
         self.final_conv = nn.Conv2d(dim_middle, dim_out, kernel_size=1)
-        self.activation = nn.SiLU(inplace=True)
+        self.activation = build_activation_layer(activation)
 
     def forward(self, x, dirs=[0, 1, 2, 3]):
         x = tuple((x if i in dirs else None) for i in range(4))
@@ -1178,6 +1213,367 @@ class Mix9Net(nn.Module):
         return f"mix9_{self.input_type}_{f}f{p}p{v}v{d}d"
 
 
+@MODELS.register("mix9s")
+class Mix9sNet(nn.Module):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=64,
+        dim_policy=32,
+        dim_value=64,
+        dim_dwconv=32,
+        input_type="basicns",
+    ):
+        super().__init__()
+        self.model_size = (dim_middle, dim_feature, dim_policy, dim_value, dim_dwconv)
+        self.input_type = input_type
+        assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
+        assert dim_dwconv >= dim_policy, "dim_dwconv must be not less than dim_policy"
+
+        self.input_plane = build_input_plane(input_type)
+        dim_input = self.input_plane.dim_plane
+        self.mapping1 = Mapping(
+            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+        )
+        self.mapping2 = Mapping(
+            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+        )
+
+        # feature depth-wise conv
+        self.feature_dwconv = Conv2dBlock(
+            dim_dwconv,
+            dim_dwconv,
+            ks=3,
+            st=1,
+            padding=3 // 2,
+            groups=dim_dwconv,
+            activation="relu",
+            quant="pixel-dwconv-floor",
+            input_quant_scale=128,
+            input_quant_bits=16,
+            weight_quant_scale=65536,
+            weight_quant_bits=16,
+            bias_quant_scale=128,
+            bias_quant_bits=16,
+        )
+
+        # policy head (point-wise conv)
+        dim_pm = self.policy_middle_dim = 16
+        self.policy_pwconv_weight_linear = nn.Sequential(
+            LinearBlock(dim_feature, dim_policy * 2, activation="relu", quant=True),
+            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation="none", quant=True),
+        )
+        self.policy_output = nn.Conv2d(dim_pm, 1, 1)
+
+        self.value_corner = StarBlock(dim_feature, dim_value)
+        self.value_edge = StarBlock(dim_feature, dim_value)
+        self.value_center = StarBlock(dim_feature, dim_value)
+        self.value_quad = StarBlock(dim_value, dim_value)
+        self.value_linear = nn.Sequential(
+            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, dim_value, activation="relu", quant=True),
+            LinearBlock(dim_value, 3, activation="none", quant=True),
+        )
+
+    def initialize(self):
+        self.feature_dwconv.conv.weight.data.mul_(0.25)
+
+    def do_feature_quantization(self, feature, data):
+        return feature, {}, {}  # Not implemented
+
+    def get_feature(self, data, inv_side=False):
+        # get the input plane from board and side to move input
+        input_plane = self.input_plane(
+            {
+                "board_input": (
+                    torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"]
+                ),
+                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
+            }
+        )  # [B, 2, H, W]
+
+        # get per-point 4-direction cell features
+        feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
+        feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
+        feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
+        feature = torch.clamp(feature, min=-511 / 32, max=511 / 32)  # [-511/32,511/32]
+
+        # do feature quantization
+        feature, aux_losses, aux_outputs = self.do_feature_quantization(feature, data)
+
+        # clamp feature for int quantization
+        feature = torch.clamp(feature, min=-16, max=511 / 32)  # [-512/32,511/32]
+        feature = fake_quant(feature, scale=32, num_bits=16)  # int16, scale=32, [-16,511/32]
+        # sum (and rescale) feature across four directions
+        feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
+        # apply relu activation
+        feature = F.relu(feature)  # [B, dim_feature, H, W] int16, scale=128, [0,16]
+
+        # apply feature depth-wise conv
+        _, _, _, _, dim_dwconv = self.model_size
+        feat_dwconv = feature[:, :dim_dwconv]  # int16, scale=128, [0,16]
+        feat_dwconv = self.feature_dwconv(feat_dwconv * 4)  # [B, dwconv, H, W] relu
+        feat_dwconv = fake_quant(feat_dwconv, scale=128, num_bits=16)  # int16, scale=128, [0,9/2*16*4]
+
+        # apply activation for direct feature
+        feat_direct = feature[:, dim_dwconv:]  # [B, dim_feature-dwconv, H, W] int16, scale=128, [0,16]
+        feat_direct = fake_quant(feat_direct, scale=128, num_bits=16)  # int16, scale=128, [0,16]
+
+        feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
+
+        return feature, aux_losses, aux_outputs
+
+    def forward(self, data):
+        _, _, dim_policy, _, _ = self.model_size
+
+        # get feature from single side
+        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        B, _, H, W = feature.shape
+
+        # global feature accumulator
+        feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
+        feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
+
+        # policy head
+        dim_pm = self.policy_middle_dim
+        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
+        pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+        pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
+        policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(dim_pm)
+            ],
+            1,
+        )
+        pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
+            B, dim_pm, 1, 1
+        )  # int32, scale=128*128*128
+        policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+        policy = self.policy_output(policy)  # [B, 1, H, W]
+
+        # value feature accumulator of nine groups
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+
+        # value head
+        value_00 = self.value_corner(feature_00)
+        value_01 = self.value_edge(feature_01)
+        value_02 = self.value_corner(feature_02)
+        value_10 = self.value_edge(feature_10)
+        value_11 = self.value_center(feature_11)
+        value_12 = self.value_edge(feature_12)
+        value_20 = self.value_corner(feature_20)
+        value_21 = self.value_edge(feature_21)
+        value_22 = self.value_corner(feature_22)
+
+        value_q00 = avg4(value_00, value_01, value_10, value_11)
+        value_q01 = avg4(value_01, value_02, value_11, value_12)
+        value_q10 = avg4(value_10, value_11, value_20, value_21)
+        value_q11 = avg4(value_11, value_12, value_21, value_22)
+        value_q00 = self.value_quad(value_q00)
+        value_q01 = self.value_quad(value_q01)
+        value_q10 = self.value_quad(value_q10)
+        value_q11 = self.value_quad(value_q11)
+
+        value = torch.cat(
+            [
+                feature_sum,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + dim_value * 4]
+        value = self.value_linear(value)
+
+        return value, policy, aux_losses, aux_outputs
+
+    @property
+    def weight_clipping(self):
+        weight_clipping_list = [
+            {
+                "params": ["feature_dwconv.conv.weight"],
+                "min_weight": -32768 / 65536,
+                "max_weight": 32767 / 65536,
+            },
+            {
+                "params": [
+                    "value_corner.up1.fc.weight",
+                    "value_corner.up2.fc.weight",
+                    "value_corner.down.fc.weight",
+                    "value_edge.up1.fc.weight",
+                    "value_edge.up2.fc.weight",
+                    "value_edge.down.fc.weight",
+                    "value_center.up1.fc.weight",
+                    "value_center.up2.fc.weight",
+                    "value_center.down.fc.weight",
+                    "value_quad.up1.fc.weight",
+                    "value_quad.up2.fc.weight",
+                    "value_quad.down.fc.weight",
+                    "value_linear.0.fc.weight",
+                    "value_linear.1.fc.weight",
+                    "value_linear.2.fc.weight",
+                ],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+            {
+                "params": [
+                    "policy_pwconv_weight_linear.0.fc.weight",
+                    "policy_pwconv_weight_linear.1.fc.weight",
+                ],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+        ]
+
+        return weight_clipping_list
+
+    @property
+    def name(self):
+        _, f, p, v, d = self.model_size
+        return f"mix9s_{self.input_type}_{f}f{p}p{v}v{d}d"
+
+
+@MODELS.register("mix9svq")
+class Mix9sVQNet(Mix9sNet):
+    def __init__(
+        self,
+        dim_middle=128,
+        dim_feature=64,
+        dim_policy=32,
+        dim_value=64,
+        dim_dwconv=32,
+        input_type="basicns",
+        codebook_size=16384,
+        num_coodbooks=1,
+        **vq_kwargs,
+    ):
+        from .vq import ProductVectorQuantize
+
+        super().__init__(
+            dim_middle=dim_middle,
+            dim_feature=dim_feature,
+            dim_policy=dim_policy,
+            dim_value=dim_value,
+            dim_dwconv=dim_dwconv,
+            input_type=input_type,
+        )
+        self.codebook_size = codebook_size
+        self.vq_layers = nn.ModuleList([
+            ProductVectorQuantize(
+                codebook_size=codebook_size,
+                dim_feature=dim_feature,
+                num_coodbooks=num_coodbooks,
+                **vq_kwargs,
+            )
+            for _ in range(2)
+        ])
+        self._cached_positions = None
+
+    @torch.compiler.disable
+    def _quantize_line_feature(self, feature, line_encoding, vq_layer_idx):
+        """
+        Args:
+            feature: [batch_size, num_directions, dim_feature, H, W].
+            line_encoding: [batch_size, num_directions, H, W], dtype=int32.
+        Returns:
+            feature_vq: [batch_size, num_directions, dim_feature, H, W].
+            info: A dict of quantization losses and aux outputs.
+        """
+        batch_size, num_directions, dim_feature, H, W = feature.shape
+        feature = feature.permute(0, 1, 3, 4, 2).reshape(-1, dim_feature)  # [B*D*H*W, dim_feature]
+        line_encoding = line_encoding.reshape(-1)  # [B*D*H*W]
+
+        # remove duplicate line encoding and only keep the unique encodings
+        line_encoding_unique, inverse_indices = torch.unique(
+            line_encoding, sorted=True, return_inverse=True
+        )  # [num_unique], [B*D*H*W]
+
+        # get the first occurrence index of each unique line encoding
+        # line_encoding_unique.shape == [num_unique]
+        # inverse_indices.shape      == [N]   (N = batch_size*num_directions*H*W)
+        N = inverse_indices.numel()
+        if self._cached_positions is None or self._cached_positions.shape[0] != N:
+            self._cached_positions = torch.arange(N, device=feature.device)
+
+        # start with something larger than any real position
+        first_occurrence_indices = torch.full_like(line_encoding_unique, fill_value=N, dtype=torch.long)
+
+        # min-reduce the position for every unique id
+        first_occurrence_indices.scatter_reduce_(
+            0, inverse_indices, self._cached_positions, reduce="amin", include_self=False
+        )
+
+        # gather features based on the unique line encoding
+        feature_per_line_encoding = feature[first_occurrence_indices]  # [num_unique, dim_feature]
+
+        # quantize the features
+        feature_per_line_encoding_vq, info, _ = self.vq_layers[vq_layer_idx](feature_per_line_encoding)
+
+        # gather the quantized features back to the original shape
+        feature_vq = feature_per_line_encoding_vq[inverse_indices]  # [N, dim_feature]
+        feature_vq = feature_vq.reshape(batch_size, num_directions, H, W, dim_feature)
+        feature_vq = feature_vq.permute(0, 1, 4, 2, 3)  # [B, num_directions, dim_feature, H, W]
+
+        return feature_vq, info
+
+    @torch.compiler.disable
+    def do_feature_quantization(self, feature, data):
+        line_encoding = data["line_encoding"]  # [B, 4, H, W]
+
+        feature_vq_1, info_1 = self._quantize_line_feature(feature[:, :2], line_encoding[:, :2], 0)
+        feature_vq_2, info_2 = self._quantize_line_feature(feature[:, 2:], line_encoding[:, 2:], 1)
+        feature_vq = torch.cat([feature_vq_1, feature_vq_2], dim=1)  # [B, 4, dim_feature, H, W]
+
+        aux_losses = {}
+        aux_outputs = {}
+        if info_1 is not None and info_2 is not None:
+            aux_losses = {"vq": (info_1["loss"] + info_2["loss"]) / 2}
+            cluster_size = (self.vq_layers[0].normalized_cluster_size + self.vq_layers[1].normalized_cluster_size) / 2
+            aux_outputs = {
+                "vq_perplexity": (info_1["perplexity"] + info_2["perplexity"]) / 2,
+                "vq_normed_perplexity": (info_1["normalized_perplexity"] + info_2["normalized_perplexity"]) / 2,
+                "vq_cluster_size_q10": torch.quantile(cluster_size, q=0.1),
+                "vq_cluster_size_q50": torch.quantile(cluster_size, q=0.5),
+                "vq_cluster_size_q90": torch.quantile(cluster_size, q=0.9),
+            }
+
+        return feature_vq, aux_losses, aux_outputs
+
+    @property
+    def name(self):
+        _, f, p, v, d = self.model_size
+        return f"mix9svq_{self.input_type}_{f}f{p}p{v}v{d}d{self.codebook_size}c"
+
+
 @MODELS.register("mix10")
 class Mix10Net(nn.Module):
     def __init__(
@@ -1186,29 +1582,22 @@ class Mix10Net(nn.Module):
         dim_feature=64,
         dim_dwconv=32,
         input_type="basicns",
-        one_mapping=False,
         spherical_feature=False,
-        use_channel_last=True,
     ):
         super().__init__()
         self.model_size = (dim_middle, dim_feature, dim_dwconv)
         self.input_type = input_type
-        self.one_mapping = one_mapping
         self.spherical_feature = spherical_feature
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
 
         self.input_plane = build_input_plane(input_type)
-        if one_mapping:
-            self.mapping0 = Mapping(
-                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
-            )
-        else:
-            self.mapping1 = Mapping(
-                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
-            )
-            self.mapping2 = Mapping(
-                self.input_plane.dim_plane, dim_middle, dim_feature, use_channel_last=use_channel_last
-            )
+        dim_input = self.input_plane.dim_plane
+        self.mapping1 = Mapping(
+            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+        )
+        self.mapping2 = Mapping(
+            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+        )
 
         # feature depth-wise conv
         self.feature_dwconv = Conv2dBlock(
@@ -1284,6 +1673,9 @@ class Mix10Net(nn.Module):
     def initialize(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
 
+    def do_feature_quantization(self, feature, data):
+        return feature, {}, {}  # Not implemented
+
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
         input_plane = self.input_plane(
@@ -1295,16 +1687,17 @@ class Mix10Net(nn.Module):
             }
         )  # [B, 2, H, W]
         # get per-point 4-direction cell features
-        if self.one_mapping:
-            feature = self.mapping0(input_plane)  # [B, 4, dim_feature, H, W]
-        else:
-            feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
-            feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
-            feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
+        feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
+        feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
+        feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
 
         # normalize feature onto hypersphere of radius 16
         if self.spherical_feature:
-            feature = F.normalize(feature, p=2, dim=2) * 16
+            feature = F.normalize(feature, p=2, dim=2) * (511 / 32)
+        feature = torch.clamp(feature, min=-511 / 32, max=511 / 32)  # int16, scale=32, [-16,16]
+
+        # do feature quantization
+        feature, aux_losses, aux_outputs = self.do_feature_quantization(feature, data)
 
         # clamp feature for int quantization
         feature = torch.clamp(feature, min=-16, max=511 / 32)  # int16, scale=32, [-16,16]
@@ -1326,7 +1719,7 @@ class Mix10Net(nn.Module):
 
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
-        return feature
+        return feature, aux_losses, aux_outputs
 
     def value_head_small(self, feature):
         # global feature accumulator
@@ -1500,7 +1893,7 @@ class Mix10Net(nn.Module):
 
     def forward(self, data):
         # get feature from single side
-        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
         value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
@@ -1514,7 +1907,7 @@ class Mix10Net(nn.Module):
         policy_small = self.policy_head_small(feature, value_small_feature)
         policy_large = self.policy_head_large(feature, value_large_feature)
 
-        aux_losses = {
+        aux_losses.update({
             "value_small": ("value_loss", value_small),
             "policy_small": ("policy_loss", policy_small),
             "policy_small_reg": ("policy_reg", policy_small),
@@ -1523,20 +1916,20 @@ class Mix10Net(nn.Module):
                 "value_relative_uncertainty_loss",
                 (value_relative_uncertainty, value_small, value_large),
             ),
-        }
-        aux_outputs = {
+        })
+        aux_outputs.update({
             "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
             "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
             "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
             "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
             "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
             "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
-        }
+        })
         return value_large, policy_large, aux_losses, aux_outputs
 
     def forward_debug_print(self, data):
         # get feature from single side
-        feature = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
@@ -1565,7 +1958,7 @@ class Mix10Net(nn.Module):
         print(f"Raw Policy Small: \n{(policy_small[0, 0]*32).int()}")
         print(f"Raw Policy Large: \n{(policy_large[0, 0]*32).int()}")
 
-        aux_losses = {
+        aux_losses.update({
             "value_small": ("value_loss", value_small),
             "policy_small": ("policy_loss", policy_small),
             "policy_small_reg": ("policy_reg", policy_small),
@@ -1574,15 +1967,15 @@ class Mix10Net(nn.Module):
                 "value_relative_uncertainty_loss",
                 (value_relative_uncertainty, value_small, value_large),
             ),
-        }
-        aux_outputs = {
+        })
+        aux_outputs.update({
             "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
             "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
             "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
             "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
             "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
             "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
-        }
+        })
         return value_large, policy_large, aux_losses, aux_outputs
 
     @property
