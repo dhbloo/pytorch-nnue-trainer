@@ -7,6 +7,7 @@ from accelerate import PartialState
 from accelerate.utils import send_to_device
 
 from model import build_model
+from dataset.pipeline import build_data_pipeline
 from utils.file_utils import load_torch_ckpt
 from utils.misc_utils import deep_update_dict
 
@@ -26,9 +27,10 @@ def parse_args_and_init():
     parser.add("--board_width", type=int, default=15, help="Board width")
     parser.add("--board_height", type=int, default=15, help="Board height")
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
+    parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
 
     args, _ = parser.parse_known_args()  # parse args
-    
+
     if PartialState(cpu=args.use_cpu).is_local_main_process:
         parser.print_values()
         print("-" * 60)
@@ -40,11 +42,12 @@ class Board:
     BLACK_PLANE = 0
     WHITE_PLANE = 1
 
-    def __init__(self, board_width, board_height, fixed_side_input=False):
+    def __init__(self, board_width: int, board_height: int, dataset_args: dict, data_pipeline_args: dict):
         self.board = np.zeros((2, board_height, board_width), dtype=np.int8)
         self.side_to_move = self.BLACK_PLANE
         self.move_history = []
-        self.fixed_side_input = fixed_side_input
+        self.fixed_side_input = dataset_args.get("fixed_side_input", False)
+        self.data_pipelines = build_data_pipeline(data_pipeline_args)
 
     @property
     def ply(self):
@@ -84,13 +87,22 @@ class Board:
         if not self.fixed_side_input and self.side_to_move == 1:
             board_input = np.flip(self.board, axis=0).copy()
         else:
-            board_input = self.board
+            board_input = self.board.copy()
 
-        return {
-            "board_size": torch.tensor(self.board.shape, dtype=torch.int8),
-            "board_input": torch.from_numpy(board_input),
-            "stm_input": torch.FloatTensor([-1 if self.side_to_move == 0 else 1]),
+        data = {
+            "board_input": board_input,
+            "board_size": np.array(self.board.shape, dtype=np.int8),
+            "stm_input": np.array([-1 if self.side_to_move == 0 else 1], dtype=np.float32),
         }
+
+        for pipeline in self.data_pipelines:
+            data = pipeline(data)
+
+        data = {
+            k: torch.from_numpy(v) if isinstance(v, torch.Tensor) else torch.tensor(v)
+            for k, v in data.items()
+        }
+        return data
 
     def __str__(self):
         s = "   "
@@ -207,6 +219,7 @@ def test_play(
     board_width,
     board_height,
     dataset_args,
+    data_pipelines,
     **kwargs,
 ):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
@@ -230,7 +243,7 @@ def test_play(
     model.eval()
 
     # construct the test board
-    board = Board(board_width, board_height, fixed_side_input=dataset_args.get("fixed_side_input", False))
+    board = Board(board_width, board_height, dataset_args, data_pipelines)
 
     # test play loop
     while board.ply + 1 < board.width * board.height:

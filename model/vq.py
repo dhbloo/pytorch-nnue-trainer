@@ -255,7 +255,7 @@ class VectorQuantize(nn.Module):
         kmeans_iter=10,
         ema_update=True,
         ema_decay=0.995,
-        threshold_ema_dead_code=1e-2,
+        threshold_ema_dead_code=5e-3,
         reset_cluster_size=None,
         commitment_weight=0.25,
         learnable_codebook=True,
@@ -278,9 +278,7 @@ class VectorQuantize(nn.Module):
         self.ema_update = ema_update and not use_simvq
         self.ema_decay = ema_decay
         self.threshold_ema_dead_code = 0 if use_simvq else threshold_ema_dead_code
-        self.reset_cluster_size = (
-            threshold_ema_dead_code if reset_cluster_size is None else reset_cluster_size
-        )
+        self.reset_cluster_size = 1 if reset_cluster_size is None else reset_cluster_size
         self.commitment_weight = commitment_weight
         self.rotation_trick = rotation_trick
         self.stochastic_sampling = stochastic_sampling
@@ -371,21 +369,26 @@ class VectorQuantize(nn.Module):
         self.inited.data.fill_(True)
 
     @torch.no_grad()
-    def _expire_codes(self, inputs):
+    def _expire_codes(self, inputs) -> Tensor | None:
         if self.threshold_ema_dead_code == 0:
-            return
+            return None
 
         expired_codes = self.normalized_cluster_size < self.threshold_ema_dead_code
         if not expired_codes.any():
-            return
+            return None
 
-        num_samples = int(expired_codes.sum().item())
+        num_expired_codes = expired_codes.sum().float()
+        num_samples = int(num_expired_codes.item())
         sampled = sample_vectors(inputs, num_samples)  # (num_samples, dim_feature)
-        reset_cluster_size = torch.full((num_samples,), self.reset_cluster_size, device=sampled.device)
+        reset_cluster_size = torch.full(
+            (num_samples,), self.reset_cluster_size, dtype=torch.float, device=sampled.device
+        )
 
         self.embed.data[expired_codes] = sampled
         self.embed_avg.data[expired_codes] = sampled * reset_cluster_size[:, None]
         self.cluster_size.data[expired_codes] = reset_cluster_size
+
+        return num_expired_codes
 
     @torch.no_grad()
     def _update_ema(self, x, embed_indices, cluster_size):
@@ -429,6 +432,10 @@ class VectorQuantize(nn.Module):
 
     @property
     def codebook(self) -> Tensor:
+        """
+        Returns:
+            codebook: features of shape (codebook_size, dim_feature).
+        """
         if self.use_simvq:
             code = self.code_transform(self.embed)
         else:
@@ -486,6 +493,13 @@ class VectorQuantize(nn.Module):
             self._accumulate_input_batch(x)
             return x, None
 
+        # expire codes if we are in training mode
+        num_expired_codes = None
+        if self.training:
+            num_expired_codes = self._expire_codes(x)
+        if num_expired_codes is None:
+            num_expired_codes = torch.zeros((), device=x.device)
+
         # get codebook embeddings
         codebook = self.codebook  # (codebook_size, dim_feature)
 
@@ -526,6 +540,7 @@ class VectorQuantize(nn.Module):
             "embed_indices": embed_indices,
             "perplexity": perplexity,
             "normalized_perplexity": perplexity / self.codebook_size,
+            "num_expired_codes": num_expired_codes,
             "loss": total_loss,
             **loss_terms,
         }
@@ -533,7 +548,6 @@ class VectorQuantize(nn.Module):
         # perform training EMA update and loss computation
         if self.training:
             self._update_ema(x, embed_indices, cluster_size)
-            self._expire_codes(x)
 
         return x_q, info
 
@@ -544,16 +558,16 @@ class ProductVectorQuantize(nn.Module):
     Args:
         codebook_size: The number of embeddings in each codebook.
         dim_feature: Total dimension of the embeddings.
-        num_coodbooks: Number of groups to split the input into.
+        num_codebooks: Number of groups to split the input into.
     """
 
-    def __init__(self, codebook_size, dim_feature, num_coodbooks, **kwargs):
+    def __init__(self, codebook_size, dim_feature, num_codebooks, **kwargs):
         super().__init__()
-        assert dim_feature % num_coodbooks == 0, "dim_feature must be divisible by num_coodbooks"
+        assert dim_feature % num_codebooks == 0, "dim_feature must be divisible by num_codebooks"
         self.codebook_size = codebook_size
         self.dim_feature = dim_feature
-        self.num_coodbooks = num_coodbooks
-        self.dim_feature_per_group = dim_feature // num_coodbooks
+        self.num_codebooks = num_codebooks
+        self.dim_feature_per_group = dim_feature // num_codebooks
         self.vq_modules = nn.ModuleList(
             [
                 VectorQuantize(
@@ -561,29 +575,37 @@ class ProductVectorQuantize(nn.Module):
                     dim_feature=self.dim_feature_per_group,
                     **kwargs,
                 )
-                for _ in range(num_coodbooks)
+                for _ in range(num_codebooks)
             ]
         )
+
+    @property
+    def codebook(self) -> Tensor:
+        """
+        Returns:
+            codebook: features of shape (num_codebooks, codebook_size, dim_feature_per_group).
+        """
+        return torch.stack([vq.codebook for vq in self.vq_modules], dim=0)
 
     @property
     def normalized_cluster_size(self) -> Tensor:
         """
         Returns:
-            normalized_cluster_size: Normalized cluster size of shape (num_coodbooks, codebook_size,).
+            normalized_cluster_size: Normalized cluster size of shape (num_codebooks, codebook_size,).
         """
         return torch.stack([vq.normalized_cluster_size for vq in self.vq_modules], dim=0)
 
     def from_indices(self, indices: Tensor) -> Tensor:
         """
         Args:
-            indices: Indices of the embedding, long tensor of shape (N, num_coodbooks).
+            indices: Indices of the embedding, long tensor of shape (N, num_codebooks).
         Returns:
             x_q: A quantized tensor of shape (N, dim_feature).
         """
         assert indices.ndim == 2, f"Wrong input ndim {indices.ndim} != 2"
         assert (
-            indices.shape[1] == self.num_coodbooks
-        ), f"Wrong input dim {indices.shape[-1]} != {self.num_coodbooks}"
+            indices.shape[1] == self.num_codebooks
+        ), f"Wrong input dim {indices.shape[-1]} != {self.num_codebooks}"
         x_q_groups = []
         for i, vq in enumerate(self.vq_modules):
             x_q = vq.from_indices(indices[:, i])
@@ -594,8 +616,8 @@ class ProductVectorQuantize(nn.Module):
     def forward(self, x: Tensor):
         assert x.ndim == 2, f"Wrong input ndim {x.ndim} != 2"
         assert x.shape[1] == self.dim_feature, f"Wrong input dim {x.shape[-1]} != {self.dim_feature}"
-        x_groups = x.view(-1, self.num_coodbooks, self.dim_feature_per_group)
-        x_groups = x_groups.unbind(1)  # num_coodbooks * (N, dim_feature_per_group)
+        x_groups = x.view(-1, self.num_codebooks, self.dim_feature_per_group)
+        x_groups = x_groups.unbind(1)  # num_codebooks * (N, dim_feature_per_group)
 
         x_q_groups = []
         info_groups = []
@@ -604,12 +626,12 @@ class ProductVectorQuantize(nn.Module):
             x_q_groups.append(x_q)
             info_groups.append(info)
 
-        x_q = torch.stack(x_q_groups, dim=1)  # (N, num_coodbooks, dim_feature_per_group)
+        x_q = torch.stack(x_q_groups, dim=1)  # (N, num_codebooks, dim_feature_per_group)
         x_q = x_q.view(-1, self.dim_feature)  # (N, dim_feature)
 
         aggregated_info, raw_info = None, None
         if all(info is not None for info in info_groups):
-            raw_info = {k: [info_groups[i][k] for i in range(self.num_coodbooks)] for k in info_groups[0]}
+            raw_info = {k: [info_groups[i][k] for i in range(self.num_codebooks)] for k in info_groups[0]}
 
             mean_attributes = ["perplexity", "normalized_perplexity"]
             mean_attributes += [key for key in raw_info.keys() if key.startswith("loss")]
@@ -617,6 +639,9 @@ class ProductVectorQuantize(nn.Module):
             aggregated_info = {key: list_mean(raw_info[key]) for key in mean_attributes}
             aggregated_info["embed_indices"] = torch.stack(
                 raw_info["embed_indices"], dim=1
-            )  # (N, num_coodbooks)
+            )  # (N, num_codebooks)
+            aggregated_info["num_expired_codes"] = torch.sum(
+                torch.stack([info["num_expired_codes"] for info in info_groups])
+            )
 
         return x_q, aggregated_info, raw_info

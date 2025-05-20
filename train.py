@@ -1,7 +1,13 @@
 import torch
 import numpy as np
 import torch.nn.functional as F
-from accelerate import Accelerator, DataLoaderConfiguration, DistributedDataParallelKwargs, ProfileKwargs, PartialState
+from accelerate import (
+    Accelerator,
+    DataLoaderConfiguration,
+    DistributedDataParallelKwargs,
+    ProfileKwargs,
+    PartialState,
+)
 from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
 from collections import deque
@@ -24,7 +30,13 @@ from utils.training_utils import (
     state_dict_drop_size_unmatched,
 )
 from utils.misc_utils import seed_everything, set_performance_level, add_dict_to, log_value_dict
-from utils.file_utils import make_dir, save_torch_ckpt, load_torch_ckpt, find_latest_ckpt, get_iteration_from_ckpt_filename
+from utils.file_utils import (
+    make_dir,
+    save_torch_ckpt,
+    load_torch_ckpt,
+    find_latest_ckpt,
+    get_iteration_from_ckpt_filename,
+)
 
 
 def parse_args_and_init():
@@ -44,9 +56,7 @@ def parse_args_and_init():
         "--val_dataset_args", type=yaml.safe_load, default={}, help="Extra validate dataset arguments"
     )
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
-    parser.add(
-        "--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline type and arguments"
-    )
+    parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
     parser.add("--num_worker", type=int, default=min(8, os.cpu_count()), help="Num of dataloader workers")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
@@ -494,9 +504,7 @@ def train(
 
     # build model, optimizer
     model = build_model(model_type, **model_args)
-    optimizer = build_optimizer(
-        optim_type, model, lr=learning_rate, weight_decay=weight_decay, **optim_args
-    )
+    optimizer = build_optimizer(optim_type, model, lr=learning_rate, weight_decay=weight_decay, **optim_args)
 
     # load checkpoint if exists
     model_name = model.name
@@ -675,8 +683,12 @@ def train(
                 if accelerator.scaler is not None:
                     training_state_dicts["scalar"] = accelerator.scaler.state_dict()
                 metadata_dict = {"iteration": str(it), "epoch": str(epoch), "rows": str(rows)}
-                save_torch_ckpt(os.path.join(rundir, f"ckpt_{model_name}_{it:07d}"),
-                                model_state_dict, training_state_dicts, metadata_dict)
+                save_torch_ckpt(
+                    os.path.join(rundir, f"ckpt_{model_name}_{it:07d}"),
+                    model_state_dict,
+                    training_state_dicts,
+                    metadata_dict,
+                )
 
                 # remove last snapshot if it's a temporary snapshot
                 if last_ckpt_filename is not None:

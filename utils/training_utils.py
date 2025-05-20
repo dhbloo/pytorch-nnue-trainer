@@ -65,8 +65,19 @@ def weights_init(init_cfg: dict):
     return init_fun
 
 
-def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.0, **kwargs):
+def build_optimizer(
+    optim_type: str,
+    model: torch.nn.Module,
+    lr: float,
+    weight_decay: float = 0.0,
+    only_track_requires_grad=True,
+    **kwargs,
+):
     parameters = model.parameters()
+    if only_track_requires_grad:
+        # only track parameters with requires_grad=True
+        parameters = [p for p in parameters if p.requires_grad]
+        
     if optim_type == "adamw":
         opt = optim.AdamW(
             parameters,
@@ -114,7 +125,7 @@ def build_optimizer(optim_type: str, model: torch.nn.Module, lr, weight_decay=0.
                 f"optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
             )
         kwargs.update({"lr": lr, "weight_decay": weight_decay, "optimizer_selection_callback": callback})
-        opt = ChainedOptimizer(model.parameters(), specs, **kwargs)
+        opt = ChainedOptimizer(parameters, specs, **kwargs)
     else:
         raise ValueError(f"Unsupported optimizer: {optim_type}")
 

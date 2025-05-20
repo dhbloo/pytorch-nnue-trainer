@@ -6,7 +6,7 @@ from zlib import crc32
 from math import ceil
 from utils.misc_utils import ascii_hist
 from . import BaseSerializer, SERIALIZERS
-from ..mixnet import Mix6Net, Mix7Net, Mix8Net, Mix9Net, Mix10Net
+from ..mixnet import Mix6Net, Mix7Net, Mix8Net, Mix9Net, Mix9sVQNet, Mix10Net
 
 
 def generate_base3_permutation(length):
@@ -1971,6 +1971,407 @@ class Mix9NetSerializer(BaseSerializer):
             o.write(policy_output_bias.astype("<f4").tobytes())
             # char  __padding_to_64bytes_1[44];
             o.write(np.zeros(44, dtype="<i1").tobytes())
+
+
+@SERIALIZERS.register("mix9svq")
+class Mix9svqNetSerializer(BaseSerializer):
+    """
+    Mix9svqNet binary serializer.
+
+    The corresponding C++ language struct layout:
+
+    template <int OutSize, int InSize>
+    struct FCWeight
+    {
+        int8_t  weight[OutSize * InSize];
+        int32_t bias[OutSize];
+    };
+
+    template <int OutSize, int InSize>
+    struct StarBlockWeight
+    {
+        FCWeight<OutSize * 2, InSize> value_corner_up1;
+        FCWeight<OutSize * 2, InSize> value_corner_up2;
+        FCWeight<OutSize, OutSize>    value_corner_down;
+    };
+
+    struct alignas(simd::NativeAlignment) Weight
+    {
+        // 1  mapping layer
+        int16_t codebook[2][65536][FeatureDim];
+        uint16_t mapping_index[2][ShapeNum];
+
+        // 2  Depthwise conv
+        int16_t feature_dwconv_weight[9][FeatDWConvDim];
+        int16_t feature_dwconv_bias[FeatDWConvDim];
+
+        struct HeadBucket
+        {
+            // 3  Policy dynamic pointwise conv
+            FCWeight<PolicyDim * 2, FeatureDim> policy_pwconv_layer_l1;
+            FCWeight<PolicyPWConvDim * PolicyDim + PolicyPWConvDim, PolicyDim * 2>
+                policy_pwconv_layer_l2;
+
+            // 4  Value Group MLP (layer 1,2)
+            StarBlockWeight<ValueDim, FeatureDim> value_corner;
+            StarBlockWeight<ValueDim, FeatureDim> value_edge;
+            StarBlockWeight<ValueDim, FeatureDim> value_center;
+            StarBlockWeight<ValueDim, ValueDim>   value_quad;
+
+            // 5  Value MLP (layer 1,2,3)
+            FCWeight<ValueDim, FeatureDim + ValueDim * 4> value_l1;
+            FCWeight<ValueDim, ValueDim>                  value_l2;
+            FCWeight<4, ValueDim>                         value_l3;
+
+            // 6  Policy output linear
+            float policy_output_weight[16];
+            float policy_output_bias;
+            char  __padding_to_64bytes_1[44];
+        } buckets[NumHeadBucket];
+    };
+    """
+
+    def __init__(self, rule="freestyle", board_size=None, **kwargs):
+        if board_size is None:
+            boardsizes = [15]
+        elif isinstance(board_size, (list, tuple)):
+            boardsizes = list(board_size)
+        else:
+            boardsizes = [board_size]
+        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+        self.line_length = 11
+        self.map_table_export_batch_size = 4096
+
+    @property
+    def is_binary(self) -> bool:
+        return True
+
+    def arch_hash(self, model: Mix9sVQNet) -> int:
+        assert model.input_plane.dim_plane == 2
+        _, dim_feature, dim_policy, dim_value, dim_dwconv = model.model_size
+        hash = crc32(b"Mix9sVQNet")
+        hash ^= crc32(model.input_type.encode("utf-8"))
+        print(f"Mix9sVQ ArchHashBase: {hex(hash)}")
+
+        assert dim_feature % 8 == 0, f"dim_feature must be a multiply of 8"
+        assert dim_policy % 8 == 0, f"dim_policy must be a multiply of 8"
+        assert dim_value % 8 == 0, f"dim_value must be a multiply of 8"
+        assert dim_dwconv % 8 == 0, f"dim_dwconv must be a multiply of 8"
+        hash ^= (dim_feature // 8) | ((dim_policy // 8) << 8) | ((dim_value // 8) << 14) | ((dim_dwconv // 8) << 20)
+        return hash
+
+    def _export_map_table(self, model: Mix9sVQNet, device, line, mapping_idx):
+        """
+        Export line -> feature mapping table.
+        Args:
+            line: shape (N, Length)
+        Returns:
+            features: shape (N, Length, dim_feature)
+        """
+        N, L = line.shape
+        us, opponent = line == 1, line == 2
+        line = np.stack((us, opponent), axis=0)[np.newaxis]  # (1, C=2, N, L)
+        line = torch.tensor(line, dtype=torch.float32, device=device)
+
+        batch_size = self.map_table_export_batch_size
+        batch_num = 1 + (N - 1) // batch_size
+        map_table = []
+        for i in range(batch_num):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, N)
+
+            mapping = getattr(model, f"mapping{mapping_idx}")
+            feature = mapping(line[:, :, start:end], dirs=[0])[0, 0]  # (dim_feature, batch, L)
+            feature = torch.clamp(feature, min=-511 / 32, max=511 / 32)
+            feature = torch.permute(feature, (1, 2, 0))  # (batch, L, dim_feature)
+            feature = feature.cpu().numpy()
+            map_table.append(feature)
+
+        map_table = np.concatenate(map_table, axis=0)  # (N, L, dim_feature)
+        return map_table
+
+    def _export_feature_codebook(self, model: Mix9sVQNet, device, mapping_idx):
+        # export feature codebook from vq layer
+        vq_layer = model.vq_layers[mapping_idx - 1]
+        feature_codebook = vq_layer.codebook.cpu().numpy()  # (num_codebooks, codebook_size, dim_feature)
+        assert feature_codebook.shape[:2] == (model.num_codebooks, model.codebook_size)
+        ascii_hist(f"mapping {mapping_idx} codebook", feature_codebook)
+        feature_codebook_clipped = np.clip(feature_codebook, a_min=-16, a_max=511 / 32)
+        num_params_clipped = np.sum(feature_codebook != feature_codebook_clipped)
+        feature_codebook_quant = np.around(feature_codebook_clipped * 32).astype(np.int16)  # [-512, 511]
+        print(
+            f"feature codebook: clipped {num_params_clipped}/{feature_codebook.size}"
+            + f", quant_range = {(feature_codebook_quant.min(), feature_codebook_quant.max())}"
+        )
+
+        # use line encoding to generate feature map
+        from dataset.pipeline.line_encoding import (
+            get_total_num_encoding,
+            get_encoding_usage_flags,
+            transform_lines_to_line_encoding,
+        )
+
+        # generate line features
+        num_encoding = get_total_num_encoding(self.line_length)
+        usage_flags = get_encoding_usage_flags(self.line_length)  # (N,) bool
+        feature_map = np.zeros((num_encoding, model.model_size[1]), dtype=np.float32)
+        for l in reversed(range(1, self.line_length + 1)):
+            lines = generate_base3_permutation(l)
+            idxs = transform_lines_to_line_encoding(lines, self.line_length)  # (n, 11)
+            map_table = self._export_map_table(model, device, lines, mapping_idx)
+            rows = np.arange(idxs.shape[0])[:, None]  # (n, 1)
+            feature_map[idxs, :] = map_table[rows, np.arange(l), :]
+
+        feature_map = torch.from_numpy(feature_map).to(device)  # (N, dim_feature)
+        _, info, _ = vq_layer(feature_map)
+        feature_index = info["embed_indices"]  # (N, num_codebooks)
+        feature_index = feature_index.cpu().numpy()
+        feature_index[~usage_flags] = 0  # unused codebook index is set to 0
+        assert model.codebook_size <= 65536, "assume uint16 for codebook index now"
+        assert feature_index.min() >= 0, "feature index should be >= 0"
+        assert feature_index.max() < model.codebook_size, "feature index should be < codebook_size"
+        feature_index = feature_index.astype(np.uint16)
+
+        for codebook_idx in range(model.num_codebooks):
+            index_bincount = np.bincount(feature_index[:, codebook_idx], minlength=model.codebook_size)
+            usecount_bincount = np.bincount(index_bincount)
+
+            # print the distribution of feature usage count
+            print(f"mapping {mapping_idx} codebook {codebook_idx} usecount distribution:")
+            print(f"  0: {usecount_bincount[0]}")
+            print(f"  1-9: {usecount_bincount[1:10].sum()}")
+            print(f"  10-99: {usecount_bincount[10:100].sum()}")
+            print(f"  100-999: {usecount_bincount[100:1000].sum()}")
+            print(f"  1000-4999: {usecount_bincount[1000:5000].sum()}")
+            print(f"  5000-9999: {usecount_bincount[5000:10000].sum()}")
+            for i in np.nonzero(usecount_bincount[10000:])[0]:
+                print(f"  {10000 + i}: {usecount_bincount[10000 + i]}")
+
+            # reset unused codebook to zeros
+            print(f"Reset {usecount_bincount[0]} unused codebook to zeros")
+            feature_codebook_quant[codebook_idx, index_bincount == 0] = 0
+
+        return feature_codebook_quant, feature_index
+
+    def _export_feature_dwconv(self, model: Mix9sVQNet):
+        conv_weight = model.feature_dwconv.conv.weight.cpu().numpy()  # [FeatureDWConvDim,1,3,3]
+        conv_bias = model.feature_dwconv.conv.bias.cpu().numpy()  # [FeatureDWConvDim]
+        conv_weight = conv_weight.reshape(conv_weight.shape[0], -1).transpose()  # [9, FeatureDWConvDim]
+        ascii_hist("feature dwconv weight", conv_weight)
+        ascii_hist("feature dwconv bias", conv_bias)
+
+        conv_weight_clipped = np.clip(conv_weight, a_min=-32768 / 65536, a_max=32767 / 65536)
+        conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
+        weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
+        bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
+        conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
+        conv_bias_quant = np.clip(np.around(conv_bias_clipped * 128), -32768, 32767).astype(np.int16)
+        print(
+            f"feature dwconv: weight clipped {weight_num_params_clipped}/{conv_weight.size}"
+            + f", bias clipped {bias_num_params_clipped}/{conv_bias.size}"
+            + f", weight_quant_range = {(conv_weight_quant.min(), conv_weight_quant.max())}"
+            + f", bias_quant_range = {(conv_bias_quant.min(), conv_bias_quant.max())}"
+        )
+
+        # Make sure that the dwconv will not overflow
+        assert np.all(
+            np.abs(conv_weight_clipped).sum(0) / 2 * 16 * 4 * 128 < 32767
+        ), f"feature dwconv would overflow! (maxsum={np.abs(conv_weight_clipped).sum(0).max()})"
+
+        return conv_weight_quant, conv_bias_quant
+
+    def _export_policy_pwconv(self, model: Mix9sVQNet):
+        # policy pw conv dynamic weight layer 1
+        l1_weight = model.policy_pwconv_weight_linear[0].fc.weight.cpu().numpy()
+        l1_bias = model.policy_pwconv_weight_linear[0].fc.bias.cpu().numpy()
+        ascii_hist("policy pwconv layer l1 weight", l1_weight)
+        ascii_hist("policy pwconv layer l1 bias", l1_bias)
+
+        # policy pw conv dynamic weight layer 2
+        l2_weight = model.policy_pwconv_weight_linear[1].fc.weight.cpu().numpy()
+        l2_bias = model.policy_pwconv_weight_linear[1].fc.bias.cpu().numpy()
+        ascii_hist("policy pwconv layer l2 weight", l2_weight)
+        ascii_hist("policy pwconv layer l2 bias", l2_bias)
+
+        # policy output layer
+        policy_output_weight = model.policy_output.weight.cpu().squeeze().numpy()
+        policy_output_bias = model.policy_output.bias.cpu().numpy()
+        ascii_hist("policy output weight", policy_output_weight)
+        ascii_hist("policy output bias", policy_output_bias)
+
+        return (
+            np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            policy_output_weight / (128 * 128 * 128),
+            policy_output_bias,
+        )
+
+    def _export_star_block(self, model: Mix9sVQNet, prefix: str):
+        block = getattr(model, prefix)
+        up1_weight = block.up1.fc.weight.cpu().numpy()
+        up1_bias = block.up1.fc.bias.cpu().numpy()
+        up2_weight = block.up2.fc.weight.cpu().numpy()
+        up2_bias = block.up2.fc.bias.cpu().numpy()
+        down_weight = block.down.fc.weight.cpu().numpy()
+        down_bias = block.down.fc.bias.cpu().numpy()
+        ascii_hist(f"{prefix}: up1 weight", up1_weight)
+        ascii_hist(f"{prefix}: up1 bias", up1_bias)
+        ascii_hist(f"{prefix}: up2 weight", up2_weight)
+        ascii_hist(f"{prefix}: up2 bias", up2_bias)
+        ascii_hist(f"{prefix}: down weight", down_weight)
+        ascii_hist(f"{prefix}: down bias", down_bias)
+
+        return (
+            np.clip(np.around(up1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(up1_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(up2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(up2_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(down_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(down_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        )
+
+    def _export_linear(self, model: Mix9sVQNet, prefix: str):
+        block = getattr(model, prefix)
+        weight = block.fc.weight.cpu().numpy()
+        bias = block.fc.bias.cpu().numpy()
+        ascii_hist(f"{prefix}: weight", weight)
+        ascii_hist(f"{prefix}: bias", bias)
+
+        return (
+            np.clip(np.around(weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        )
+
+    def _export_value(self, model: Mix9sVQNet):
+        # value layers
+        l1_weight = model.value_linear[0].fc.weight.cpu().numpy()
+        l1_bias = model.value_linear[0].fc.bias.cpu().numpy()
+        l2_weight = model.value_linear[1].fc.weight.cpu().numpy()
+        l2_bias = model.value_linear[1].fc.bias.cpu().numpy()
+        l3_weight = model.value_linear[2].fc.weight.cpu().numpy()
+        l3_bias = model.value_linear[2].fc.bias.cpu().numpy()
+        ascii_hist("value: linear1 weight", l1_weight)
+        ascii_hist("value: linear1 bias", l1_bias)
+        ascii_hist("value: linear2 weight", l2_weight)
+        ascii_hist("value: linear2 bias", l2_bias)
+        ascii_hist("value: linear3 weight", l3_weight)
+        ascii_hist("value: linear3 bias", l3_bias)
+
+        return (
+            np.clip(np.around(l1_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l1_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l2_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l2_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+            np.clip(np.around(l3_weight * 128), -128, 127).astype(np.int8),
+            np.clip(np.around(l3_bias * 128 * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        )
+
+    def serialize(self, out: io.RawIOBase, model: Mix9sVQNet, device):
+        feature_codebook1, feature_index1 = self._export_feature_codebook(model, device, 1)
+        feature_codebook2, feature_index2 = self._export_feature_codebook(model, device, 2)
+        feat_dwconv_weight, feat_dwconv_bias = self._export_feature_dwconv(model)
+        (
+            policy_pwconv_layer_l1_weight,
+            policy_pwconv_layer_l1_bias,
+            policy_pwconv_layer_l2_weight,
+            policy_pwconv_layer_l2_bias,
+            policy_output_weight,
+            policy_output_bias,
+        ) = self._export_policy_pwconv(model)
+        corner_weights = self._export_star_block(model, "value_corner")
+        edge_weights = self._export_star_block(model, "value_edge")
+        center_weights = self._export_star_block(model, "value_center")
+        quad_weights = self._export_star_block(model, "value_quad")
+        l1_weight, l1_bias, l2_weight, l2_bias, l3_weight, l3_bias = self._export_value(model)
+
+        # Since each quantized feature is in [-512, 511] range, they only uses 10 bits,
+        # here we write compressed uint64 streams to save space.
+        def write_features_compressed(feature_codebook, feature_bits=10):
+            features_i16 = feature_codebook.reshape(-1).astype("<i2")  # (num_codes*FC,)
+            bitmask = np.uint64(2**feature_bits - 1)
+            uint64 = np.uint64(0)
+            bits_used = 0
+            uint64_written = 0
+            for i in range(features_i16.shape[0]):
+                v = features_i16[i].astype(np.uint64) & bitmask
+                uint64 |= v << np.uint64(bits_used)
+                if 64 - bits_used >= feature_bits:
+                    bits_used += feature_bits
+                else:
+                    out.write(uint64.tobytes())
+                    uint64_written += 1
+                    uint64 = v >> np.uint64(64 - bits_used)
+                    bits_used = feature_bits - (64 - bits_used)
+            if bits_used > 0:
+                out.write(uint64.tobytes())
+                uint64_written += 1
+            original_num_bytes = features_i16.size * 2
+            compressed_num_bytes = uint64_written * 8
+            compression_rate = 100 * (compressed_num_bytes / original_num_bytes)
+            print(f"write feature compressed: {original_num_bytes} -> {compressed_num_bytes}"
+                  f" bytes ({compression_rate:.2f}%)")
+
+        # int16_t codebook[2][65536][FeatureDim];
+        write_features_compressed(feature_codebook1)
+        write_features_compressed(feature_codebook2)
+
+        # Write feature index as uint16
+        def write_feature_index(feature_index):
+            feature_index = feature_index.reshape(-1).astype("<u2")
+            out.write(feature_index.tobytes())
+        # int16_t mapping_index[2][ShapeNum];
+        write_feature_index(feature_index1)
+        write_feature_index(feature_index2)
+
+        # int16_t feature_dwconv_weight[9][FeatureDWConvDim];
+        # int16_t feature_dwconv_bias[FeatureDWConvDim];
+        out.write(feat_dwconv_weight.astype("<i2").tobytes())
+        out.write(feat_dwconv_bias.astype("<i2").tobytes())
+
+        # FCWeight<PolicyDim * 2, FeatureDim> policy_pwconv_layer_l1;
+        # FCWeight<PolicyPWConvDim * PolicyDim + PolicyPWConvDim, PolicyDim * 2> policy_pwconv_layer_l2;
+        out.write(policy_pwconv_layer_l1_weight.astype("<i1").tobytes())
+        out.write(policy_pwconv_layer_l1_bias.astype("<i4").tobytes())
+        out.write(policy_pwconv_layer_l2_weight.astype("<i1").tobytes())
+        out.write(policy_pwconv_layer_l2_bias.astype("<i4").tobytes())
+
+        # StarBlockWeight<ValueDim, FeatureDim> value_corner;
+        # StarBlockWeight<ValueDim, FeatureDim> value_edge;
+        # StarBlockWeight<ValueDim, FeatureDim> value_center;
+        # StarBlockWeight<ValueDim, ValueDim>   value_quad;
+        def write_star_block(weights):
+            out.write(weights[0].astype("<i1").tobytes())
+            out.write(weights[1].astype("<i4").tobytes())
+            out.write(weights[2].astype("<i1").tobytes())
+            out.write(weights[3].astype("<i4").tobytes())
+            out.write(weights[4].astype("<i1").tobytes())
+            out.write(weights[5].astype("<i4").tobytes())
+        write_star_block(corner_weights)
+        write_star_block(edge_weights)
+        write_star_block(center_weights)
+        write_star_block(quad_weights)
+
+        # FCWeight<ValueDim, FeatureDim + ValueDim * 4> value_l1;
+        # FCWeight<ValueDim, ValueDim>                  value_l2;
+        # FCWeight<4, ValueDim>                         value_l3;
+        out.write(l1_weight.astype("<i1").tobytes())
+        out.write(l1_bias.astype("<i4").tobytes())
+        out.write(l2_weight.astype("<i1").tobytes())
+        out.write(l2_bias.astype("<i4").tobytes())
+        # pad l3 weights to have at least output dim = 4
+        l3_weight = np.concatenate([l3_weight, np.zeros_like(l3_weight[:1])], axis=0)
+        l3_bias = np.concatenate([l3_bias, np.zeros_like(l3_bias[:1])], axis=0)
+        out.write(l3_weight.astype("<i1").tobytes())
+        out.write(l3_bias.astype("<i4").tobytes())
+
+        # float policy_output_weight[16];
+        # float policy_output_bias;
+        out.write(policy_output_weight.astype("<f4").tobytes())
+        out.write(policy_output_bias.astype("<f4").tobytes())
+        # char  __padding_to_64bytes_1[44];
+        out.write(np.zeros(44, dtype="<i1").tobytes())
 
 
 @SERIALIZERS.register("mix10")

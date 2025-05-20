@@ -49,10 +49,16 @@ class DirectionalConvLayer(nn.Module):
         weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
         self.weight = nn.Parameter(torch.empty(weight_shape))
         self.bias = nn.Parameter(torch.zeros((dim_out,)))
-        nn.init.kaiming_normal_(self.weight)
         self.use_nonzero_padding = use_nonzero_padding
         self.use_channel_last = use_channel_last
         self.fix_direction_order = fix_direction_order
+
+    def initialize(self):
+        if self.use_channel_last:
+            nn.init.kaiming_normal_(self.weight.data)
+        else:
+            nn.init.kaiming_normal_(self.weight.data.permute(1, 0, 2))
+        self.bias.data.zero_()
 
     def _conv1d_direction(self, x, dir):
         if self.use_channel_last:
@@ -143,6 +149,7 @@ class Mapping(nn.Module):
         use_channel_last=True,
         fix_direction_order=False,
         activation="silu",
+        line_length=11,
     ):
         super().__init__()
         self.d_conv = DirectionalConvLayer(
@@ -161,7 +168,7 @@ class Mapping(nn.Module):
                     use_channel_last=use_channel_last,
                     fix_direction_order=fix_direction_order,
                 )
-                for _ in range(4)
+                for _ in range((line_length // 2) - 1)
             ],
             Conv0dResBlock(dim_middle, activation),
         )
@@ -1415,6 +1422,120 @@ class Mix9sNet(nn.Module):
 
         return value, policy, aux_losses, aux_outputs
 
+    def forward_debug_print(self, data):
+        _, _, dim_policy, _, _ = self.model_size
+
+        # get feature from single side
+        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        B, _, H, W = feature.shape
+        print(f"feature after dwconv at (0,0): \n{(feature[..., 0, 0]*128).int()}")
+
+        # global feature accumulator
+        feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
+        print(f"feature sum before scale: \n{(feature_sum*128).int()}")
+        feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
+        print(f"feature sum: \n{(feature_sum*128).int()}")
+
+        # policy head
+        dim_pm = self.policy_middle_dim
+        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
+        print(f"policy pwconv output: \n{(pwconv_output*128*128).int()}")
+        pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
+        pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
+        print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
+        policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
+        print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
+        policy = torch.cat(
+            [
+                F.conv2d(
+                    input=policy.reshape(1, B * dim_policy, H, W),
+                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
+                    groups=B,
+                ).reshape(B, 1, H, W)
+                for i in range(dim_pm)
+            ],
+            1,
+        )
+        print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
+        pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
+            B, dim_pm, 1, 1
+        )  # int32, scale=128*128*128
+        print(f"policy pwconv bias: \n{(pwconv_bias.flatten(1, -1)*128*128*128).int()}")
+        policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
+        print(f"policy pwconv output at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
+        policy = self.policy_output(policy)  # [B, 1, H, W]
+        print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
+
+        # value feature accumulator of nine groups
+        H0, W0 = 0, 0
+        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
+        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
+        H3, W3 = H, W
+        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
+        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
+        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        print(f"feature 00 sum: \n{(feature_00*128).int()}")
+        print(f"feature 01 sum: \n{(feature_01*128).int()}")
+        print(f"feature 02 sum: \n{(feature_02*128).int()}")
+        print(f"feature 10 sum: \n{(feature_10*128).int()}")
+        print(f"feature 11 sum: \n{(feature_11*128).int()}")
+        print(f"feature 12 sum: \n{(feature_12*128).int()}")
+        print(f"feature 20 sum: \n{(feature_20*128).int()}")
+        print(f"feature 21 sum: \n{(feature_21*128).int()}")
+        print(f"feature 22 sum: \n{(feature_22*128).int()}")
+
+        # value head
+        value_00 = self.value_corner(feature_00)
+        value_01 = self.value_edge(feature_01)
+        value_02 = self.value_corner(feature_02)
+        value_10 = self.value_edge(feature_10)
+        value_11 = self.value_center(feature_11)
+        value_12 = self.value_edge(feature_12)
+        value_20 = self.value_corner(feature_20)
+        value_21 = self.value_edge(feature_21)
+        value_22 = self.value_corner(feature_22)
+
+        value_q00 = avg4(value_00, value_01, value_10, value_11)
+        value_q01 = avg4(value_01, value_02, value_11, value_12)
+        value_q10 = avg4(value_10, value_11, value_20, value_21)
+        value_q11 = avg4(value_11, value_12, value_21, value_22)
+        value_q00 = self.value_quad(value_q00)
+        value_q01 = self.value_quad(value_q01)
+        value_q10 = self.value_quad(value_q10)
+        value_q11 = self.value_quad(value_q11)
+
+        value = torch.cat(
+            [
+                feature_sum,
+                value_q00,
+                value_q01,
+                value_q10,
+                value_q11,
+            ],
+            1,
+        )  # [B, dim_feature + dim_value * 4]
+        print(f"value feature input: \n{(value*128).int()}")
+        for i, linear in enumerate(self.value_linear):
+            value = linear(value)
+            print(f"value feature after layer {i}: \n{(value*128).int()}")
+
+        return value, policy, aux_losses, aux_outputs
+
     @property
     def weight_clipping(self):
         weight_clipping_list = [
@@ -1473,7 +1594,7 @@ class Mix9sVQNet(Mix9sNet):
         dim_dwconv=32,
         input_type="basicns",
         codebook_size=16384,
-        num_coodbooks=1,
+        num_codebooks=1,
         **vq_kwargs,
     ):
         from .vq import ProductVectorQuantize
@@ -1487,15 +1608,18 @@ class Mix9sVQNet(Mix9sNet):
             input_type=input_type,
         )
         self.codebook_size = codebook_size
-        self.vq_layers = nn.ModuleList([
-            ProductVectorQuantize(
-                codebook_size=codebook_size,
-                dim_feature=dim_feature,
-                num_coodbooks=num_coodbooks,
-                **vq_kwargs,
-            )
-            for _ in range(2)
-        ])
+        self.num_codebooks = num_codebooks
+        self.vq_layers = nn.ModuleList(
+            [
+                ProductVectorQuantize(
+                    codebook_size=codebook_size,
+                    dim_feature=dim_feature,
+                    num_codebooks=num_codebooks,
+                    **vq_kwargs,
+                )
+                for _ in range(2)
+            ]
+        )
         self._cached_positions = None
 
     @torch.compiler.disable
@@ -1557,13 +1681,22 @@ class Mix9sVQNet(Mix9sNet):
         aux_outputs = {}
         if info_1 is not None and info_2 is not None:
             aux_losses = {"vq": (info_1["loss"] + info_2["loss"]) / 2}
-            cluster_size = (self.vq_layers[0].normalized_cluster_size + self.vq_layers[1].normalized_cluster_size) / 2
+            cluster_size = torch.cat(
+                [
+                    self.vq_layers[0].normalized_cluster_size,
+                    self.vq_layers[1].normalized_cluster_size,
+                ]
+            )
             aux_outputs = {
                 "vq_perplexity": (info_1["perplexity"] + info_2["perplexity"]) / 2,
-                "vq_normed_perplexity": (info_1["normalized_perplexity"] + info_2["normalized_perplexity"]) / 2,
+                "vq_normed_perplexity": (info_1["normalized_perplexity"] + info_2["normalized_perplexity"])
+                / 2,
+                "vq_cluster_size_q01": torch.quantile(cluster_size, q=0.01),
                 "vq_cluster_size_q10": torch.quantile(cluster_size, q=0.1),
                 "vq_cluster_size_q50": torch.quantile(cluster_size, q=0.5),
                 "vq_cluster_size_q90": torch.quantile(cluster_size, q=0.9),
+                "vq_cluster_size_q99": torch.quantile(cluster_size, q=0.99),
+                "vq_num_expired_codes": info_1["num_expired_codes"] + info_2["num_expired_codes"],
             }
 
         return feature_vq, aux_losses, aux_outputs
@@ -1907,24 +2040,31 @@ class Mix10Net(nn.Module):
         policy_small = self.policy_head_small(feature, value_small_feature)
         policy_large = self.policy_head_large(feature, value_large_feature)
 
-        aux_losses.update({
-            "value_small": ("value_loss", value_small),
-            "policy_small": ("policy_loss", policy_small),
-            "policy_small_reg": ("policy_reg", policy_small),
-            "value_large_uncertainty": ("value_uncertainty_loss", (value_large_uncertainty, value_large)),
-            "value_relative_uncertainty": (
-                "value_relative_uncertainty_loss",
-                (value_relative_uncertainty, value_small, value_large),
-            ),
-        })
-        aux_outputs.update({
-            "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
-            "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
-            "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
-            "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
-            "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
-            "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
-        })
+        aux_losses.update(
+            {
+                "value_small": ("value_loss", value_small),
+                "policy_small": ("policy_loss", policy_small),
+                "policy_small_reg": ("policy_reg", policy_small),
+                "value_large_uncertainty": (
+                    "value_uncertainty_loss",
+                    (value_large_uncertainty, value_large),
+                ),
+                "value_relative_uncertainty": (
+                    "value_relative_uncertainty_loss",
+                    (value_relative_uncertainty, value_small, value_large),
+                ),
+            }
+        )
+        aux_outputs.update(
+            {
+                "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
+                "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
+                "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
+                "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
+                "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
+                "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
+            }
+        )
         return value_large, policy_large, aux_losses, aux_outputs
 
     def forward_debug_print(self, data):
@@ -1958,24 +2098,31 @@ class Mix10Net(nn.Module):
         print(f"Raw Policy Small: \n{(policy_small[0, 0]*32).int()}")
         print(f"Raw Policy Large: \n{(policy_large[0, 0]*32).int()}")
 
-        aux_losses.update({
-            "value_small": ("value_loss", value_small),
-            "policy_small": ("policy_loss", policy_small),
-            "policy_small_reg": ("policy_reg", policy_small),
-            "value_large_uncertainty": ("value_uncertainty_loss", (value_large_uncertainty, value_large)),
-            "value_relative_uncertainty": (
-                "value_relative_uncertainty_loss",
-                (value_relative_uncertainty, value_small, value_large),
-            ),
-        })
-        aux_outputs.update({
-            "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
-            "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
-            "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
-            "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
-            "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
-            "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
-        })
+        aux_losses.update(
+            {
+                "value_small": ("value_loss", value_small),
+                "policy_small": ("policy_loss", policy_small),
+                "policy_small_reg": ("policy_reg", policy_small),
+                "value_large_uncertainty": (
+                    "value_uncertainty_loss",
+                    (value_large_uncertainty, value_large),
+                ),
+                "value_relative_uncertainty": (
+                    "value_relative_uncertainty_loss",
+                    (value_relative_uncertainty, value_small, value_large),
+                ),
+            }
+        )
+        aux_outputs.update(
+            {
+                "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
+                "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
+                "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
+                "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
+                "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
+                "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
+            }
+        )
         return value_large, policy_large, aux_losses, aux_outputs
 
     @property
