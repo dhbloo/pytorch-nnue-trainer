@@ -60,6 +60,44 @@ SERIALIZERS = Registry("serialization")
 import_submodules(__name__, recursive=False)
 
 
-def build_serializer(model_type, **kwargs) -> BaseSerializer:
+def get_rules_from_args(export_args: dict):
+    if "rule" in export_args:
+        rules = [export_args.pop("rule")]
+    elif "rule_list" in export_args:
+        rules = export_args.pop("rule_list")
+        assert isinstance(rules, list), f"rule_list must be a list of str, got {rules}"
+    else:
+        rules = export_args.pop("rules", ["freestyle", "standard", "renju"])
+    if len(rules) == 0:
+        raise ValueError("No supported rules specified")
+    for rule in rules:
+        if rule not in ["freestyle", "standard", "renju"]:
+            raise ValueError(f"Invalid rule {rule}, must be in [freestyle, standard, renju]")
+    return rules
+
+
+def get_boardsizes_from_args(export_args: dict):
+    if "board_size" in export_args:
+        boardsizes = [export_args.pop("board_size")]
+    elif "min_board_size" in export_args and "max_board_size" in export_args:
+        min_board_size = export_args.pop("min_board_size")
+        max_board_size = export_args.pop("max_board_size")
+        boardsizes = list(range(min_board_size, max_board_size + 1))
+    elif "board_size_list" in export_args:
+        boardsizes = export_args.pop("board_size_list")
+        assert isinstance(boardsizes, list), f"boardsizes={boardsizes}"
+    else:
+        boardsizes = export_args.pop("boardsizes", list(range(1, 32 + 1)))
+    for boardsize in boardsizes:
+        if not isinstance(boardsize, int):
+            raise ValueError(f"Invalid board size {boardsize}, must be int")
+        if not (1 <= boardsize <= 32):
+            raise ValueError(f"Invalid board size {boardsize}, must be in [1, 32]")
+    return boardsizes
+
+
+def build_serializer(model_type, **export_args) -> BaseSerializer:
     assert model_type in SERIALIZERS
-    return SERIALIZERS[model_type](**kwargs)
+    rules = get_rules_from_args(export_args)
+    boardsizes = get_boardsizes_from_args(export_args)
+    return SERIALIZERS[model_type](rules=rules, boardsizes=boardsizes, **export_args)

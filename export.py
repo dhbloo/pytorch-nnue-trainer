@@ -8,7 +8,7 @@ from datetime import datetime
 
 from dataset import build_dataset
 from model import build_model
-from model.serialization import build_serializer
+from model.serialization import build_serializer, get_rules_from_args, get_boardsizes_from_args
 from utils.training_utils import build_data_loader
 from utils.file_utils import find_latest_ckpt, load_torch_ckpt
 from utils.misc_utils import set_performance_level, deep_update_dict
@@ -49,40 +49,6 @@ def _get_default_output_filename(checkpoint, ext):
     checkpoint_dir, checkpoint_filename = os.path.split(checkpoint)
     checkpoint_name, checkpoint_ext = os.path.splitext(checkpoint_filename)
     return os.path.join(checkpoint_dir, f"{checkpoint_name}_export.{ext}")
-
-
-def _get_rules_from_args(export_args: dict):
-    if "rule" in export_args:
-        rules = [export_args["rule"]]
-    elif "rule_list" in export_args:
-        rules = export_args["rule_list"]
-        assert isinstance(rules, list), f"rule_list must be a list of str, got {rules}"
-    else:
-        rules = ["freestyle", "standard", "renju"]
-    if len(rules) == 0:
-        raise ValueError("No supported rules specified")
-    for rule in rules:
-        if rule not in ["freestyle", "standard", "renju"]:
-            raise ValueError(f"Invalid rule {rule}, must be in [freestyle, standard, renju]")
-    return rules
-
-
-def _get_boardsizes_from_args(export_args: dict):
-    if "board_size" in export_args:
-        boardsizes = [export_args["board_size"]]
-    elif "min_board_size" in export_args and "max_board_size" in export_args:
-        boardsizes = list(range(export_args["min_board_size"], export_args["max_board_size"] + 1))
-    elif "board_size_list" in export_args:
-        boardsizes = export_args["board_size_list"]
-        assert isinstance(boardsizes, list), f"boardsizes={boardsizes}"
-    else:
-        boardsizes = list(range(1, 32 + 1))
-    for boardsize in boardsizes:
-        if not isinstance(boardsize, int):
-            raise ValueError(f"Invalid board size {boardsize}, must be int")
-        if not (1 <= boardsize <= 32):
-            raise ValueError(f"Invalid board size {boardsize}, must be in [1, 32]")
-    return boardsizes
 
 
 def _get_sample_data(
@@ -252,8 +218,8 @@ def export_onnx(output, model, export_args, **kwargs):
 
     # Add metadata to the exported ONNX model
     io_version = model.get_io_version()
-    supported_rules = _get_rules_from_args(export_args)
-    supported_boardsizes = _get_boardsizes_from_args(export_args)
+    supported_rules = get_rules_from_args(export_args)
+    supported_boardsizes = get_boardsizes_from_args(export_args)
     onnx_model = onnx.load(output)
     onnx_model.model_version = make_onnx_model_version(io_version, supported_rules, supported_boardsizes)
     onnx_model.producer_name = "https://github.com/dhbloo/pytorch-nnue-trainer"

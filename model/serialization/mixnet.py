@@ -61,9 +61,15 @@ class Mix6NetSerializer(BaseSerializer):
     """
 
     def __init__(
-        self, rule="freestyle", board_size=None, side_to_move=None, feature_map_bound=4500, text_output=False, **kwargs
+        self,
+        rules,
+        boardsizes,
+        side_to_move=None,
+        feature_map_bound=4500,
+        text_output=False,
+        **kwargs,
     ):
-        super().__init__(rules=[rule], boardsizes=list(range(5, 23)) if board_size is None else [board_size], **kwargs)
+        super().__init__(rules, boardsizes, **kwargs)
         self.side_to_move = side_to_move
         self.line_length = 11
         self.text_output = text_output
@@ -188,7 +194,9 @@ class Mix6NetSerializer(BaseSerializer):
 
         conv_weight_max = np.abs(conv_weight).max()
         conv_bias_max = np.abs(conv_bias).max()
-        bound_perchannel = np.abs(conv_weight).sum((1, 2, 3)) * bound_perchannel[:PC] + np.abs(conv_bias) * scale
+        bound_perchannel = (
+            np.abs(conv_weight).sum((1, 2, 3)) * bound_perchannel[:PC] + np.abs(conv_bias) * scale
+        )
         conv_max = max(conv_weight_max * 2**15, conv_bias_max * scale)
         conv_scale = min(32766 / conv_max, 32766 / bound_perchannel.max())
         scale *= conv_scale
@@ -271,7 +279,9 @@ class Mix6NetSerializer(BaseSerializer):
         )
 
     def serialize(self, out: io.IOBase, model: Mix6Net, device):
-        feature_map, usage_flags, scale, bound = self._export_feature_map(model, device, stm=self.side_to_move)
+        feature_map, usage_flags, scale, bound = self._export_feature_map(
+            model, device, stm=self.side_to_move
+        )
         map_lr_slope_sub1div8, map_lr_bias, scale, bound_perchannel = self._export_mapping_activation(
             model, scale, bound
         )
@@ -438,14 +448,14 @@ class Mix7NetSerializer(BaseSerializer):
 
     def __init__(
         self,
-        rule="freestyle",
-        board_size=None,
+        rules,
+        boardsizes,
         text_output=False,
         feature_map_bound=6000,
         feature_bound_scale=1.0,
         **kwargs,
     ):
-        super().__init__(rules=[rule], boardsizes=list(range(5, 23)) if board_size is None else [board_size], **kwargs)
+        super().__init__(rules, boardsizes, **kwargs)
         self.line_length = 11
         self.text_output = text_output
         self.feature_map_bound = feature_map_bound
@@ -585,7 +595,9 @@ class Mix7NetSerializer(BaseSerializer):
             + f", bound = {quant_bound_perchannel.max()}"
         )
         assert conv_quant_max < 32767, f"feature dwconv weight overflow! ({conv_quant_max})"
-        assert quant_bound_perchannel.max() < 32767, f"feature dwconv overflow! ({quant_bound_perchannel.max()})"
+        assert (
+            quant_bound_perchannel.max() < 32767
+        ), f"feature dwconv overflow! ({quant_bound_perchannel.max()})"
 
         # transpose weight to [9][dim_feature]
         conv_weight_quant = conv_weight_quant.squeeze(1).transpose((1, 2, 0))
@@ -838,14 +850,15 @@ class Mix8NetSerializer(BaseSerializer):
     };
     """
 
-    def __init__(self, rule="freestyle", board_size=None, text_output=False, feature_bound_scale=1.0, **kwargs):
-        if board_size is None:
-            boardsizes = [15]
-        elif isinstance(board_size, (list, tuple)):
-            boardsizes = list(board_size)
-        else:
-            boardsizes = [board_size]
-        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+    def __init__(
+        self,
+        rules,
+        boardsizes,
+        text_output=False,
+        feature_bound_scale=1.0,
+        **kwargs,
+    ):
+        super().__init__(rules=rules, boardsizes=boardsizes, **kwargs)
         self.line_length = 11
         self.text_output = text_output
         self.feature_bound_scale = feature_bound_scale
@@ -978,7 +991,9 @@ class Mix8NetSerializer(BaseSerializer):
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
         conv_weight_max = np.abs(conv_weight_clipped).max()
         conv_bias_max = np.abs(conv_bias_clipped).max()
-        quant_bound = np.abs(conv_bias_clipped * quant_scale + np.abs(conv_weight_clipped).sum(1) * quant_bound)
+        quant_bound = np.abs(
+            conv_bias_clipped * quant_scale + np.abs(conv_weight_clipped).sum(1) * quant_bound
+        )
         quant_bound = self.feature_bound_scale * quant_bound
 
         conv_quant_max = max(conv_weight_max * 2**15, conv_bias_max * quant_scale)
@@ -1123,8 +1138,8 @@ class Mix8NetSerializer(BaseSerializer):
     def serialize(self, out: io.IOBase, model: Mix8Net, device):
         feature_map, usage_flags, quant_scale_direct, quant_bound = self._export_feature_map(model, device)
         map_prelu_weight = self._export_mapping_activation(model)
-        feat_dwconv_weight, feat_dwconv_bias, quant_scale_ftconv, quant_bound_perchannel = self._export_feature_dwconv(
-            model, quant_scale_direct, quant_bound
+        feat_dwconv_weight, feat_dwconv_bias, quant_scale_ftconv, quant_bound_perchannel = (
+            self._export_feature_dwconv(model, quant_scale_direct, quant_bound)
         )
         (
             policy_pwconv_layer_l1_weight,
@@ -1512,14 +1527,8 @@ class Mix9NetSerializer(BaseSerializer):
     };
     """
 
-    def __init__(self, rule="freestyle", board_size=None, text_output=False, **kwargs):
-        if board_size is None:
-            boardsizes = [15]
-        elif isinstance(board_size, (list, tuple)):
-            boardsizes = list(board_size)
-        else:
-            boardsizes = [board_size]
-        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+    def __init__(self, rules, boardsizes, text_output=False, **kwargs):
+        super().__init__(rules, boardsizes, **kwargs)
         self.line_length = 11
         self.text_output = text_output
         self.map_table_export_batch_size = 4096
@@ -1539,7 +1548,12 @@ class Mix9NetSerializer(BaseSerializer):
         assert dim_policy % 8 == 0, f"dim_policy must be a multiply of 8"
         assert dim_value % 8 == 0, f"dim_value must be a multiply of 8"
         assert dim_dwconv % 8 == 0, f"dim_dwconv must be a multiply of 8"
-        hash ^= (dim_feature // 8) | ((dim_policy // 8) << 8) | ((dim_value // 8) << 14) | ((dim_dwconv // 8) << 20)
+        hash ^= (
+            (dim_feature // 8)
+            | ((dim_policy // 8) << 8)
+            | ((dim_value // 8) << 14)
+            | ((dim_dwconv // 8) << 20)
+        )
         return hash
 
     def _export_map_table(self, model: Mix9Net, device, line, mapping_idx):
@@ -1610,7 +1624,9 @@ class Mix9NetSerializer(BaseSerializer):
         ascii_hist("feature dwconv bias", conv_bias)
 
         conv_weight_clipped = np.clip(conv_weight, a_min=-32768 / 65536, a_max=32767 / 65536)
-        conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
+        conv_bias_clipped = np.clip(
+            conv_bias, a_min=-64, a_max=64
+        )  # not too large, otherwise it may overflow
         weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
         conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
@@ -1631,7 +1647,9 @@ class Mix9NetSerializer(BaseSerializer):
 
     def _export_policy_pwconv(self, model: Mix9Net):
         if model.no_dynamic_pwconv:
-            dwconv_weight = model.policy_pwconv.conv.weight.cpu().squeeze().numpy()  # [PolicyPWConvDim, FeatureDim]
+            dwconv_weight = (
+                model.policy_pwconv.conv.weight.cpu().squeeze().numpy()
+            )  # [PolicyPWConvDim, FeatureDim]
             dwconv_bias = model.policy_pwconv.conv.bias.cpu().numpy()  # [PolicyPWConvDim]
         else:
             # policy pw conv dynamic weight layer 1
@@ -2031,14 +2049,8 @@ class Mix9svqNetSerializer(BaseSerializer):
     };
     """
 
-    def __init__(self, rule="freestyle", board_size=None, **kwargs):
-        if board_size is None:
-            boardsizes = [15]
-        elif isinstance(board_size, (list, tuple)):
-            boardsizes = list(board_size)
-        else:
-            boardsizes = [board_size]
-        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+    def __init__(self, rules, boardsizes, **kwargs):
+        super().__init__(rules, boardsizes, **kwargs)
         self.line_length = 11
         self.map_table_export_batch_size = 4096
 
@@ -2057,7 +2069,12 @@ class Mix9svqNetSerializer(BaseSerializer):
         assert dim_policy % 8 == 0, f"dim_policy must be a multiply of 8"
         assert dim_value % 8 == 0, f"dim_value must be a multiply of 8"
         assert dim_dwconv % 8 == 0, f"dim_dwconv must be a multiply of 8"
-        hash ^= (dim_feature // 8) | ((dim_policy // 8) << 8) | ((dim_value // 8) << 14) | ((dim_dwconv // 8) << 20)
+        hash ^= (
+            (dim_feature // 8)
+            | ((dim_policy // 8) << 8)
+            | ((dim_value // 8) << 14)
+            | ((dim_dwconv // 8) << 20)
+        )
         return hash
 
     def _export_map_table(self, model: Mix9sVQNet, device, line, mapping_idx):
@@ -2161,7 +2178,9 @@ class Mix9svqNetSerializer(BaseSerializer):
         ascii_hist("feature dwconv bias", conv_bias)
 
         conv_weight_clipped = np.clip(conv_weight, a_min=-32768 / 65536, a_max=32767 / 65536)
-        conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
+        conv_bias_clipped = np.clip(
+            conv_bias, a_min=-64, a_max=64
+        )  # not too large, otherwise it may overflow
         weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
         conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
@@ -2310,8 +2329,10 @@ class Mix9svqNetSerializer(BaseSerializer):
             original_num_bytes = features_i16.size * 2
             compressed_num_bytes = uint64_written * 8
             compression_rate = 100 * (compressed_num_bytes / original_num_bytes)
-            print(f"write feature compressed: {original_num_bytes} -> {compressed_num_bytes}"
-                  f" bytes ({compression_rate:.2f}%)")
+            print(
+                f"write feature compressed: {original_num_bytes} -> {compressed_num_bytes}"
+                f" bytes ({compression_rate:.2f}%)"
+            )
 
         # int16_t codebook[2][65536][FeatureDim];
         write_features_compressed(feature_codebook1)
@@ -2321,6 +2342,7 @@ class Mix9svqNetSerializer(BaseSerializer):
         def write_feature_index(feature_index):
             feature_index = feature_index.reshape(-1).astype("<u2")
             out.write(feature_index.tobytes())
+
         # int16_t mapping_index[2][ShapeNum];
         write_feature_index(feature_index1)
         write_feature_index(feature_index2)
@@ -2348,6 +2370,7 @@ class Mix9svqNetSerializer(BaseSerializer):
             out.write(weights[3].astype("<i4").tobytes())
             out.write(weights[4].astype("<i1").tobytes())
             out.write(weights[5].astype("<i4").tobytes())
+
         write_star_block(corner_weights)
         write_star_block(edge_weights)
         write_star_block(center_weights)
@@ -2438,14 +2461,8 @@ class Mix10NetSerializer(BaseSerializer):
     };
     """
 
-    def __init__(self, rule="freestyle", board_size=None, text_output=False, **kwargs):
-        if board_size is None:
-            boardsizes = [15]
-        elif isinstance(board_size, (list, tuple)):
-            boardsizes = list(board_size)
-        else:
-            boardsizes = [board_size]
-        super().__init__(rules=[rule], boardsizes=boardsizes, **kwargs)
+    def __init__(self, rules, boardsizes, text_output=False, **kwargs):
+        super().__init__(rules, boardsizes, **kwargs)
         self.line_length = 11
         self.text_output = text_output
         self.map_table_export_batch_size = 4096
@@ -2534,7 +2551,9 @@ class Mix10NetSerializer(BaseSerializer):
         ascii_hist("feature dwconv bias", conv_bias)
 
         conv_weight_clipped = np.clip(conv_weight, a_min=-32768 / 65536, a_max=32767 / 65536)
-        conv_bias_clipped = np.clip(conv_bias, a_min=-64, a_max=64)  # not too large, otherwise it may overflow
+        conv_bias_clipped = np.clip(
+            conv_bias, a_min=-64, a_max=64
+        )  # not too large, otherwise it may overflow
         weight_num_params_clipped = np.sum(conv_weight != conv_weight_clipped)
         bias_num_params_clipped = np.sum(conv_bias != conv_bias_clipped)
         conv_weight_quant = np.clip(np.around(conv_weight_clipped * 65536), -32768, 32767).astype(np.int16)
@@ -2580,7 +2599,7 @@ class Mix10NetSerializer(BaseSerializer):
             policy_output_weight / (128 * 128 * 128),
             policy_output_bias,
         )
-    
+
     def _export_policy_large_pwconv(self, model: Mix10Net):
         # policy pw conv dynamic weight layer 0
         sh_weight = model.policy_large_pwconv_weight_shared.fc.weight.cpu().numpy()
@@ -2673,11 +2692,13 @@ class Mix10NetSerializer(BaseSerializer):
         l3_weights = self._export_linear(model, "value_large_output[1]")
 
         if self.text_output:
+
             def write_mapping_table(name, mapping, usage_flags):
                 print(name, file=out)
                 print(usage_flags.sum(), file=out)
-                for i, (f, used) in tqdm(enumerate(zip(mapping.astype("i2"), usage_flags)), 
-                                         total=len(usage_flags)):
+                for i, (f, used) in tqdm(
+                    enumerate(zip(mapping.astype("i2"), usage_flags)), total=len(usage_flags)
+                ):
                     if used:
                         print(i, end=" ", file=out)
                         f.tofile(out, sep=" ")
@@ -2704,22 +2725,32 @@ class Mix10NetSerializer(BaseSerializer):
                 bias.astype("i4").tofile(out, sep=" ")
                 print(file=out)
 
-            print_linear_block("policy_small_pwconv_weight_l1", 
-                               policy_small_pwconv_weight_l1_weight, 
-                               policy_small_pwconv_weight_l1_bias)
-            print_linear_block("policy_small_pwconv_weight_l2",
-                               policy_small_pwconv_weight_l2_weight,
-                               policy_small_pwconv_weight_l2_bias)
-            
-            print_linear_block("policy_large_pwconv_weight_shared",
-                               policy_large_pwconv_weight_shared_weight,
-                               policy_large_pwconv_weight_shared_bias)
-            print_linear_block("policy_large_pwconv_weight_1",
-                               policy_large_pwconv_weight_1_weight,
-                               policy_large_pwconv_weight_1_bias)
-            print_linear_block("policy_large_pwconv_weight_2",
-                               policy_large_pwconv_weight_2_weight,
-                               policy_large_pwconv_weight_2_bias)
+            print_linear_block(
+                "policy_small_pwconv_weight_l1",
+                policy_small_pwconv_weight_l1_weight,
+                policy_small_pwconv_weight_l1_bias,
+            )
+            print_linear_block(
+                "policy_small_pwconv_weight_l2",
+                policy_small_pwconv_weight_l2_weight,
+                policy_small_pwconv_weight_l2_bias,
+            )
+
+            print_linear_block(
+                "policy_large_pwconv_weight_shared",
+                policy_large_pwconv_weight_shared_weight,
+                policy_large_pwconv_weight_shared_bias,
+            )
+            print_linear_block(
+                "policy_large_pwconv_weight_1",
+                policy_large_pwconv_weight_1_weight,
+                policy_large_pwconv_weight_1_bias,
+            )
+            print_linear_block(
+                "policy_large_pwconv_weight_2",
+                policy_large_pwconv_weight_2_weight,
+                policy_large_pwconv_weight_2_bias,
+            )
 
             print_linear_block("value_small_l1", *small_l1_weights)
             print_linear_block("value_small_l2", *small_l2_weights)
@@ -2791,7 +2822,9 @@ class Mix10NetSerializer(BaseSerializer):
             def write_linear(weight_and_bias, zero_padding=0):
                 weight, bias = weight_and_bias
                 if zero_padding > 0:
-                    weight = np.concatenate([weight, np.zeros((zero_padding, weight.shape[1]), dtype=np.int8)], axis=0)
+                    weight = np.concatenate(
+                        [weight, np.zeros((zero_padding, weight.shape[1]), dtype=np.int8)], axis=0
+                    )
                     bias = np.concatenate([bias, np.zeros((zero_padding,), dtype=np.int32)], axis=0)
                 o.write(weight.astype("<i1").tobytes())
                 o.write(bias.astype("<i4").tobytes())

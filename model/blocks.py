@@ -265,16 +265,16 @@ def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
 # Activation Layers
 
 
-def build_activation_layer(activation):
+def build_activation_layer(activation, inplace=False):
     if activation == "relu":
-        return nn.ReLU(inplace=True)
+        return nn.ReLU(inplace=inplace)
     elif activation == "lrelu":
-        return nn.LeakyReLU(0.1, inplace=True)
+        return nn.LeakyReLU(0.1, inplace=inplace)
     elif activation.startswith("lrelu/"):  # custom slope
         neg_slope = 1.0 / int(activation[6:])
-        return nn.LeakyReLU(neg_slope, inplace=True)
+        return nn.LeakyReLU(neg_slope, inplace=inplace)
     elif activation == "crelu":
-        return ClippedReLU(inplace=True)
+        return ClippedReLU(inplace=inplace)
     elif activation == "tanh":
         return nn.Tanh()
     elif activation == "sigmoid":
@@ -282,9 +282,9 @@ def build_activation_layer(activation):
     elif activation == "gelu":
         return nn.GELU()
     elif activation == "silu":
-        return nn.SiLU(inplace=True)
+        return nn.SiLU(inplace=inplace)
     elif activation == "mish":
-        return nn.Mish(inplace=True)
+        return nn.Mish(inplace=inplace)
     elif activation == "none":
         return None
     else:

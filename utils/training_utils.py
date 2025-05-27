@@ -77,41 +77,34 @@ def build_optimizer(
     if only_track_requires_grad:
         # only track parameters with requires_grad=True
         parameters = [p for p in parameters if p.requires_grad]
-        
+
     if optim_type == "adamw":
-        opt = optim.AdamW(
-            parameters,
-            lr=lr,
-            betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
-            eps=1e-8,
-            weight_decay=weight_decay,
-        )
+        args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay}
+        args.update(kwargs)
+        opt = optim.AdamW(parameters, **args)
     elif optim_type == "adamw-ams":
-        opt = optim.AdamW(
-            parameters,
-            lr=lr,
-            betas=(kwargs.get("beta1", 0.9), kwargs.get("beta2", 0.999)),
-            eps=1e-8,
-            weight_decay=weight_decay,
-            amsgrad=True,
-        )
+        args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay, "amsgrad": True}
+        args.update(kwargs)
+        opt = optim.AdamW(parameters, **args)
     elif optim_type == "sgd":
-        opt = optim.SGD(parameters, lr=lr, momentum=0, dampening=0, weight_decay=weight_decay)
-    elif optim_type == "sgd_momentum":
-        opt = optim.SGD(
-            parameters,
-            lr=lr,
-            momentum=kwargs.get("momentum", 0.9),
-            dampening=kwargs.get("dampening", 0.1),
-            weight_decay=weight_decay,
-        )
+        args = {"lr": lr, "momentum": 0, "dampening": 0, "weight_decay": weight_decay}
+        args.update(kwargs)
+        opt = optim.SGD(parameters, **args)
+    elif optim_type == "sgd-momentum":
+        args = {"lr": lr, "momentum": 0.9, "dampening": 0.1, "nesterov": False, "weight_decay": weight_decay}
+        args.update(kwargs)
+        opt = optim.SGD(parameters, **args)
+    elif optim_type == "sgd-nesterov":
+        args = {"lr": lr, "momentum": 0.9, "dampening": 0.1, "nesterov": True, "weight_decay": weight_decay}
+        args.update(kwargs)
+        opt = optim.SGD(parameters, **args)
     elif optim_type == "muon-adamw":
         from utils.muon import Muon, get_params_for_muon
         from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
 
         params_id_to_name = {id(p): name for name, p in model.named_parameters()}
         muon_params_id_set = set(id(p) for p in get_params_for_muon(model))
-        muon_args = {"weight_decay": 1e-2}
+        muon_args = {"weight_decay": max(1e-2, 0.0 if weight_decay is None else weight_decay)}
         muon_args.update(kwargs.pop("muon_args", {}))
         adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
         adamw_args.update(kwargs.pop("adamw_args", {}))

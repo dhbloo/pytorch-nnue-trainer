@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate.state import PartialState
-from accelerate.utils import gather, reduce
+from accelerate.utils import gather, gather_object, reduce
 from pykeops.torch import LazyTensor
 from torch import Tensor
 
@@ -113,9 +113,7 @@ def sample_vectors(inputs: Tensor, num_samples: int) -> Tensor:
     """Sample num_samples vectors from the input tensor (supports DDP)."""
     num_processes = PartialState().num_processes
     process_idx = PartialState().process_index
-    num_samples_per_rank, num_samples_remain = divmod(num_samples, num_processes)
-    if process_idx < num_samples_remain:
-        num_samples_per_rank += 1
+    num_samples_per_rank = (num_samples + num_processes - 1) // num_processes
 
     num_inputs, device = inputs.shape[0], inputs.device
     assert num_inputs > 0, "Can not sample empty input tensor"
@@ -124,8 +122,9 @@ def sample_vectors(inputs: Tensor, num_samples: int) -> Tensor:
     else:
         indices = torch.randint(0, num_inputs, (num_samples_per_rank,), device=device)
     sampled = inputs[indices]  # (num_sample_per_rank, dim_feature)
-    sampled = gather(sampled)  # (num_samples, dim_feature)
-    assert sampled.shape[0] == num_samples
+    sampled = gather(sampled)  # (>=num_samples, dim_feature)
+    assert sampled.shape[0] >= num_samples
+    sampled = sampled[:num_samples]  # (num_samples, dim_feature)
 
     return sampled
 
@@ -292,11 +291,11 @@ class VectorQuantize(nn.Module):
         self.register_buffer("cluster_size", torch.ones(codebook_size))
         if kmeans_init:
             embed = torch.zeros(codebook_size, dim_feature)
-            self._init_input_samples = (
+            self._init_input_samples_per_process = (
                 codebook_size * kmeans_sample_multiplier // PartialState().num_processes
             )
-            self._init_input_batches = []
-            self._init_input_count = 0
+            self._init_input_batches_this_process = []
+            self._init_input_count_this_process = 0
         elif use_simvq:
             embed = torch.randn(codebook_size, dim_feature) * (dim_feature**-0.5)
             self.inited.data.fill_(True)
@@ -324,21 +323,25 @@ class VectorQuantize(nn.Module):
         self.register_buffer("embed_avg", embed.clone())
 
     def _accumulate_input_batch(self, x):
-        num_samples_remain = self._init_input_samples - self._init_input_count
-        if x.shape[0] > num_samples_remain:
-            x = x[:num_samples_remain]
-        x = x.detach().clone()
-        self._init_input_batches.append(x)
-        self._init_input_count += x.shape[0]
+        num_samples_remain = self._init_input_samples_per_process - self._init_input_count_this_process
+        if num_samples_remain > 0:
+            if x.shape[0] > num_samples_remain:
+                x = x[:num_samples_remain]
+            x = x.detach().clone()
+            self._init_input_batches_this_process.append(x)
+            self._init_input_count_this_process += x.shape[0]
 
-        if self._init_input_count < self._init_input_samples:
+        # We need to make sure all process have enough inputs before we continue
+        has_enough_inputs = self._init_input_count_this_process >= self._init_input_samples_per_process
+        has_enough_inputs = gather_object([has_enough_inputs])
+        if not all(has_enough_inputs):
             return  # wait for more inputs
 
-        inputs = torch.cat(self._init_input_batches, dim=0)  # (num_samples, dim_feature)
+        inputs = torch.cat(self._init_input_batches_this_process, dim=0)  # (num_samples, dim_feature)
         # free up memory
-        del self._init_input_samples
-        del self._init_input_batches
-        del self._init_input_count
+        del self._init_input_samples_per_process
+        del self._init_input_batches_this_process
+        del self._init_input_count_this_process
         self._init_embed(inputs)
 
     @torch.no_grad()
@@ -399,7 +402,7 @@ class VectorQuantize(nn.Module):
             embed_sum = torch.zeros_like(self.embed_avg)  # (codebook_size, dim_feature)
             embed_sum.scatter_add_(0, embed_indices[:, None].expand(-1, self.dim_feature), x)
 
-            reduce(embed_sum, reduction="sum")  # (codebook_size, dim_feature)
+            embed_sum = reduce(embed_sum, reduction="sum")  # (codebook_size, dim_feature)
             ema_inplace(self.embed_avg, embed_sum, self.ema_decay)
 
             def laplace_smoothing(x, n_categories, eps=1e-5, dim=-1):
@@ -528,7 +531,7 @@ class VectorQuantize(nn.Module):
 
         # compute perplexity
         cluster_size = torch.bincount(embed_indices.view(-1), minlength=self.codebook_size)
-        reduce(cluster_size, reduction="sum")
+        cluster_size = reduce(cluster_size, reduction="sum")
         perplexity = compute_perplexity(cluster_size)
 
         # compute VQ losses

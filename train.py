@@ -581,7 +581,11 @@ def train(
 
             it += 1
             rows += batch_size
-            data["train_progress"] = it / iterations
+            data.update({
+                "train_iter": it,
+                "train_total_iter": iterations,
+                "train_progress": it / iterations,
+            })
 
             # evaulate teacher model for knowledge distillation
             with torch.no_grad(), nullcontext() if kd_disable_amp else accelerator.autocast():
