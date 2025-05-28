@@ -71,7 +71,7 @@ def parse_args_and_init():
     parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
     parser.add("--eval_bs_multipler", type=int, default=1, help="Eval batch size multipler")
     parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
-    parser.add("--weight_decay", type=float, default=0, help="Weight decay")
+    parser.add("--weight_decay", type=float, default=1e-2, help="Weight decay")
     parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
     parser.add("--clip_grad_value", type=float, help="Gradient clipping max value")
     parser.add("--no_shuffle", action="store_true", help="Do not shuffle dataset")

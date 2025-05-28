@@ -199,6 +199,7 @@ def post_process_data(
     fixed_board_size=None,
     symmetry_type=None,
     symmetry_index=None,
+    drop_extra=False,
 ) -> dict:
     """
     Apply post processing to the data dict that contains some numpy arrays.
@@ -220,6 +221,7 @@ def post_process_data(
             to the fixed board size.
         symmetry_type: The type of symmetry to apply to the data. False for no symmetry.
         symmetry_index: The index of the symmetry to apply to the data. None for random.
+        drop_extra: Drop extra data except for the core ndarray.
     """
     if fixed_side_input and data["stm_input"] > 0:
         # Flip side when stm is white
@@ -286,8 +288,18 @@ def post_process_data(
             )
 
         assert data["board_input"].shape == (board_channels, padded_h, padded_w)
-        assert data["policy_target"].shape == (padded_h, padded_w) or \
-            data["policy_target"].shape == (padded_h * padded_w + 1,)
+        assert data["policy_target"].shape == (padded_h, padded_w) or data["policy_target"].shape == (
+            padded_h * padded_w + 1,
+        )
+
+    if drop_extra:
+        keys_to_preserve = ["board_size", "board_input", "stm_input", "value_target", "policy_target"]
+        data = {k: data[k] for k in keys_to_preserve}
+
+    if "position" in data:
+        transformed_position = data.pop("position")
+        data["position_string"] = "".join([str(m) for m in transformed_position])
+        data["last_move"] = transformed_position[-1].pos
 
     return data
 

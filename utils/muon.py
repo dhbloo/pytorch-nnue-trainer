@@ -5,7 +5,27 @@ from torch.nn import Module, Parameter, Embedding
 from torch.optim.optimizer import required
 
 
-def zeropower_via_newtonschulz5(G: Tensor, steps: int, use_baddbmm: bool) -> Tensor:
+def get_bf16_support_set():
+    """Get the set of devices that supports bf16."""
+    bf16_support_set = set()
+
+    if not torch.cuda.is_available():
+        return bf16_support_set
+
+    device_count = torch.cuda.device_count()
+    if device_count == 0:
+        return bf16_support_set
+
+    for i in range(device_count):
+        device = torch.device(f"cuda:{i}")
+        major, minor = torch.cuda.get_device_capability(device)
+        if major >= 8:
+            bf16_support_set.add(device)
+
+    return bf16_support_set
+
+
+def zeropower_via_newtonschulz5(G: Tensor, steps: int, use_baddbmm: bool, use_bf16: bool) -> Tensor:
     """
     Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
     quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
@@ -15,11 +35,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int, use_baddbmm: bool) -> Ten
     where S' is diagonal with S_{ii}' ~ Uniform(0.5, 1.5), which turns out not to hurt model
     performance at all relative to UV^T, where USV^T = G is the SVD.
     """
-    assert (
-        G.ndim >= 2
-    )  # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
+    assert G.ndim >= 2
     a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.float()
+    X = G.bfloat16() if use_bf16 else G.float()
     if G.size(-2) > G.size(-1):
         X = X.mT
 
@@ -77,6 +96,7 @@ class Muon(torch.optim.Optimizer):
         nesterov=True,
         ns_steps=5,
         use_baddbmm=True,
+        use_bf16=False,
     ):
         defaults = dict(
             lr=lr,
@@ -84,9 +104,10 @@ class Muon(torch.optim.Optimizer):
             momentum=momentum,
             nesterov=nesterov,
             ns_steps=ns_steps,
-            use_baddbmm=use_baddbmm,
         )
         super().__init__(params, defaults)
+        self.use_baddbmm = use_baddbmm
+        self.bf16_support_set = get_bf16_support_set() if use_bf16 else set()
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -111,24 +132,29 @@ class Muon(torch.optim.Optimizer):
                 buf: Tensor = state["momentum_buffer"]
                 key = (p.shape, p.device, p.dtype)
                 if key not in shape_groups:
-                    shape_groups[key] = {"params": [], "grads": [], "buffers": []}
+                    shape_groups[key] = {"params": [], "grads": [], "momentum_buffers": []}
                 shape_groups[key]["params"].append(p)
                 shape_groups[key]["grads"].append(g)
-                shape_groups[key]["buffers"].append(buf)
+                shape_groups[key]["momentum_buffers"].append(buf)
             for key in shape_groups:
                 group_data = shape_groups[key]
                 g = torch.stack(group_data["grads"])
-                buf = torch.stack(group_data["buffers"])
-                buf.lerp_(g, 1 - group["momentum"])
-                g = g.lerp_(buf, group["momentum"]) if group["nesterov"] else buf
-                if g.ndim >= 4:  # for the case of conv filters
+                m = torch.stack(group_data["momentum_buffers"])
+                m.lerp_(g, 1 - group["momentum"])
+                g = g.lerp_(m, group["momentum"]) if group["nesterov"] else m
+                if g.ndim >= 4:  # for the case of 1d/2d conv filters
                     g = g.view(g.size(0), g.size(1), -1)
-                g = zeropower_via_newtonschulz5(g, steps=group["ns_steps"], use_baddbmm=group["use_baddbmm"])
+                g = zeropower_via_newtonschulz5(
+                    g,
+                    steps=group["ns_steps"],
+                    use_baddbmm=self.use_baddbmm,
+                    use_bf16=g.device in self.bf16_support_set,
+                )
                 for i, p in enumerate(group_data["params"]):
                     if group["weight_decay"] > 0:
                         p.data.mul_(1 - group["lr"] * group["weight_decay"])
                     p.data.add_(g[i].view_as(p), alpha=-group["lr"] * max(g[i].size()) ** 0.5)
-                    self.state[p]["momentum_buffer"] = buf[i].clone()
+                    self.state[p]["momentum_buffer"] = m[i].clone()
 
         return loss
 
@@ -148,8 +174,11 @@ def get_params_for_muon(model: Module) -> list[Parameter]:
         for name, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
                 continue
-            if param.dim() >= 2 and not isinstance(module, Embedding) \
-                and not name.endswith(("emb", "embed", "embedding")):
+            if (
+                param.dim() >= 2
+                and not isinstance(module, Embedding)
+                and not name.endswith(("emb", "embed", "embedding"))
+            ):
                 muon_params.append(param)
 
     return muon_params

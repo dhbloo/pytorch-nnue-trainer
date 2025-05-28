@@ -79,6 +79,7 @@ class SimpleBinaryDataset(IterableDataset):
         fixed_side_input: bool = False,
         fixed_board_size: None | tuple[int, int] = None,
         apply_symmetry: bool = False,
+        drop_extra: bool = False,
         shuffle: bool = False,
         sample_rate: float = 1.0,
         max_worker_per_file: int = 2,
@@ -91,6 +92,7 @@ class SimpleBinaryDataset(IterableDataset):
         self.fixed_side_input = fixed_side_input
         self.fixed_board_size = fixed_board_size
         self.apply_symmetry = apply_symmetry
+        self.drop_extra = drop_extra
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.max_worker_per_file = max_worker_per_file
@@ -152,10 +154,13 @@ class SimpleBinaryDataset(IterableDataset):
             "position": position,
             "ply": ply,
         }
-        data = post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
-        transformed_position = data.pop("position")
-        data["position_string"] = "".join([str(m) for m in transformed_position])
-        data["last_move"] = transformed_position[-1].pos
+        data = post_process_data(
+            data,
+            fixed_side_input=self.fixed_side_input,
+            fixed_board_size=self.fixed_board_size,
+            symmetry_type=self.apply_symmetry,
+            drop_extra=self.drop_extra,
+        )
         return data
 
     def __iter__(self):
