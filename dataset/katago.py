@@ -254,6 +254,9 @@ class ProcessedKatagoNumpyDataset(Dataset):
         apply_symmetry: bool = False,
         filter_stm: int | None = None,
         filter_condition: str | None = None,
+        board_input_channels: list[int] | None = None,
+        stm_input_channel: int | None = None,
+        value_target_channels: list[int] | None = None,
         **kwargs,
     ):
         super().__init__()
@@ -314,6 +317,15 @@ class ProcessedKatagoNumpyDataset(Dataset):
             self.length = filter_data_by_condition(f"gf[:, 0] == {filter_stm}", self.data_dict)
         if filter_condition is not None:
             self.length = filter_data_by_condition(filter_condition, self.data_dict)
+
+        # Select a subset of channels if specified
+        if board_input_channels is not None:
+            self.data_dict["bf"] = self.data_dict["bf"][:, board_input_channels]
+        if stm_input_channel is not None:
+            assert "gf" in self.data_dict, "Specified stm_input_channel but no gf in data dict!"
+            self.data_dict["gf"] = self.data_dict["gf"][:, stm_input_channel]
+        if value_target_channels is not None:
+            self.data_dict["vt"] = self.data_dict["vt"][:, value_target_channels]
 
     @property
     def is_fixed_side_input(self):

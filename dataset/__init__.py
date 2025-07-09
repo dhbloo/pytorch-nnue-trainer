@@ -1,4 +1,4 @@
-import random
+import numpy as np
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.file_utils import make_file_list
 from utils.misc_utils import Registry, import_submodules
@@ -10,6 +10,7 @@ import_submodules(__name__, recursive=False)
 
 def _read_multi_dataset(file_list: list[str], dataset_dict: dict[str, dict], **kwargs):
     datasets = []
+    blend_ratios = []
     for dataset_name, dataset_args in dataset_dict.items():
         dataset_type = dataset_args.pop("dataset_type")
         assert dataset_type in DATASETS, f"Invalid dataset type in {dataset_name}: {dataset_type}"
@@ -22,10 +23,15 @@ def _read_multi_dataset(file_list: list[str], dataset_dict: dict[str, dict], **k
             data_paths = [data_paths]
         else:
             assert isinstance(data_paths, list), f"data_paths in {dataset_name} must be list of str"
+
+        blend_ratio = float(dataset_args.pop("blend_ratio", 1.0))
+        blend_ratios.append(blend_ratio)
+
         flist = make_file_list(data_paths, dataset_cls.FILE_EXTS)
         dataset = dataset_cls(file_list=flist, **kwargs, **dataset_args)
         datasets.append(dataset)
-    return datasets
+    
+    return datasets, blend_ratios
 
 
 @DATASETS.register("multi")
@@ -35,7 +41,7 @@ class MultiDataset(Dataset):
     def __init__(self, file_list: list[str], dataset_dict: dict[str, dict], **kwargs) -> None:
         super().__init__()
         self.fixed_side_input = kwargs.get("fixed_side_input", False)
-        self.datasets = _read_multi_dataset(file_list, dataset_dict, **kwargs)
+        self.datasets, _ = _read_multi_dataset(file_list, dataset_dict, **kwargs)
         # check if all datasets have __len__ and __getitem__ method
         assert all(
             hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__") for dataset in self.datasets
@@ -66,7 +72,7 @@ class MultiIterativeDataset(IterableDataset):
         super().__init__()
         self.fixed_side_input = kwargs.get("fixed_side_input", False)
         self.sync_length = sync_length
-        self.datasets = _read_multi_dataset(file_list, dataset_dict, **kwargs)
+        self.datasets, self.blend_ratios = _read_multi_dataset(file_list, dataset_dict, **kwargs)
         # check if all datasets have __iter__ method
         assert all(
             hasattr(dataset, "__iter__") for dataset in self.datasets
@@ -81,20 +87,33 @@ class MultiIterativeDataset(IterableDataset):
         return all(map(lambda d: d.is_internal_shuffleable, self.datasets))
 
     def __iter__(self):
+        def normalize_array(arr):
+            arr_total = sum(arr)
+            assert arr_total > 0.0, f"Sum of the array should be positive!"
+            return [x / arr_total for x in arr]
+
         dataset_iters = [iter(ds) for ds in self.datasets]
+        blend_ratios = normalize_array(self.blend_ratios)
         sync_length_flag = False
+
+        def remove_at(idx):
+            nonlocal dataset_iters, blend_ratios
+            del dataset_iters[idx], blend_ratios[idx]
+            if len(blend_ratios) > 0:
+                blend_ratios = normalize_array(blend_ratios)  # re-normalize blend ratios
+
         while len(dataset_iters) > 0:
             # randomly select a dataset to get one data entry
-            idx = random.randint(0, len(dataset_iters) - 1)
+            idx = np.random.choice(len(dataset_iters), p=blend_ratios)
             dataset_iter = dataset_iters[idx]
 
             try:
                 data = next(dataset_iter)
                 yield data
                 if sync_length_flag:
-                    del dataset_iters[idx]  # remove the unfinished dataset if sync_length_flag is True
+                    remove_at(idx)  # remove the unfinished dataset if sync_length_flag is True
             except StopIteration:
-                del dataset_iters[idx]  # remove the exhausted dataset
+                remove_at(idx)  # remove the exhausted dataset
                 if self.sync_length:  # only take common length part
                     sync_length_flag = True
 

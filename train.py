@@ -140,9 +140,6 @@ def calc_loss(
     kd_alpha=1.0,
     policy_reg_lambda=0,
     value_policy_ratio=1,
-    ignore_forbidden_point_policy=False,
-    value_focal_gamma=0,
-    policy_focal_gamma=0,
     **extra_args,
 ):
     value_loss_type, policy_loss_type = loss_type.split("+")
@@ -197,7 +194,11 @@ def calc_loss(
         if value_loss_type == "KL":
             return cross_entropy_with_softlabel(value, value_target, use_kl_divergence=True)
         elif value_loss_type == "CE":
-            return cross_entropy_with_softlabel(value, value_target, focal_gamma=value_focal_gamma)
+            return cross_entropy_with_softlabel(
+                value,
+                value_target,
+                focal_gamma=extra_args.get("value_focal_gamma", 0),
+            )
         elif value_loss_type == "MSE":
             if value.ndim == 1:
                 return F.mse_loss(torch.sigmoid(value), value_target)
@@ -213,7 +214,7 @@ def calc_loss(
     # policy loss
     def get_policy_loss(policy: torch.Tensor) -> torch.Tensor:
         # check if there is loss weight for policy at each empty cells
-        if ignore_forbidden_point_policy:
+        if extra_args.get("ignore_forbidden_point_policy", False):
             forbidden_point = torch.flatten(data["forbidden_point"], start_dim=1)  # [B, H*W]
             policy_loss_weight = 1.0 - forbidden_point.float()  # [B, H*W]
         else:
@@ -231,7 +232,7 @@ def calc_loss(
                 policy,
                 policy_target,
                 weight=policy_loss_weight,
-                focal_gamma=policy_focal_gamma,
+                focal_gamma=extra_args.get("policy_focal_gamma", 0),
             )
         elif policy_loss_type == "MSE":
             policy_softmaxed = torch.softmax(policy, dim=1)
@@ -301,7 +302,7 @@ def calc_loss(
         "policy_loss": policy_loss.detach(),
     }
 
-    if policy_reg_lambda > 0:
+    if float(policy_reg_lambda) > 0:
         policy_reg = get_policy_reg_loss(policy, board_mask)
         total_loss += float(policy_reg_lambda) * policy_reg
         loss_dict["policy_reg"] = policy_reg.detach()
@@ -352,9 +353,7 @@ def calc_loss(
             results,
             policy_reg_lambda=policy_reg_lambda,
             value_policy_ratio=value_policy_ratio,
-            ignore_forbidden_point_policy=ignore_forbidden_point_policy,
-            value_focal_gamma=value_focal_gamma,
-            policy_focal_gamma=policy_focal_gamma,
+            **extra_args,
         )
 
         # merge real loss and knowledge distillation loss
@@ -581,11 +580,13 @@ def train(
 
             it += 1
             rows += batch_size
-            data.update({
-                "train_iter": it,
-                "train_total_iter": iterations,
-                "train_progress": it / iterations,
-            })
+            data.update(
+                {
+                    "train_iter": it,
+                    "train_total_iter": iterations,
+                    "train_progress": it / iterations,
+                }
+            )
 
             # evaulate teacher model for knowledge distillation
             with torch.no_grad(), nullcontext() if kd_disable_amp else accelerator.autocast():

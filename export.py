@@ -216,6 +216,15 @@ def export_onnx(output, model, export_args, **kwargs):
         dynamo=export_args.get("onnx_use_dynamo", False),
     )
 
+    # Run OnnxSlim if available
+    try:
+        import onnxslim
+
+        print("Running onnxslim to optimize the model...")
+        onnxslim.slim(output, output)
+    except:
+        pass
+
     # Add metadata to the exported ONNX model
     io_version = model.get_io_version()
     supported_rules = get_rules_from_args(export_args)
@@ -234,14 +243,6 @@ def export_onnx(output, model, export_args, **kwargs):
         f"\nir_version={onnx_model.ir_version} "
     )
 
-    # Run OnnxSlim if available
-    try:
-        import onnxslim
-
-        print("Running onnxslim to optimize the model...")
-        onnxslim.slim(output, output)
-    except:
-        pass
     print(f"Onnx model has been exported to {output}.")
 
 
