@@ -27,7 +27,7 @@ def parse_args_and_init():
     parser.add("--board_width", type=int, default=15, help="Board width")
     parser.add("--board_height", type=int, default=15, help="Board height")
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
-    parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
+    parser.add("--data_pipelines", type=yaml.safe_load, default={}, help="Data-pipeline arguments")
 
     args, _ = parser.parse_known_args()  # parse args
 
@@ -164,6 +164,7 @@ def debug_print(board, model, data):
         if isinstance(data[k], torch.Tensor):
             data[k] = torch.unsqueeze(data[k], dim=0)
 
+    # get predicted value and policy from model results
     if hasattr(model, "forward_debug_print"):
         torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
         with torch.no_grad():
@@ -171,30 +172,49 @@ def debug_print(board, model, data):
     else:
         with torch.no_grad():
             value, policy, *retvals = model(data)
+    aux_losses = retvals[0] if len(retvals) >= 1 else None
+    aux_outputs = retvals[1] if len(retvals) >= 2 else None
 
-    # remove batch dimension
-    value = value.squeeze(0)
-    policy = policy.squeeze(0)
-    with np.printoptions(precision=4, linewidth=120, suppress=True):
-        print(f"Raw Value: {value.cpu().numpy()}")
-    with np.printoptions(precision=2, linewidth=120, suppress=True):
-        print(f"Raw Policy: \n{policy.cpu().numpy()}")
+    def print_value(value: torch.Tensor) -> torch.Tensor:
+        value = value.squeeze(0)  # remove batch dimension
 
-    # apply activation function
-    if value.shape[0] == 1:
-        value = torch.sigmoid(value)
-    elif value.shape[0] == 3:
-        value = torch.softmax(value, dim=0)
-    else:
-        raise ValueError(f"Invalid value shape: {value.shape}")
-    policy = torch.softmax(policy.flatten(), dim=0).reshape(policy.shape)
-    with np.printoptions(precision=4, linewidth=120, suppress=True):
+        # apply activation function
         if value.shape[0] == 1:
-            print(f"Sigmoided Value: {value.cpu().numpy()}")
+            value_softmaxed = torch.sigmoid(value)
         elif value.shape[0] == 3:
-            print(f"Softmaxed Value: {value.cpu().numpy()}")
-    with np.printoptions(precision=2, linewidth=120, suppress=True):
-        print(f"Softmaxed Policy: \n{policy.cpu().numpy()}")
+            value_softmaxed = torch.softmax(value, dim=0)
+        else:
+            raise ValueError(f"Invalid value shape: {value.shape}")
+
+        with np.printoptions(precision=4, linewidth=120, suppress=True):
+            print(f"Raw Value: {value.cpu().numpy()}")
+        with np.printoptions(precision=4, linewidth=120, suppress=True):
+            print(f"Softmaxed Value: {value_softmaxed.cpu().numpy()}")
+
+    def print_policy(policy: torch.Tensor) -> torch.Tensor:
+        policy = policy.squeeze(0)  # remove batch dimension
+        policy_softmaxed = torch.softmax(policy.flatten(), dim=0).reshape_as(policy)
+
+        with np.printoptions(precision=2, linewidth=120, suppress=True):
+            print(f"Raw Policy: \n{policy.cpu().numpy()}")
+        with np.printoptions(precision=2, linewidth=120, suppress=True):
+            print(f"Softmaxed Policy: \n{policy_softmaxed.cpu().numpy()}")
+
+    print("=====Main Value Output=====")
+    print_value(value)
+    print("=====Main Policy Output=====")
+    print_policy(policy)
+
+    if aux_losses:
+        for aux_name, aux_loss in aux_losses.items():
+            if isinstance(aux_loss, tuple) and len(aux_loss) == 2:
+                aux_loss_type, aux_loss_input = aux_loss
+                if aux_loss_type == "value_loss":
+                    print(f"=====Aux Value Output: {aux_name}=====")
+                    print_value(aux_loss_input)
+                elif aux_loss_type == "policy_loss":
+                    print(f"=====Aux Policy Output: {aux_name}=====")
+                    print_policy(aux_loss_input)
 
 
 def input_move():

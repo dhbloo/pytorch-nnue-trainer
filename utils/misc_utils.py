@@ -118,7 +118,7 @@ def ascii_hist(name, x, bins=10, width=60):
     N, X = np.histogram(x, bins=bins)
     nmax = N.max()
 
-    print(name + f", min={x.min():.4f}, max={x.max():.4f}")
+    print(name + f", shape={x.shape}, min={x.min():.4f}, max={x.max():.4f}")
     for xi, n in zip(X, N):
         bar = "#" * int(n * 1.0 * width / nmax)
         xi = "{0: <8.4g}".format(xi).ljust(10)

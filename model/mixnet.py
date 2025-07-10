@@ -1714,14 +1714,16 @@ class Mix10Net(nn.Module):
         dim_middle=128,
         dim_feature=64,
         dim_dwconv=32,
+        dim_value=64,
         input_type="basicns",
         spherical_feature=False,
     ):
         super().__init__()
-        self.model_size = (dim_middle, dim_feature, dim_dwconv)
+        self.model_size = (dim_middle, dim_feature, dim_dwconv, dim_value)
         self.input_type = input_type
         self.spherical_feature = spherical_feature
         assert dim_dwconv <= dim_feature, f"Invalid dim_dwconv {dim_dwconv}"
+        assert dim_value <= dim_feature, f"Invalid dim_value {dim_value}"
 
         self.input_plane = build_input_plane(input_type)
         dim_input = self.input_plane.dim_plane
@@ -1754,9 +1756,12 @@ class Mix10Net(nn.Module):
         dim_policy_small_in = max(dim_dwconv // 2, 16)
         dim_policy_small_out = max(dim_dwconv // 4, 16)
         self.policy_small_pwconv_weight = nn.Sequential(
-            LinearBlock(dim_feature, dim_feature, quant=True),
+            LinearBlock(dim_value, dim_value, quant=True),
             LinearBlock(
-                dim_feature, dim_policy_small_out * (dim_policy_small_in + 1), activation="none", quant=True
+                dim_value,
+                dim_policy_small_out * (dim_policy_small_in + 1),
+                activation="none",
+                quant=True,
             ),
         )
         self.policy_small_output = nn.Conv2d(dim_policy_small_out, 1, 1)
@@ -1765,15 +1770,15 @@ class Mix10Net(nn.Module):
         dim_policy_large_in = max(dim_dwconv, 16)
         dim_policy_large_mid = max(dim_dwconv // 2, 16)
         dim_policy_large_out = max(dim_dwconv // 4, 16)
-        self.policy_large_pwconv_weight_shared = LinearBlock(dim_feature, dim_feature * 2, quant=True)
+        self.policy_large_pwconv_weight_0 = LinearBlock(dim_value, dim_value, quant=True)
         self.policy_large_pwconv_weight_1 = LinearBlock(
-            dim_feature * 2,
+            dim_value,
             dim_policy_large_mid * (dim_policy_large_in + 1),
             activation="none",
             quant=True,
         )
         self.policy_large_pwconv_weight_2 = LinearBlock(
-            dim_feature * 2,
+            dim_value,
             dim_policy_large_out * (dim_policy_large_mid + 1),
             activation="none",
             quant=True,
@@ -1782,26 +1787,23 @@ class Mix10Net(nn.Module):
 
         # value head small
         self.value_linear_small = nn.Sequential(
-            LinearBlock(dim_feature, dim_feature, quant=True),
-            LinearBlock(dim_feature, dim_feature, quant=True),
+            LinearBlock(dim_feature, dim_value, quant=True),
+            LinearBlock(dim_value, dim_value, quant=True),
         )
-        self.value_small_output = nn.Sequential(
-            LinearBlock(dim_feature, 32, quant=True),
-            LinearBlock(32, 4, activation="none", quant=True),
-        )
+        self.value_small_output = LinearBlock(dim_value, 3, activation="none", quant=True)
 
         # value head large
-        self.value_gate = LinearBlock(dim_feature, dim_feature * 2, activation="none", quant=True)
-        self.value_corner = LinearBlock(dim_feature, dim_feature, quant=True)
-        self.value_edge = LinearBlock(dim_feature, dim_feature, quant=True)
-        self.value_center = LinearBlock(dim_feature, dim_feature, quant=True)
-        self.value_quad = LinearBlock(dim_feature, dim_feature, quant=True)
+        self.value_gate = LinearBlock(dim_value, dim_feature * 2, activation="none", quant=True)
+        self.value_corner = LinearBlock(dim_feature, dim_value, quant=True)
+        self.value_edge = LinearBlock(dim_feature, dim_value, quant=True)
+        self.value_center = LinearBlock(dim_feature, dim_value, quant=True)
+        self.value_quad = LinearBlock(dim_value, dim_value, quant=True)
 
-        self.value_linear_large = LinearBlock(dim_feature * 5, dim_feature, quant=True)
-        self.value_large_output = nn.Sequential(
-            LinearBlock(dim_feature, 32, quant=True),
-            LinearBlock(32, 4, activation="none", quant=True),
+        self.value_linear_large = nn.Sequential(
+            LinearBlock(dim_value * 5, dim_value, quant=True),
+            LinearBlock(dim_value, dim_value, quant=True),
         )
+        self.value_large_output = LinearBlock(dim_value, 3, activation="none", quant=True)
 
     def initialize(self):
         self.feature_dwconv.conv.weight.data.mul_(0.25)
@@ -1819,29 +1821,29 @@ class Mix10Net(nn.Module):
                 "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
             }
         )  # [B, 2, H, W]
+
         # get per-point 4-direction cell features
         feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
         feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
         feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
-
         # normalize feature onto hypersphere of radius 16
         if self.spherical_feature:
             feature = F.normalize(feature, p=2, dim=2) * (511 / 32)
-        feature = torch.clamp(feature, min=-511 / 32, max=511 / 32)  # int16, scale=32, [-16,16]
+        feature = torch.clamp(feature, min=-511 / 32, max=511 / 32)  # [-511/32,511/32]
 
         # do feature quantization
         feature, aux_losses, aux_outputs = self.do_feature_quantization(feature, data)
 
         # clamp feature for int quantization
-        feature = torch.clamp(feature, min=-16, max=511 / 32)  # int16, scale=32, [-16,16]
-        feature = fake_quant(feature, scale=32, num_bits=16)
+        feature = torch.clamp(feature, min=-16, max=511 / 32)  # [-512/32,511/32]
+        feature = fake_quant(feature, scale=32, num_bits=16)  # int16, scale=32, [-16,511/32]
         # sum (and rescale) feature across four directions
         feature = torch.mean(feature, dim=1)  # [B, dim_feature, H, W] int16, scale=128, [-16,16]
         # apply relu activation
         feature = F.relu(feature)  # [B, dim_feature, H, W] int16, scale=128, [0,16]
 
         # apply feature depth-wise conv
-        _, _, dim_dwconv = self.model_size
+        _, _, dim_dwconv, _ = self.model_size
         feat_dwconv = feature[:, :dim_dwconv]  # int16, scale=128, [0,16]
         feat_dwconv = self.feature_dwconv(feat_dwconv * 4)  # [B, dwconv, H, W] relu
         feat_dwconv = fake_quant(feat_dwconv, scale=128, num_bits=16)  # int16, scale=128, [0,9/2*16*4]
@@ -1860,14 +1862,12 @@ class Mix10Net(nn.Module):
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
 
         # (shared) small value head
-        value_small_feature = self.value_linear_small(feature_sum)
+        value_small_feature = self.value_linear_small(feature_sum)  # [B, dim_value]
 
         # small value output head
-        value_and_rel_uncertainty = self.value_small_output(value_small_feature)  # [B, 4]
-        value = value_and_rel_uncertainty[:, :3]  # [B, 3]
-        relative_uncertainty = value_and_rel_uncertainty[:, 3]  # [B]
+        value = self.value_small_output(value_small_feature)  # [B, 3]
 
-        return value, relative_uncertainty, value_small_feature
+        return value, value_small_feature
 
     def value_head_large(self, feature, value_small_feature):
         # value modulation
@@ -1890,24 +1890,24 @@ class Mix10Net(nn.Module):
         H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
         H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
         H3, W3 = H, W
-        feature_00 = get_group_feature(H0, H1, W0, W1, feature_mod)  # [B, dim_group]
-        feature_01 = get_group_feature(H0, H1, W1, W2, feature_mod)  # [B, dim_group]
-        feature_02 = get_group_feature(H0, H1, W2, W3, feature_mod)  # [B, dim_group]
-        feature_10 = get_group_feature(H1, H2, W0, W1, feature_mod)  # [B, dim_group]
-        feature_11 = get_group_feature(H1, H2, W1, W2, feature_mod)  # [B, dim_group]
-        feature_12 = get_group_feature(H1, H2, W2, W3, feature_mod)  # [B, dim_group]
-        feature_20 = get_group_feature(H2, H3, W0, W1, feature_mod)  # [B, dim_group]
-        feature_21 = get_group_feature(H2, H3, W1, W2, feature_mod)  # [B, dim_group]
-        feature_22 = get_group_feature(H2, H3, W2, W3, feature_mod)  # [B, dim_group]
-        value_00 = self.value_corner(feature_00)
-        value_01 = self.value_edge(feature_01)
-        value_02 = self.value_corner(feature_02)
-        value_10 = self.value_edge(feature_10)
-        value_11 = self.value_center(feature_11)
-        value_12 = self.value_edge(feature_12)
-        value_20 = self.value_corner(feature_20)
-        value_21 = self.value_edge(feature_21)
-        value_22 = self.value_corner(feature_22)
+        feature_00 = get_group_feature(H0, H1, W0, W1, feature_mod)  # [B, dim_feature]
+        feature_01 = get_group_feature(H0, H1, W1, W2, feature_mod)  # [B, dim_feature]
+        feature_02 = get_group_feature(H0, H1, W2, W3, feature_mod)  # [B, dim_feature]
+        feature_10 = get_group_feature(H1, H2, W0, W1, feature_mod)  # [B, dim_feature]
+        feature_11 = get_group_feature(H1, H2, W1, W2, feature_mod)  # [B, dim_feature]
+        feature_12 = get_group_feature(H1, H2, W2, W3, feature_mod)  # [B, dim_feature]
+        feature_20 = get_group_feature(H2, H3, W0, W1, feature_mod)  # [B, dim_feature]
+        feature_21 = get_group_feature(H2, H3, W1, W2, feature_mod)  # [B, dim_feature]
+        feature_22 = get_group_feature(H2, H3, W2, W3, feature_mod)  # [B, dim_feature]
+        value_00 = self.value_corner(feature_00)  # [B, dim_value]
+        value_01 = self.value_edge(feature_01)  # [B, dim_value]
+        value_02 = self.value_corner(feature_02)  # [B, dim_value]
+        value_10 = self.value_edge(feature_10)  # [B, dim_value]
+        value_11 = self.value_center(feature_11)  # [B, dim_value]
+        value_12 = self.value_edge(feature_12)  # [B, dim_value]
+        value_20 = self.value_corner(feature_20)  # [B, dim_value]
+        value_21 = self.value_edge(feature_21)  # [B, dim_value]
+        value_22 = self.value_corner(feature_22)  # [B, dim_value]
 
         value_q00 = avg4(value_00, value_01, value_10, value_11)
         value_q01 = avg4(value_01, value_02, value_11, value_12)
@@ -1918,17 +1918,19 @@ class Mix10Net(nn.Module):
         value_q10 = self.value_quad(value_q10)
         value_q11 = self.value_quad(value_q11)
 
+        # (shared) large value head
         value_large_feature = torch.cat(
             [value_small_feature, value_q00, value_q01, value_q10, value_q11], dim=1
-        )  # [B, dim_feature * 5]
+        )  # [B, dim_value * 5]
         value_large_feature = self.value_linear_large(value_large_feature)  # [B, dim_feature]
-        value_and_uncertainty = self.value_large_output(value_large_feature)  # [B, 4]
-        value = value_and_uncertainty[:, :3]  # [B, 3]
-        uncertainty = value_and_uncertainty[:, 3]  # [B]
-        return value, uncertainty, value_large_feature
+
+        # large value output head
+        value = self.value_large_output(value_large_feature)  # [B, 3]
+
+        return value, value_large_feature
 
     def policy_head_small(self, feature, value_small_feature):
-        _, _, dim_dwconv = self.model_size
+        _, _, dim_dwconv, _ = self.model_size
         dim_policy_small_in = max(dim_dwconv // 2, 16)
         dim_policy_small_out = max(dim_dwconv // 4, 16)
         num_policy_weight = dim_policy_small_in * dim_policy_small_out
@@ -1963,7 +1965,7 @@ class Mix10Net(nn.Module):
         return policy
 
     def policy_head_large(self, feature, value_small_feature):
-        _, _, dim_dwconv = self.model_size
+        _, _, dim_dwconv, _ = self.model_size
         dim_policy_large_in = max(dim_dwconv, 16)
         dim_policy_large_mid = max(dim_dwconv // 2, 16)
         dim_policy_large_out = max(dim_dwconv // 4, 16)
@@ -1971,7 +1973,7 @@ class Mix10Net(nn.Module):
         num_policy_weight_2 = dim_policy_large_mid * dim_policy_large_out
 
         B, _, H, W = feature.shape
-        pwconv_shared = self.policy_large_pwconv_weight_shared(value_small_feature)
+        pwconv_shared = self.policy_large_pwconv_weight_0(value_small_feature)
         pwconv_output_1 = self.policy_large_pwconv_weight_1(pwconv_shared)
         pwconv_weight_1 = pwconv_output_1[:, :num_policy_weight_1].reshape(B, num_policy_weight_1, 1, 1)
         pwconv_weight_1 = fake_quant(pwconv_weight_1, scale=128 * 128, num_bits=16, floor=True)
@@ -2029,12 +2031,8 @@ class Mix10Net(nn.Module):
         feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
-        value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
-        value_large, value_large_uncertainty, value_large_feature = self.value_head_large(
-            feature, value_small_feature
-        )
-        value_large_uncertainty = F.softplus(value_large_uncertainty.float())
-        value_relative_uncertainty = F.sigmoid(value_relative_uncertainty.float())
+        value_small, value_small_feature = self.value_head_small(feature)
+        value_large, value_large_feature = self.value_head_large(feature, value_small_feature)
 
         # policy head
         policy_small = self.policy_head_small(feature, value_small_feature)
@@ -2045,24 +2043,6 @@ class Mix10Net(nn.Module):
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
-                "value_large_uncertainty": (
-                    "value_uncertainty_loss",
-                    (value_large_uncertainty, value_large),
-                ),
-                "value_relative_uncertainty": (
-                    "value_relative_uncertainty_loss",
-                    (value_relative_uncertainty, value_small, value_large),
-                ),
-            }
-        )
-        aux_outputs.update(
-            {
-                "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
-                "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
-                "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
-                "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
-                "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
-                "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
             }
         )
         return value_large, policy_large, aux_losses, aux_outputs
@@ -2071,26 +2051,13 @@ class Mix10Net(nn.Module):
         # get feature from single side
         feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
-        feature_sum = torch.sum(feature, dim=(2, 3))  # [B, dim_feature]
-        feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
-        print(f"feature_sum: \n{(feature_sum*128).int()}")
-
-        # small value head
-        value_small, value_relative_uncertainty, value_small_feature = self.value_head_small(feature)
-        print(f"value_small: \n{value_small}, relative_uncertainty_logits: \n{value_relative_uncertainty}")
+        # value head
+        value_small, value_small_feature = self.value_head_small(feature)
+        value_large, value_large_feature = self.value_head_large(feature, value_small_feature)
         print(f"value_small_feature: \n{(value_small_feature*128).int()}")
-
-        # large value head
-        value_large, value_large_uncertainty, value_large_feature = self.value_head_large(
-            feature, value_small_feature
-        )
+        print(f"value_small: \n{value_small}")
         print(f"value_large_feature: \n{(value_large_feature*128).int()}")
-        print(f"value_large: \n{value_large}, large_uncertainty_logits: \n{value_large_uncertainty}")
-
-        value_large_uncertainty = F.softplus(value_large_uncertainty.float())
-        value_relative_uncertainty = F.sigmoid(value_relative_uncertainty.float())
-        print(f"value_large_uncertainty: \n{value_large_uncertainty}")
-        print(f"value_relative_uncertainty: \n{value_relative_uncertainty}")
+        print(f"value_large: \n{value_large}")
 
         # policy head
         policy_small = self.policy_head_small(feature, value_small_feature)
@@ -2103,24 +2070,6 @@ class Mix10Net(nn.Module):
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
-                "value_large_uncertainty": (
-                    "value_uncertainty_loss",
-                    (value_large_uncertainty, value_large),
-                ),
-                "value_relative_uncertainty": (
-                    "value_relative_uncertainty_loss",
-                    (value_relative_uncertainty, value_small, value_large),
-                ),
-            }
-        )
-        aux_outputs.update(
-            {
-                "value_large_uncertainty_mean": torch.mean(value_large_uncertainty),
-                "value_large_uncertainty_q10": torch.quantile(value_large_uncertainty, q=0.1),
-                "value_large_uncertainty_q90": torch.quantile(value_large_uncertainty, q=0.9),
-                "value_relative_uncertainty_mean": torch.mean(value_relative_uncertainty),
-                "value_relative_uncertainty_q10": torch.quantile(value_relative_uncertainty, q=0.1),
-                "value_relative_uncertainty_q90": torch.quantile(value_relative_uncertainty, q=0.9),
             }
         )
         return value_large, policy_large, aux_losses, aux_outputs
@@ -2144,14 +2093,13 @@ class Mix10Net(nn.Module):
                     "value_quad.fc.weight",
                     "value_linear_small.0.fc.weight",
                     "value_linear_small.1.fc.weight",
-                    "value_small_output.0.fc.weight",
-                    "value_small_output.1.fc.weight",
-                    "value_linear_large.fc.weight",
-                    "value_large_output.0.fc.weight",
-                    "value_large_output.1.fc.weight",
+                    "value_small_output.fc.weight",
+                    "value_linear_large.0.fc.weight",
+                    "value_linear_large.1.fc.weight",
+                    "value_large_output.fc.weight",
                     "policy_small_pwconv_weight.0.fc.weight",
                     "policy_small_pwconv_weight.1.fc.weight",
-                    "policy_large_pwconv_weight_shared.fc.weight",
+                    "policy_large_pwconv_weight_0.fc.weight",
                     "policy_large_pwconv_weight_1.fc.weight",
                     "policy_large_pwconv_weight_2.fc.weight",
                 ],
@@ -2162,5 +2110,5 @@ class Mix10Net(nn.Module):
 
     @property
     def name(self):
-        _, f, d = self.model_size
-        return f"mix10_{self.input_type}_{f}f{d}d"
+        _, f, d, v = self.model_size
+        return f"mix10_{self.input_type}_{f}f{d}d{v}v"
