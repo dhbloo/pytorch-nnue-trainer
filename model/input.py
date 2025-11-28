@@ -47,10 +47,14 @@ class BasicInputPlane(nn.Module):
         super().__init__()
         self.with_stm = with_stm
 
-    def forward(self, data):
+    def forward(self, data, inv_side=False):
         board_input = data["board_input"].float()
         stm_input = data["stm_input"]
         assert stm_input.dtype == torch.float32
+
+        if inv_side:
+            board_input = torch.flip(board_input, dims=[1])
+            stm_input = -stm_input
 
         if self.with_stm:
             B, C, H, W = board_input.shape
@@ -70,8 +74,8 @@ class MaskedInputPlane(BasicInputPlane):
     def __init__(self, with_stm=True):
         super().__init__(with_stm)
 
-    def forward(self, data):
-        input_plane = super().forward(data)
+    def forward(self, data, inv_side=False):
+        input_plane = super().forward(data, inv_side)
 
         board_size = data["board_size"]
         B, C, H, W = data["board_input"].shape

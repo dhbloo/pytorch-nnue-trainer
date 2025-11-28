@@ -57,7 +57,7 @@ def parse_args_and_init():
     )
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
-    parser.add("--num_worker", type=int, default=min(8, os.cpu_count()), help="Num of dataloader workers")
+    parser.add("--num_worker", type=int, default=4, help="Num of dataloader workers")
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add("--optim_type", default="adamw", help="Optimizer type")
@@ -155,42 +155,28 @@ def calc_loss(
         value_target, policy_target, *kd_retvals = kd_results
     else:
         # get value and poliay target from data
-        value_target = data["value_target"]
-        policy_target = data["policy_target"]
-
-    # reshape policy
-    policy_target = torch.flatten(policy_target, start_dim=1)
-    policy = torch.flatten(policy, start_dim=1)
-    assert policy_target.shape[1] == policy.shape[1]
-
-    # apply board region mask to policy, so after exp() they are close to zero
-    if board_mask is not None:
-        board_mask = torch.flatten(board_mask, start_dim=1)
-        policy = policy.masked_fill(board_mask == 0, -1e6)
-
-    if kd_results is not None:
-        # apply softmax to value and policy target according to temparature
-        if value_target.size(1) > 1:
-            value_target = torch.softmax(value_target / kd_T, dim=1)
-        else:  # for value without draw info
-            value_target = torch.sigmoid(value_target / kd_T)
-        policy_target = torch.softmax(policy_target / kd_T, dim=1)
-
-        # scale prediction value and policy according to temparature
-        value = value / kd_T
-        policy = policy / kd_T
-
-    # convert value_target if value has no draw info
-    if value.size(1) == 1:
-        value = value[:, 0]  # squeeze value channel dim
-        if value_target.size(1) == 1:
-            value_target = value_target[:, 0]  # squeeze value channel dim
-        else:
-            value_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2  # in [0, 1]
+        value_target, policy_target = data["value_target"], data["policy_target"]
 
     # ===============================================================
     # value loss
-    def get_value_loss(value: torch.Tensor) -> torch.Tensor:
+    def get_value_loss(value: torch.Tensor, value_target: torch.Tensor) -> torch.Tensor:
+        if kd_results is not None:
+            # apply softmax to value target according to temparature
+            if value_target.size(1) > 1:
+                value_target = torch.softmax(value_target / kd_T, dim=1)
+            else:  # for value without draw info
+                value_target = torch.sigmoid(value_target / kd_T)
+            # scale prediction value according to temparature
+            value = value / kd_T
+
+        # convert value_target if value has no draw info
+        if value.size(1) == 1:
+            value = value[:, 0]  # squeeze value channel dim
+            if value_target.size(1) == 1:
+                value_target = value_target[:, 0]  # squeeze value channel dim
+            else:
+                value_target = (value_target[:, 0] - value_target[:, 1] + 1) / 2  # in [0, 1]
+
         if value_loss_type == "KL":
             return cross_entropy_with_softlabel(value, value_target, use_kl_divergence=True)
         elif value_loss_type == "CE":
@@ -212,7 +198,28 @@ def calc_loss(
 
     # ===============================================================
     # policy loss
-    def get_policy_loss(policy: torch.Tensor) -> torch.Tensor:
+    def get_policy_loss(policy: torch.Tensor, policy_target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # reshape policy
+        policy_target = torch.flatten(policy_target, start_dim=1)
+        policy = torch.flatten(policy, start_dim=1)
+        assert policy_target.shape[1] == policy.shape[1]
+
+        # apply board region mask to policy, so after exp() they are close to zero
+        if mask is not None:
+            mask = torch.flatten(mask, start_dim=1)
+            policy = policy.masked_fill(mask == 0, -1e6)
+            policy_target = policy_target.masked_fill(mask == 0, 0)
+
+        if kd_results is not None:
+            if mask is not None:
+                policy_target = policy_target.masked_fill(mask == 0, -1e6)
+            # apply softmax to policy target according to temparature
+            policy_target = torch.softmax(policy_target / kd_T, dim=1)
+            # scale prediction policy according to temparature
+            policy = policy / kd_T
+            if mask is not None:
+                policy_target = policy_target.masked_fill(mask == 0, 0)
+
         # check if there is loss weight for policy at each empty cells
         if extra_args.get("ignore_forbidden_point_policy", False):
             forbidden_point = torch.flatten(data["forbidden_point"], start_dim=1)  # [B, H*W]
@@ -247,8 +254,11 @@ def calc_loss(
 
     # ===============================================================
     # policy reg loss
-    def get_policy_reg_loss(policy: torch.Tensor, mask: None | torch.Tensor) -> torch.Tensor:
+    def get_policy_reg_loss(policy: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        policy = torch.flatten(policy, start_dim=1)  # reshape policy
         if mask is not None:
+            mask = torch.flatten(mask, start_dim=1)  # reshape mask
+            policy = policy.masked_fill(mask == 0, -1e6)
             policy_mean = torch.sum(policy * mask) / torch.sum(mask)
         else:
             policy_mean = torch.mean(policy)
@@ -292,8 +302,8 @@ def calc_loss(
 
     # ===============================================================
 
-    value_loss = get_value_loss(value)
-    policy_loss = get_policy_loss(policy)
+    value_loss = get_value_loss(value, value_target)
+    policy_loss = get_policy_loss(policy, policy_target, board_mask)
     value_lambda = 2 * value_policy_ratio / (value_policy_ratio + 1)
     policy_lambda = 2 / (value_policy_ratio + 1)
     total_loss = value_lambda * value_loss + policy_lambda * policy_loss
@@ -316,23 +326,23 @@ def calc_loss(
 
             # use pre-defined loss terms if aux_loss is a tuple of (string, inputs)
             if isinstance(aux_loss, tuple) and len(aux_loss) == 2:
-                aux_loss_type, aux_loss_input = aux_loss
+                aux_loss_type, aux_input = aux_loss
                 if aux_loss_type == "value_loss":
-                    aux_loss = get_value_loss(aux_loss_input)
+                    aux_loss = get_value_loss(aux_input, value_target)
                     if aux_loss_weight is None:
                         aux_loss_weight = value_lambda
                 elif aux_loss_type == "policy_loss":
-                    aux_loss = get_policy_loss(aux_loss_input)
+                    aux_loss = get_policy_loss(aux_input, policy_target, board_mask)
                     if aux_loss_weight is None:
                         aux_loss_weight = policy_lambda
                 elif aux_loss_type == "value_uncertainty_loss":
-                    aux_loss = get_value_uncertainty_loss(*aux_loss_input)
+                    aux_loss = get_value_uncertainty_loss(*aux_input)
                 elif aux_loss_type == "value_relative_uncertainty_loss":
-                    aux_loss = get_value_relative_uncertainty_loss(*aux_loss_input)
+                    aux_loss = get_value_relative_uncertainty_loss(*aux_input)
                 elif aux_loss_type == "policy_reg":
                     if aux_loss_weight is None and policy_reg_lambda == 0:
                         continue
-                    aux_loss = get_policy_reg_loss(aux_loss_input, board_mask)
+                    aux_loss = get_policy_reg_loss(aux_input, board_mask)
                     aux_loss_print_name = aux_loss_name
                     if aux_loss_weight is None:
                         aux_loss_weight = policy_reg_lambda

@@ -9,7 +9,7 @@ def make_dir(dirpath: str | list[str]):
     def _mkdir(path: str):
         if os.path.exists(path):
             return
-        print("Create folder {path}")
+        print(f"Create folder {path}")
         os.makedirs(path, exist_ok=True)
 
     if isinstance(dirpath, list):

@@ -13,6 +13,7 @@ from .blocks import (
     SwitchPReLU,
     SequentialWithExtraArguments,
     build_activation_layer,
+    build_norm2d_layer,
 )
 from .input import build_input_plane
 from utils.quant_utils import fake_quant
@@ -106,15 +107,18 @@ class DirectionalConvLayer(nn.Module):
 
 
 class DirectionalConvResBlock(nn.Module):
-    def __init__(self, dim, activation, **dirconv_kwargs):
+    def __init__(self, dim, act, norm, **dirconv_kwargs):
         super().__init__()
         self.d_conv = DirectionalConvLayer(dim, dim, **dirconv_kwargs)
+        self.norm = build_norm2d_layer(norm, dim)
         self.conv1x1 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.activation = build_activation_layer(activation)
+        self.activation = build_activation_layer(act)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         residual = x
         x = self.d_conv(x)
+        if self.norm is not None:
+            x = tuple_op(lambda t: self.norm(t) if mask is None else self.norm(t, mask=mask), x)
         x = tuple_op(self.activation, x)
         x = tuple_op(self.conv1x1, x)
         x = tuple_op(self.activation, x)
@@ -130,7 +134,7 @@ class Conv0dResBlock(nn.Module):
         self.conv2 = nn.Conv2d(middle_dim, dim, kernel_size=1)
         self.activation = build_activation_layer(activation)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         residual = x
         x = tuple_op(self.conv1, x)
         x = tuple_op(self.activation, x)
@@ -149,6 +153,7 @@ class Mapping(nn.Module):
         use_channel_last=True,
         fix_direction_order=False,
         activation="silu",
+        normalization="none",
         line_length=11,
     ):
         super().__init__()
@@ -159,11 +164,13 @@ class Mapping(nn.Module):
             use_channel_last=use_channel_last,
             fix_direction_order=fix_direction_order,
         )
-        self.convs = nn.Sequential(
+        self.norm = build_norm2d_layer(normalization, dim_middle)
+        self.convs = SequentialWithExtraArguments(
             *[
                 DirectionalConvResBlock(
                     dim_middle,
                     activation,
+                    normalization,
                     use_nonzero_padding=False,
                     use_channel_last=use_channel_last,
                     fix_direction_order=fix_direction_order,
@@ -175,11 +182,13 @@ class Mapping(nn.Module):
         self.final_conv = nn.Conv2d(dim_middle, dim_out, kernel_size=1)
         self.activation = build_activation_layer(activation)
 
-    def forward(self, x, dirs=[0, 1, 2, 3]):
+    def forward(self, x, mask=None, dirs=[0, 1, 2, 3]):
         x = tuple((x if i in dirs else None) for i in range(4))
         x = self.d_conv(x)
+        if self.norm is not None:
+            x = tuple_op(lambda t: self.norm(t) if mask is None else self.norm(t, mask=mask), x)
         x = tuple_op(self.activation, x)
-        x = self.convs(x)
+        x = self.convs(x, mask=mask)
         x = tuple_op(self.final_conv, x)
         x = tuple(xi for xi in x if xi is not None)
         x = torch.stack(x, dim=1)  # [B, <=4, dim_out, H, W]
@@ -450,14 +459,7 @@ class Mix8Net(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane(
-            {
-                "board_input": (
-                    torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"]
-                ),
-                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
-            }
-        )  # [B, 2, H, W]
+        input_plane = self.input_plane(data, inv_side)  # [B, 2, H, W]
         # get per-point 4-direction cell features
         feature = self.mapping(input_plane)  # [B, 4, dim_feature, H, W]
 
@@ -840,14 +842,7 @@ class Mix9Net(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane(
-            {
-                "board_input": (
-                    torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"]
-                ),
-                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
-            }
-        )  # [B, 2, H, W]
+        input_plane = self.input_plane(data, inv_side)  # [B, 2, H, W]
         # get per-point 4-direction cell features
         if self.one_mapping:
             feature = self.mapping0(input_plane)  # [B, 4, dim_feature, H, W]
@@ -1290,14 +1285,7 @@ class Mix9sNet(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane(
-            {
-                "board_input": (
-                    torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"]
-                ),
-                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
-            }
-        )  # [B, 2, H, W]
+        input_plane = self.input_plane(data, inv_side)  # [B, 2, H, W]
 
         # get per-point 4-direction cell features
         feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
@@ -1716,6 +1704,8 @@ class Mix10Net(nn.Module):
         dim_dwconv=32,
         dim_value=64,
         input_type="basicns",
+        mapping_norm="none",
+        feature_norm="none",
         spherical_feature=False,
     ):
         super().__init__()
@@ -1728,10 +1718,20 @@ class Mix10Net(nn.Module):
         self.input_plane = build_input_plane(input_type)
         dim_input = self.input_plane.dim_plane
         self.mapping1 = Mapping(
-            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+            dim_input,
+            dim_middle,
+            dim_feature,
+            use_channel_last=True,
+            fix_direction_order=True,
+            normalization=mapping_norm,
         )
         self.mapping2 = Mapping(
-            dim_input, dim_middle, dim_feature, use_channel_last=True, fix_direction_order=True
+            dim_input,
+            dim_middle,
+            dim_feature,
+            use_channel_last=True,
+            fix_direction_order=True,
+            normalization=mapping_norm,
         )
 
         # feature depth-wise conv
@@ -1751,6 +1751,7 @@ class Mix10Net(nn.Module):
             bias_quant_scale=128,
             bias_quant_bits=16,
         )
+        self.feature_norm = build_norm2d_layer(feature_norm, dim_dwconv)
 
         # policy head (point-wise conv) small
         dim_policy_small_in = max(dim_dwconv // 2, 16)
@@ -1813,18 +1814,13 @@ class Mix10Net(nn.Module):
 
     def get_feature(self, data, inv_side=False):
         # get the input plane from board and side to move input
-        input_plane = self.input_plane(
-            {
-                "board_input": (
-                    torch.flip(data["board_input"], dims=[1]) if inv_side else data["board_input"]
-                ),
-                "stm_input": -data["stm_input"] if inv_side else data["stm_input"],
-            }
-        )  # [B, 2, H, W]
+        input_plane = self.input_plane(data, inv_side)  # [B, 2, H, W]
+        if not isinstance(input_plane, tuple):
+            input_plane = (input_plane,)
 
         # get per-point 4-direction cell features
-        feature1 = self.mapping1(input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
-        feature2 = self.mapping2(input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
+        feature1 = self.mapping1(*input_plane, dirs=[0, 1])  # [B, 2, dim_feature, H, W]
+        feature2 = self.mapping2(*input_plane, dirs=[2, 3])  # [B, 2, dim_feature, H, W]
         feature = torch.cat([feature1, feature2], dim=1)  # [B, 4, dim_feature, H, W]
         # normalize feature onto hypersphere of radius 16
         if self.spherical_feature:
@@ -1848,13 +1844,17 @@ class Mix10Net(nn.Module):
         feat_dwconv = self.feature_dwconv(feat_dwconv * 4)  # [B, dwconv, H, W] relu
         feat_dwconv = fake_quant(feat_dwconv, scale=128, num_bits=16)  # int16, scale=128, [0,9/2*16*4]
 
+        # apply mask to the feature after dwconv
+        if self.feature_norm is not None:
+            feat_dwconv = self.feature_norm(feat_dwconv, *input_plane[1:])
+
         # apply activation for direct feature
         feat_direct = feature[:, dim_dwconv:]  # [B, dim_feature-dwconv, H, W] int16, scale=128, [0,16]
         feat_direct = fake_quant(feat_direct, scale=128, num_bits=16)  # int16, scale=128, [0,16]
 
         feature = torch.cat([feat_dwconv, feat_direct], dim=1)  # [B, dim_feature, H, W]
 
-        return feature, aux_losses, aux_outputs
+        return feature, aux_losses, aux_outputs, *input_plane[1:]
 
     def value_head_small(self, feature):
         # global feature accumulator
@@ -2028,7 +2028,7 @@ class Mix10Net(nn.Module):
 
     def forward(self, data):
         # get feature from single side
-        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, *retvals = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
         value_small, value_small_feature = self.value_head_small(feature)
@@ -2038,18 +2038,18 @@ class Mix10Net(nn.Module):
         policy_small = self.policy_head_small(feature, value_small_feature)
         policy_large = self.policy_head_large(feature, value_large_feature)
 
-        aux_losses.update(
+        retvals[0].update(
             {
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
             }
         )
-        return value_large, policy_large, aux_losses, aux_outputs
+        return value_large, policy_large, *retvals
 
     def forward_debug_print(self, data):
         # get feature from single side
-        feature, aux_losses, aux_outputs = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, *retvals = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
         value_small, value_small_feature = self.value_head_small(feature)
@@ -2065,14 +2065,14 @@ class Mix10Net(nn.Module):
         print(f"Raw Policy Small: \n{(policy_small[0, 0]*32).int()}")
         print(f"Raw Policy Large: \n{(policy_large[0, 0]*32).int()}")
 
-        aux_losses.update(
+        retvals[0].update(
             {
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
             }
         )
-        return value_large, policy_large, aux_losses, aux_outputs
+        return value_large, policy_large, *retvals
 
     @property
     def weight_clipping(self):
