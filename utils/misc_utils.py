@@ -38,6 +38,17 @@ def log_value_dict(tb_logger, tag, value_dict, it, rows):
         tb_logger.add_scalar(f"{tag}_rows/{name}", value, rows)
 
 
+def format_time(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.2f} s"
+    elif seconds < 3600:
+        return f"{seconds/60:.2f} min"
+    elif seconds < 86400:
+        return f"{seconds/3600:.2f} h"
+    else:
+        return f"{seconds//86400:.0f} d {((seconds%86400)/3600):.2f} h"
+
+
 def deep_update_dict(base_dict: dict, new_dict: dict):
     """Recursively update base_dict with new_dict (inplace).
 

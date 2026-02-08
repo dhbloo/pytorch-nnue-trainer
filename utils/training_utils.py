@@ -125,15 +125,16 @@ def build_optimizer(
     return opt
 
 
-def build_lr_scheduler(optimizer, lr_schedule_type="constant", last_it=-1, **kwargs):
+def build_lr_scheduler(optimizer, lr_schedule_type, iterations, last_it=-1, **kwargs):
     if lr_schedule_type == "constant":
-        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0, last_epoch=last_it)
+        scheduler = optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=iterations, last_epoch=last_it)
     elif lr_schedule_type == "step":
         step_size = kwargs.get("step_size", 50000)
         step_gamma = kwargs.get("step_gamma", 0.9)
-        scheduler = optim.lr_scheduler.StepLR(
-            optimizer, step_size=step_size, gamma=step_gamma, last_epoch=last_it
-        )
+        scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=step_size, gamma=step_gamma, last_epoch=last_it)
+    elif lr_schedule_type == "cosine":
+        eta_min = kwargs.get("eta_min", 1e-5)
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=iterations, eta_min=eta_min, last_epoch=last_it)
     else:
         raise ValueError(f"Unsupported lr scheduler: {lr_schedule_type}")
 

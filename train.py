@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 import torch.nn.functional as F
 from accelerate import (
     Accelerator,
@@ -10,7 +9,6 @@ from accelerate import (
 )
 from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
-from collections import deque
 from contextlib import nullcontext
 import configargparse
 import yaml
@@ -29,7 +27,13 @@ from utils.training_utils import (
     weight_clipping,
     state_dict_drop_size_unmatched,
 )
-from utils.misc_utils import seed_everything, set_performance_level, add_dict_to, log_value_dict
+from utils.misc_utils import (
+    seed_everything,
+    set_performance_level,
+    add_dict_to,
+    log_value_dict,
+    format_time,
+)
 from utils.file_utils import (
     make_dir,
     save_torch_ckpt,
@@ -75,11 +79,10 @@ def parse_args_and_init():
     parser.add("--clip_grad_norm", type=float, help="Gradient clipping max norm")
     parser.add("--clip_grad_value", type=float, help="Gradient clipping max value")
     parser.add("--no_shuffle", action="store_true", help="Do not shuffle dataset")
-    parser.add("--log_interval", type=int, default=100, help="Num iterations to log")
+    parser.add("--log_interval", type=int, default=500, help="Num iterations to log")
     parser.add("--show_interval", type=int, default=1000, help="Num iterations to display")
     parser.add("--save_interval", type=int, default=100000, help="Num iterations to save snapshot")
     parser.add("--val_interval", type=int, default=50000, help="Num iterations to do validation")
-    parser.add("--avg_loss_interval", type=int, default=2500, help="Num iterations to average loss")
     parser.add(
         "--temp_save_interval",
         type=int,
@@ -416,7 +419,6 @@ def train(
     show_interval,
     save_interval,
     val_interval,
-    avg_loss_interval,
     temp_save_interval,
     kd_model_type,
     kd_model_args,
@@ -436,7 +438,7 @@ def train(
     **kwargs,
 ):
     # initialize accelerator
-    dataloader_config = DataLoaderConfiguration(dispatch_batches=False)
+    dataloader_config = DataLoaderConfiguration(dispatch_batches=False, non_blocking=True)
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)
     accelerator = Accelerator(cpu=use_cpu, dataloader_config=dataloader_config, kwargs_handlers=[ddp_kwargs])
     seed_everything(random_seed)
@@ -444,9 +446,9 @@ def train(
 
     if accelerator.is_local_main_process:
         tb_logger = SummaryWriter(os.path.join(rundir, "log"))
-        log_filename = os.path.join(rundir, "training_log.jsonl")
+        log_file = open(os.path.join(rundir, "training_log.jsonl"), "a")
     else:
-        tb_logger, log_filename = None, None
+        tb_logger, log_file = None, None
 
     profile_ctx = nullcontext()
     if profile:
@@ -542,7 +544,7 @@ def train(
             accelerator.print(f"Loaded from pretrained: {load_from}")
 
     # build lr scheduler
-    scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, last_it=it - 1, **lr_scheduler_args)
+    scheduler = build_lr_scheduler(optimizer, lr_scheduler_type, iterations, last_it=it - 1, **lr_scheduler_args)
 
     # accelerate model training
     model, optimizer, train_loader = accelerator.prepare(model, optimizer, train_loader)
@@ -572,9 +574,9 @@ def train(
 
     accelerator.print(f"Start training from iteration {it}, epoch {epoch}")
     train_data_iter = iter(train_loader)
-    last_it = it
-    last_time = time.time()
-    avg_metric_dict = {}
+    start_time = log_last_time = show_last_time = time.time()
+    log_last_it = show_last_it = it
+    gpu_loss_sum, gpu_aux_sum, gpu_metric_count = {}, {}, 0
     model.train()
     with profile_ctx as profiler:
         while it < iterations:
@@ -628,62 +630,70 @@ def train(
                 optimizer.step()
                 scheduler.step()
 
-            # update running average loss
-            loss_dict = accelerator.gather(loss_dict)
-            aux_dict = accelerator.gather(aux_dict)
-            for metric_dict in [loss_dict, aux_dict]:
-                for key, value in metric_dict.items():
-                    value = torch.mean(value, dim=0).item()
-                    if not key in avg_metric_dict:
-                        avg_metric_dict[key] = deque(maxlen=avg_loss_interval)
-                    avg_metric_dict[key].append(value)
-                    metric_dict[key] = np.mean(avg_metric_dict[key])
+            # accumulate metrics on GPU (no cross-GPU communication)
+            add_dict_to(gpu_loss_sum, loss_dict)
+            add_dict_to(gpu_aux_sum, aux_dict)
+            gpu_metric_count += 1
+
+            # gather and average metrics at log/show intervals
+            if it % log_interval == 0 or it % show_interval == 0:
+                loss_dict = {k: v / gpu_metric_count for k, v in gpu_loss_sum.items()}
+                aux_dict = {k: v / gpu_metric_count for k, v in gpu_aux_sum.items()}
+
+                loss_dict = accelerator.gather(loss_dict)
+                aux_dict = accelerator.gather(aux_dict)
+                for metric_dict in [loss_dict, aux_dict]:
+                    for key, value in metric_dict.items():
+                        metric_dict[key] = torch.mean(value, dim=0).item()
+
+                gpu_loss_sum = {}
+                gpu_aux_sum = {}
+                gpu_metric_count = 0
 
             # logging
             if it % log_interval == 0 and accelerator.is_local_main_process:
                 log_value_dict(tb_logger, "train", loss_dict, it, rows)
                 if aux_dict:
                     log_value_dict(tb_logger, "train_aux", aux_dict, it, rows)
-                with open(log_filename, "a") as log:
-                    json_text = json.dumps(
-                        {
-                            "it": it,
-                            "epoch": epoch,
-                            "rows": rows,
-                            "train_loss": loss_dict,
-                            "train_aux": aux_dict,
-                            "lr": scheduler.get_last_lr()[0],
-                        }
-                    )
-                    log.writelines([json_text, "\n"])
+
+                # Log time-related performance metrics
+                iters_per_second = (it - log_last_it) / (time.time() - log_last_time)
+                elapsed_time = time.time() - start_time
+                running_stat_dict = {
+                    "epoch": epoch,
+                    "rows": rows,
+                    "elapsed": elapsed_time,
+                    "it/s": iters_per_second,
+                    "entry/s": iters_per_second * batch_size,
+                    "lr": scheduler.get_last_lr()[0],
+                }
+                log_value_dict(tb_logger, "running_stat", running_stat_dict, it, rows)
+                log_last_it = it
+                log_last_time = time.time()
+
+                json_log_dict = {
+                    "it": it,
+                    "train_loss": loss_dict,
+                    "train_aux": aux_dict,
+                    "running_stat": running_stat_dict,
+                }
+                log_file.write(json.dumps(json_log_dict) + "\n")
+                log_file.flush()
 
             # display current progress
             if it % show_interval == 0 and accelerator.is_local_main_process:
-                elasped = time.time() - last_time
-                num_it = it - last_it
-                speed = num_it / elasped
-                log_value_dict(
-                    tb_logger,
-                    "running_stat",
-                    {
-                        "epoch": epoch,
-                        "rows": rows,
-                        "elasped_seconds": elasped,
-                        "it/s": speed,
-                        "entry/s": speed * batch_size,
-                        "lr": scheduler.get_last_lr()[0],
-                    },
-                    it,
-                    rows,
+                iters_per_second = (it - show_last_it) / (time.time() - show_last_time)
+                elapsed_time = time.time() - start_time
+                eta_time = (iterations - it) / iters_per_second
+                print(f"Iter: {it}/{iterations} ({it/iterations*100:.2f}%)"
+                   f" | Elapsed: {format_time(elapsed_time)}"
+                   f" | Speed: {iters_per_second:.2f} it/s"
+                   f" | ETA: {format_time(eta_time)}"
+                   f" | Loss: {loss_dict['total_loss']:.4f}, v={loss_dict['value_loss']:.4f}, p={loss_dict['policy_loss']:.4f}",
+                   flush=True
                 )
-                print(
-                    f"[{it:08d}][{epoch}][{elasped:.2f}s][{speed:.2f}it/s]"
-                    + f" total: {loss_dict['total_loss']:.4f},"
-                    + f" value: {loss_dict['value_loss']:.4f},"
-                    + f" policy: {loss_dict['policy_loss']:.4f}"
-                )
-                last_it = it
-                last_time = time.time()
+                show_last_it = it
+                show_last_time = time.time()
 
             # checkpoint saving
             if (
@@ -716,6 +726,8 @@ def train(
                 val_start_time = time.time()
                 val_loss_dict, val_aux_dict = {}, {}
                 num_val_batches = 0
+                if accelerator.is_local_main_process:
+                    print(f"\nValidation at iteration {it}/{iterations} ({it/iterations*100:.2f}%)...", flush=True)
 
                 model.eval()
                 with torch.no_grad():
@@ -751,36 +763,36 @@ def train(
                     for k, aux_tensor in all_val_aux_dict.items():
                         val_aux_dict[k] = torch.sum(aux_tensor).item() / num_val_batches
 
-                    val_elasped = time.time() - val_start_time
+                    val_elapsed_time = time.time() - val_start_time
+                    elapsed_time = time.time() - start_time
                     num_val_entries = num_val_batches * batch_size_per_process * eval_bs_multipler
                     # log validation results
                     log_value_dict(tb_logger, "validation", val_loss_dict, it, rows)
                     if val_aux_dict:
                         log_value_dict(tb_logger, "validation_aux", val_aux_dict, it, rows)
-                    with open(log_filename, "a") as log:
-                        json_text = json.dumps(
-                            {
-                                "it": it,
-                                "epoch": epoch,
-                                "val_loss": val_loss_dict,
-                                "val_aux": val_aux_dict,
-                                "num_val_entries": num_val_entries,
-                                "elasped_seconds": val_elasped,
-                            }
-                        )
-                        log.writelines([json_text, "\n"])
-                    print(
-                        f"[validation][{num_val_entries} entries][{val_elasped:.2f}s]"
-                        + f" total: {val_loss_dict['total_loss']:.4f},"
-                        + f" value: {val_loss_dict['value_loss']:.4f},"
-                        + f" policy: {val_loss_dict['policy_loss']:.4f}"
-                    )
+                    json_log_dict = {
+                        "it": it,
+                        "epoch": epoch,
+                        "elapsed": elapsed_time,
+                        "val_loss": val_loss_dict,
+                        "val_aux": val_aux_dict,
+                        "num_val_entries": num_val_entries,
+                    }
+                    log_file.write(json.dumps(json_log_dict) + "\n")
+                    log_file.flush()
+                    print(f"Validation finished with {num_val_entries} entries, using {format_time(val_elapsed_time)}.")
+                    print(f"Validation loss: {val_loss_dict['total_loss']:.4f}, v={val_loss_dict['value_loss']:.4f}, p={val_loss_dict['policy_loss']:.4f}")
+                    print(flush=True)
 
-                    # substract validation time from training time
-                    last_time += val_elasped
+                    # subtract validation time from training time
+                    log_last_time += val_elapsed_time
+                    show_last_time += val_elapsed_time
 
             if profile:
                 profiler.step()
+
+    if accelerator.is_local_main_process:
+        log_file.close()
 
 
 if __name__ == "__main__":
