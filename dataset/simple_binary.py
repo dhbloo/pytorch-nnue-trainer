@@ -5,7 +5,7 @@ import random
 import torch.utils.data
 import io
 from torch.utils.data.dataset import IterableDataset
-from utils.data_utils import Result, Move, Rule, Symmetry, make_subset_range, post_process_data
+from utils.data_utils import *
 from . import DATASETS
 
 
@@ -82,7 +82,7 @@ class SimpleBinaryDataset(IterableDataset):
         drop_extra: bool = False,
         shuffle: bool = False,
         sample_rate: float = 1.0,
-        max_worker_per_file: int = 2,
+        max_partition_per_file: int = 1,
         **kwargs
     ):
         super().__init__()
@@ -95,7 +95,7 @@ class SimpleBinaryDataset(IterableDataset):
         self.drop_extra = drop_extra
         self.shuffle = shuffle
         self.sample_rate = sample_rate
-        self.max_worker_per_file = max_worker_per_file
+        self.max_partition_per_file = max_partition_per_file
 
     @property
     def is_fixed_side_input(self):
@@ -164,16 +164,15 @@ class SimpleBinaryDataset(IterableDataset):
         return data
 
     def __iter__(self):
-        worker_info = torch.utils.data.get_worker_info()
-        worker_num = worker_info.num_workers if worker_info else 1
-        worker_id = worker_info.id if worker_info else 0
-        worker_per_file = min(worker_num, self.max_worker_per_file)
-        assert worker_num % worker_per_file == 0
+        partition_num, partition_idx = get_partition_num_and_idx()
+        partition_per_file = min(partition_num, self.max_partition_per_file)
+        assert partition_num % partition_per_file == 0, \
+            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
 
         for file_index in make_subset_range(
             len(self.file_list),
-            partition_num=worker_num // worker_per_file,
-            partition_idx=worker_id // worker_per_file,
+            partition_num=partition_num // partition_per_file,
+            partition_idx=partition_idx // partition_per_file,
             shuffle=self.shuffle,
         ):
             filename = self.file_list[file_index]

@@ -1,4 +1,6 @@
 import numpy as np
+import torch
+import torch.distributed as dist
 from enum import Enum
 
 
@@ -169,6 +171,24 @@ def even_select_range(N, M):
                 yield True
             else:
                 yield False
+
+
+def get_partition_num_and_idx():
+    worker_info = torch.utils.data.get_worker_info()
+    worker_num = worker_info.num_workers if worker_info else 1
+    worker_id = worker_info.id if worker_info else 0
+    
+    if dist.is_available() and dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
+    # Combine worker id and rank to get a global unique partition index
+    partition_num = worker_num * world_size
+    partition_idx = rank * worker_num + worker_id
+    return partition_num, partition_idx
 
 
 def make_subset_range(length, partition_num, partition_idx, shuffle=False, sample_rate=1.0):
