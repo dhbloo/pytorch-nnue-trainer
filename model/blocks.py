@@ -236,6 +236,19 @@ class MaskNorm(nn.Module):
                 
 
 def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
+    """Build a 2D normalization layer from a string identifier.
+
+    Options:
+        "bn" - Batch normalization (BatchNorm2d)
+        "gn" - Group normalization, requires norm_groups parameter
+        "gn-{N}" - Group normalization with N groups parsed from the string (e.g., "gn-8")
+        "ln" - Local layer normalization (channel-wise)
+        "mask" - Mask-aware fixup normalization without affine parameters
+        "mask-affine" - Mask-aware fixup normalization with affine parameters
+        "maskbn" - Mask-aware batch normalization with affine parameters
+        "maskbn-noaffine" - Mask-aware batch normalization without affine parameters
+        "none" - No normalization (returns None)
+    """
     assert isinstance(num_features, int)
     if norm == "bn":
         return BatchNorm(num_features)
@@ -266,6 +279,20 @@ def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
 
 
 def build_activation_layer(activation, inplace=False):
+    """Build an activation layer from a string identifier.
+
+    Options:
+        "relu" - Rectified linear unit
+        "lrelu" - Leaky ReLU with negative slope 0.1
+        "lrelu/{N}" - Leaky ReLU with negative slope 1/N (e.g., "lrelu/3" gives slope 1/3)
+        "crelu" - Clipped ReLU, clamped to [0, 1]
+        "tanh" - Hyperbolic tangent
+        "sigmoid" - Sigmoid function
+        "gelu" - Gaussian error linear unit
+        "silu" - Sigmoid linear unit (Swish)
+        "mish" - Mish activation
+        "none" - No activation (returns None)
+    """
     if activation == "relu":
         return nn.ReLU(inplace=inplace)
     elif activation == "lrelu":
@@ -292,6 +319,7 @@ def build_activation_layer(activation, inplace=False):
 
 
 class ClippedReLU(nn.Module):
+    """ReLU clamped to [0, max]."""
     def __init__(self, inplace=False, max=1):
         super().__init__()
         self.inplace = inplace
@@ -305,6 +333,7 @@ class ClippedReLU(nn.Module):
 
 
 class ChannelWiseLeakyReLU(nn.Module):
+    """LeakyReLU with per-channel learnable negative slopes and optional bias."""
     def __init__(self, dim, bias=True, bound=0):
         super().__init__()
         self.neg_slope = nn.Parameter(torch.ones(dim) * 0.5)
@@ -327,6 +356,7 @@ class ChannelWiseLeakyReLU(nn.Module):
 
 
 class QuantPReLU(nn.PReLU):
+    """PReLU with fake quantization on both input and weight."""
     def __init__(
         self,
         num_parameters: int = 1,
@@ -360,6 +390,13 @@ class QuantPReLU(nn.PReLU):
 
 
 class SwitchPReLU(nn.Module):
+    """PReLU with per-expert learnable negative slopes for MoE networks.
+
+    Args:
+        num_parameters: Number of learnable slope parameters (typically number of channels)
+        num_experts: Number of experts in the MoE routing
+        init: Initial value for all negative slopes (default: 0.25)
+    """
     def __init__(
         self, num_parameters: int, num_experts: int, init: float = 0.25, device=None, dtype=None
     ) -> None:
@@ -388,6 +425,21 @@ class SwitchPReLU(nn.Module):
 
 
 class LinearBlock(nn.Module):
+    """
+    Linear layer followed by an activation function, with optional fake quantization.
+
+    Args:
+        in_dim: Input feature dimension
+        out_dim: Output feature dimension
+        activation: Activation function type, e.g., "relu", "lrelu", "none" (default: "relu")
+        bias: If True, adds a learnable bias to the linear layer (default: True)
+        quant: If True, enables fake quantization for weights, inputs, and biases (default: False)
+        input_quant_scale: Quantization scale for input (default: 128)
+        input_quant_bits: Quantization bit width for input (default: 8)
+        weight_quant_scale: Quantization scale for weights (default: 128)
+        weight_quant_bits: Quantization bit width for weights (default: 8)
+        bias_quant_bits: Quantization bit width for bias (default: 32)
+    """
     def __init__(
         self,
         in_dim,
@@ -436,6 +488,33 @@ class LinearBlock(nn.Module):
 
 
 class Conv2dBlock(nn.Module):
+    """
+    2D convolution block with configurable normalization, activation, and activation order.
+    Supports optional fake quantization and mask propagation for variable-sized inputs.
+
+    Args:
+        in_dim: Input channel dimension
+        out_dim: Output channel dimension
+        ks: Kernel size for convolution
+        st: Stride for convolution
+        padding: Padding size (default: 0)
+        norm: Normalization type, e.g., "bn", "gn", "ln", "mask", "maskbn", "none" (default: "none")
+        activation: Activation function type, e.g., "relu", "lrelu", "none" (default: "relu")
+        pad_type: Padding type, one of "zeros", "reflect", "replicate", "circular" (default: "zeros")
+        bias: If True, adds a learnable bias to the conv layer (default: True)
+        dilation: Dilation rate for convolution (default: 1)
+        groups: Number of groups for grouped convolution (default: 1)
+        activation_first: If True, applies norm→activation→conv (pre-activation).
+                          If False, applies conv→norm→activation (post-activation) (default: False)
+        quant: If True, enables fake quantization. Can also be "pixel-dwconv" or "pixel-dwconv-floor"
+               for pixel-wise quantization in depthwise convolutions (default: False)
+        input_quant_scale: Quantization scale for input (default: 128)
+        input_quant_bits: Quantization bit width for input (default: 8)
+        weight_quant_scale: Quantization scale for weights (default: 128)
+        weight_quant_bits: Quantization bit width for weights (default: 8)
+        bias_quant_scale: Quantization scale for bias. If None, uses input_quant_scale * weight_quant_scale
+        bias_quant_bits: Quantization bit width for bias (default: 32)
+    """
     def __init__(
         self,
         in_dim,
@@ -450,7 +529,6 @@ class Conv2dBlock(nn.Module):
         dilation=1,
         groups=1,
         activation_first=False,
-        use_spectral_norm=False,
         quant=False,
         input_quant_scale=128,
         input_quant_bits=8,
@@ -480,9 +558,6 @@ class Conv2dBlock(nn.Module):
             bias=bias,
             padding_mode=pad_type,
         )
-
-        if use_spectral_norm:
-            self.conv = nn.utils.spectral_norm(self.conv)
 
         self.quant = quant
         if quant:
@@ -556,6 +631,7 @@ class Conv2dBlock(nn.Module):
 
 
 class Conv1dLine4Block(nn.Module):
+    """Conv2d block with sparse kernel using only diagonal, anti-diagonal, and cross-shaped positions."""
     def __init__(
         self,
         in_dim,
@@ -652,6 +728,7 @@ class Conv1dLine4Block(nn.Module):
 
 
 class Conv2dSymBlock(nn.Module):
+    """Conv2d block with spatially symmetric kernel weights."""
     def __init__(
         self,
         in_dim: int,
@@ -1056,6 +1133,7 @@ class SwitchLinearBlock(nn.Module):
 
 
 class SwitchConv2d(nn.Module):
+    """Switchable 2D convolution with per-expert weights for MoE networks."""
     def __init__(
         self,
         in_channels: int,
@@ -1146,6 +1224,7 @@ class SwitchConv2d(nn.Module):
 
 
 class SwitchConv2dBlock(nn.Module):
+    """Conv2dBlock with switchable convolution for MoE networks."""
     def __init__(
         self,
         in_dim,
@@ -1235,6 +1314,7 @@ class SwitchConv2dBlock(nn.Module):
 
 
 class SequentialWithExtraArguments(nn.Sequential):
+    """Sequential container that forwards extra positional and keyword arguments to each module."""
     def forward(self, x, *args, **kwargs):
         for module in self:
             x = module(x, *args, **kwargs)

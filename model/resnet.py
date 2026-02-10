@@ -8,6 +8,24 @@ from .head import build_head
 
 
 class ResBlock(nn.Module):
+    """
+    Residual block with configurable activation order.
+    Supports both post-activation (activation_first=False) and pre-activation (activation_first=True) variants.
+
+    Args:
+        dim_in: Input channel dimension
+        ks: Kernel size for convolutions (default: 3)
+        st: Stride for convolutions (default: 1)
+        padding: Padding for convolutions (default: 1)
+        pad_type: Padding type, e.g., "zeros", "reflect" (default: "zeros")
+        conv1_norm: Normalization type for first conv, e.g., "bn", "none" (default: "none")
+        conv2_norm: Normalization type for second conv (default: "none")
+        activation: Activation function type, e.g., "relu", "lrelu" (default: "relu")
+        activation_first: If True, applies BN→activation→conv (pre-activation).
+                          If False, applies conv→BN→activation (post-activation) (default: False)
+        dim_out: Output channel dimension. If None, uses dim_in (default: None)
+        dim_hidden: Hidden channel dimension between two convs. If None, uses min(dim_in, dim_out) (default: None)
+    """
     def __init__(
         self,
         dim_in,
@@ -81,6 +99,10 @@ class ResBlock(nn.Module):
 
 @MODELS.register("resnet")
 class ResNet(nn.Module):
+    """
+    Standard ResNet with post-activation (Conv→BN→ReLU).
+    Input conv has activation, residual blocks apply activation after residual addition.
+    """
     def __init__(
         self,
         num_blocks,
@@ -140,6 +162,11 @@ class ResNet(nn.Module):
 
 @MODELS.register("resnetv2")
 class ResNetv2(nn.Module):
+    """
+    Pre-activation ResNet (BN→ReLU→Conv).
+    Input conv has no activation, residual blocks apply BN and activation before convolution.
+    Uses larger 5x5 input kernel by default for increased receptive field.
+    """
     def __init__(
         self,
         num_blocks,
@@ -200,6 +227,11 @@ class ResNetv2(nn.Module):
 
 @MODELS.register("resnetv3")
 class ResNetv3(nn.Module):
+    """
+    Mask-aware ResNet with masked convolutions and batch normalization.
+    Propagates masks through the network to handle variable-sized inputs.
+    Supports optional mask dropping via drop_mask parameter (for evaluation).
+    """
     def __init__(
         self,
         num_blocks,
