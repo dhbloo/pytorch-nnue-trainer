@@ -1,3 +1,28 @@
+[build-system]
+requires = ["setuptools", "pybind11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pytorch-nnue-trainer"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.3",
+    "accelerate",
+    "numpy",
+    "configargparse",
+    "pyyaml",
+    "tqdm",
+    "tensorboard",
+    "lz4",
+    "pykeops",
+]
+
+# The repo is run in place; `pip install .` only installs dependencies and
+# builds the C++ extensions defined in setup.py.
+[tool.setuptools]
+packages = []
+
 [tool.pyright]
 exclude = [
     "**/__pycache__",

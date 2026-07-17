@@ -8,26 +8,22 @@ This repository holds the training code for NNUE and various CNN models that can
 
 ### Requirements
 
-+ Python 3.10+ and Pytorch 2.3+
-+ Essential dependencies: `accelerate configargparse tqdm tensorboard lz4`.
-+ Optional: `pybind11` if you want to install dataset pipelines.
-+ Optional: `pykeops` if you want to use vector quantization module.
++ Python 3.10+ and a C++ compiler (used to build the dataset pipeline extensions).
 
-### Setup dataset pipeline
+### Setup
 
-After install all required packages in specified in requirements, it is necessary to build some extra c++ sources for the trainer to transform some data into features. First of all, you need to setup the C++ compiling environment. Then install the dataset pipelines by doing the following commands. Make sure you have installed `pybind11` before executing the following commands.
+Install all dependencies and build the C++ extensions with a single command from the repository root:
 
-+ Line Encoding: Fast line encoding for transforming board features. Necessary if you want to train LineNet or export MixNet9 or later models.
+```bash
+pip install .
+```
 
-  ```bash
-  pip install dataset/pipeline/line_encoding_cpp
-  ```
+This installs the required packages (PyTorch 2.3+, accelerate, etc.) and compiles the pybind11 extensions used by the dataset pipelines: `line_encoding_cpp` (fast line encoding; necessary to train LineNet or export MixNet9 or later models) and `forbidden_point_cpp` (forbidden points for Renju rule training).
 
-+ Forbidden Point (optional): Finding forbidden points for Renju rule. Can be skipped if you don't need to train a network for Renju rule.
+Optional packages not installed by default:
 
-  ```bash
-  pip install dataset/pipeline/forbidden_point_cpp
-  ```
++ `onnx` and `onnxslim` for ONNX export (`export.py --export_type onnx`).
++ `matplotlib` for `visualize_dataset.py`.
 
 ## Usage
 
