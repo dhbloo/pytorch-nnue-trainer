@@ -19,12 +19,14 @@ from tqdm.auto import tqdm
 
 from dataset import build_dataset
 from model import build_model
+from trainer.profiler import NULL_PROFILER, build_profiler
 from utils.training_utils import (
     build_lr_scheduler,
     build_optimizer,
     weights_init,
     build_data_loader,
-    weight_clipping,
+    resolve_weight_clipping,
+    apply_weight_clipping,
     state_dict_drop_size_unmatched,
 )
 from utils.misc_utils import (
@@ -74,6 +76,12 @@ class BaseTrainer:
         random_seed: Seed for all random number generators.
         performance_level: Torch performance level (0 = safe, 2 = fast).
         use_cpu: Force training on CPU even if CUDA is available.
+        profiler_args: Profiler configuration, or ``None`` to disable (zero
+            overhead).  Keys: ``timing`` (log per-region iteration times at
+            every ``log_interval``), ``trace_at`` (iterations at which to
+            record a torch.profiler trace window into
+            ``rundir/profile_trace``), ``trace_iters`` (active iterations per
+            trace window, default 30).
         # Data
         dataset_type: Registered dataset class name (passed to ``build_dataset``).
         train_datas: Paths to training data files.
@@ -132,6 +140,7 @@ class BaseTrainer:
         random_seed: int = 42,
         performance_level: int = 2,
         use_cpu: bool = False,
+        profiler_args: dict | None = None,
         # Data
         dataset_type: str,
         train_datas: list[str],
@@ -181,6 +190,7 @@ class BaseTrainer:
         self.random_seed = random_seed
         self.performance_level = performance_level
         self.use_cpu = use_cpu
+        self.profiler_args = profiler_args or {}
 
         self.dataset_type = dataset_type
         self.train_datas = train_datas
@@ -226,6 +236,7 @@ class BaseTrainer:
         self._temp_snapshot_iters = set()
         self._setup_accelerator()
         self._setup_logging()
+        self._setup_profiler()
         self._setup_data()
         self._init_models()
         self._setup_optimizer()
@@ -358,6 +369,16 @@ class BaseTrainer:
         )
         seed_everything(self.random_seed)
         set_performance_level(self.performance_level)
+        self.profiler = NULL_PROFILER
+
+    def _setup_profiler(self):
+        """Build the training profiler (a zero-overhead null object when disabled)."""
+        self.profiler = build_profiler(
+            self.profiler_args,
+            rundir=self.rundir,
+            is_main_process=self.accelerator.is_main_process,
+            use_cpu=self.use_cpu,
+        )
 
     def _setup_logging(self):
         """Open TensorBoard writer and JSONL log file (main process only)."""
@@ -787,6 +808,17 @@ class BaseTrainer:
         self.train_loader = prepared[len(model_names) + len(optimizer_names)]
         if self.val_loader is not None:
             self.val_loader = accelerator.prepare_data_loader(self.val_loader)
+        self._setup_weight_clipping()
+
+    def _setup_weight_clipping(self):
+        """Resolve per-model weight-clipping groups once for the training loop."""
+        self._weight_clip_groups = []
+        for m in self.models.values():
+            unwrapped = self._unwrap(m)
+            if hasattr(unwrapped, "weight_clipping"):
+                self._weight_clip_groups.extend(
+                    resolve_weight_clipping(unwrapped.named_parameters(), unwrapped.weight_clipping)
+                )
 
     def _all_trained_parameters(self):
         """Yield all parameters from all trained models."""
@@ -820,35 +852,40 @@ class BaseTrainer:
         """
         accelerator = self.accelerator
 
-        # apply weight clipping if needed (check all trained models)
-        for m in self.models.values():
-            unwrapped = self._unwrap(m)
-            if hasattr(unwrapped, "weight_clipping"):
-                weight_clipping(unwrapped.named_parameters(), unwrapped.weight_clipping)
+        # apply weight clipping if needed (groups resolved in _prepare_for_training)
+        if self._weight_clip_groups:
+            with self.profiler.region("clip"):
+                apply_weight_clipping(self._weight_clip_groups)
 
         total_loss_dict, total_aux_dict = {}, {}
         for micro_step in range(self.gradient_accumulation_steps):
             if micro_step > 0:
-                data = self._fetch_batch()
-            extra_kwargs = self.on_before_step(data)
+                with self.profiler.region("data"):
+                    data = self._fetch_batch()
+            with self.profiler.region("pre"):
+                extra_kwargs = self.on_before_step(data)
             with accelerator.accumulate(*self.models.values()), accelerator.autocast():
-                loss, loss_dict, aux_dict = self.train_step(data, **extra_kwargs)
-                accelerator.backward(loss)
+                with self.profiler.region("fwd"):
+                    loss, loss_dict, aux_dict = self.train_step(data, **extra_kwargs)
+                with self.profiler.region("bwd"):
+                    accelerator.backward(loss)
 
-                if accelerator.sync_gradients:
-                    self._clip_gradients()
+                with self.profiler.region("opt"):
+                    if accelerator.sync_gradients:
+                        self._clip_gradients()
 
-                # step/zero_grad are skipped internally on non-sync micro-batches
-                for opt in self.optimizers.values():
-                    opt.step()
-                if accelerator.sync_gradients:
-                    # keep an LR unchanged when AMP overflow skipped its optimizer's
-                    # step; each optimizer decides overflow independently
-                    for name, sched in self.schedulers.items():
-                        if not getattr(self.optimizers[name], "step_was_skipped", False):
-                            sched.step()
-                for opt in self.optimizers.values():
-                    opt.zero_grad(set_to_none=True)
+                    # step/zero_grad are skipped internally on non-sync micro-batches
+                    for opt in self.optimizers.values():
+                        opt.step()
+                    if accelerator.sync_gradients:
+                        # keep an LR unchanged when AMP overflow skipped its
+                        # optimizer's step; each optimizer decides overflow
+                        # independently
+                        for name, sched in self.schedulers.items():
+                            if not getattr(self.optimizers[name], "step_was_skipped", False):
+                                sched.step()
+                    for opt in self.optimizers.values():
+                        opt.zero_grad(set_to_none=True)
             add_dict_to(total_loss_dict, loss_dict)
             add_dict_to(total_aux_dict, aux_dict)
 
@@ -877,7 +914,8 @@ class BaseTrainer:
         while st.iteration < self.iterations:
             torch.compiler.cudagraph_mark_step_begin()
 
-            data = self._fetch_batch()
+            with self.profiler.region("data"):
+                data = self._fetch_batch()
             st.iteration += 1
             st.rows += self.batch_size * self.gradient_accumulation_steps
 
@@ -887,6 +925,7 @@ class BaseTrainer:
             add_dict_to(gpu_loss_sum, loss_dict)
             add_dict_to(gpu_aux_sum, aux_dict)
             gpu_metric_count += 1
+            self.profiler.mark_iteration()
 
             # gather and average at log/show intervals
             if st.iteration % self.log_interval == 0 or st.iteration % self.show_interval == 0:
@@ -911,6 +950,8 @@ class BaseTrainer:
             if st.iteration % self.val_interval == 0 and self.val_loader is not None:
                 self._validate()
 
+            self.profiler.step(st.iteration)
+
         # Ensure the final iteration has both model checkpoints and a training
         # state, so no progress is lost and a finished run is always resumable
         # even when the intervals do not align.
@@ -921,6 +962,7 @@ class BaseTrainer:
         if not final_state_saved:
             self._save_checkpoint(force_state=True)
 
+        self.profiler.close()
         if accelerator.is_main_process:
             self.tb_logger.close()
             self.log_file.close()
@@ -984,6 +1026,8 @@ class BaseTrainer:
 
     def _log_metrics(self, loss_dict, aux_dict):
         """Write training metrics to TensorBoard and the JSONL log file (main process only)."""
+        # flush on every process: it clears the profiler's recording buffers
+        prof_stats = self.profiler.flush_timings()
         st = self.state
         if not self.accelerator.is_main_process:
             return
@@ -1004,6 +1048,7 @@ class BaseTrainer:
         for name, sched in self.schedulers.items():
             lr_key = "lr" if name == "main" else f"lr_{name}"
             running_stat_dict[lr_key] = sched.get_last_lr()[0]
+        running_stat_dict.update(prof_stats)
         log_value_dict(self.tb_logger, "running_stat", running_stat_dict, st.iteration, st.rows)
         self._log_last_it = st.iteration
         self._log_last_time = time.time()

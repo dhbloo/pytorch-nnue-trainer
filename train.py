@@ -97,6 +97,12 @@ def parse_args_and_init():
         default=2,
         help="Performance level to use. A higher value will trade higher performance with less precision and reproducibility",
     )
+    parser.add(
+        "--profiler_args",
+        type=yaml.safe_load,
+        default=None,
+        help='Profiler configuration, e.g. "{timing: true, trace_at: [100000], trace_iters: 30}"',
+    )
     parser.add("--profile", action="store_true", help="Enable profiling")
     parser.add("--profile_active_iters", type=int, default=30, help="Num iterations to profile")
     parser.add("--profile_warmup_iters", type=int, default=10, help="Warmup iterations before profiling")

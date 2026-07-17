@@ -219,27 +219,46 @@ def build_data_loader(
     return dataloader
 
 
-def weight_clipping(named_parameters, clip_parameters):
+def resolve_weight_clipping(named_parameters, clip_parameters):
+    """Resolve parameter names in *clip_parameters* to parameter tensors.
+
+    Done once at setup so the per-iteration apply does not rebuild the name
+    lookup.  Returns a list of ``(min_weight, max_weight, params,
+    virtual_params)`` tuples; ``virtual_params`` is ``None`` for plain clamping.
+    """
     named_parameters = dict(named_parameters)
+    resolved = []
     for group in clip_parameters:
-        min_weight = group["min_weight"]
-        max_weight = group["max_weight"]
-        for i, param_name in enumerate(group["params"]):
-            p = named_parameters[param_name]
-            p_data_fp32 = p.data
-            if "virtual_params" in group:
-                virtual_param_name = group["virtual_params"][i]
-                virtual_param = named_parameters[virtual_param_name]
-                virtual_param = virtual_param.repeat(
-                    *[p_data_fp32.shape[i] // virtual_param.shape[i] for i in range(virtual_param.ndim)]
+        params = [named_parameters[name] for name in group["params"]]
+        virtual_params = None
+        if "virtual_params" in group:
+            virtual_params = [named_parameters[name] for name in group["virtual_params"]]
+            if len(virtual_params) != len(params):
+                raise ValueError(
+                    f"weight clipping group has {len(params)} params"
+                    f" but {len(virtual_params)} virtual_params"
                 )
-                min_weight_t = p_data_fp32.new_full(p_data_fp32.shape, min_weight) - virtual_param
-                p_data_fp32 = torch.max(p_data_fp32, min_weight_t)
-                max_weight_t = p_data_fp32.new_full(p_data_fp32.shape, max_weight) - virtual_param
-                p_data_fp32 = torch.min(p_data_fp32, max_weight_t)
-            else:
-                p_data_fp32.clamp_(min_weight, max_weight)
-            p.data.copy_(p_data_fp32)
+        resolved.append((group["min_weight"], group["max_weight"], params, virtual_params))
+    return resolved
+
+
+def apply_weight_clipping(resolved_groups):
+    """Clamp parameters per the groups produced by :func:`resolve_weight_clipping`."""
+    for min_weight, max_weight, params, virtual_params in resolved_groups:
+        if virtual_params is None:
+            for p in params:
+                p.data.clamp_(min_weight, max_weight)
+        else:
+            for p, virtual_param in zip(params, virtual_params):
+                p_data = p.data
+                virtual = virtual_param.repeat(
+                    *[p_data.shape[i] // virtual_param.shape[i] for i in range(virtual_param.ndim)]
+                )
+                min_weight_t = p_data.new_full(p_data.shape, min_weight) - virtual
+                p_data = torch.max(p_data, min_weight_t)
+                max_weight_t = p_data.new_full(p_data.shape, max_weight) - virtual
+                p_data = torch.min(p_data, max_weight_t)
+                p.data.copy_(p_data)
 
 
 def cross_entropy_with_softlabel(
