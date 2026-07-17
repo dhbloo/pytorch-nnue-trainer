@@ -73,7 +73,7 @@ def _get_git_revision_short_hash(fallback: str = "(unknown)") -> str:
 
         output = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"])
         return output.decode("ascii").strip()
-    except:
+    except Exception:
         return fallback
 
 
@@ -222,7 +222,7 @@ def export_onnx(output, model, export_args, **kwargs):
 
         print("Running onnxslim to optimize the model...")
         onnxslim.slim(output, output)
-    except:
+    except Exception:
         pass
 
     # Add metadata to the exported ONNX model

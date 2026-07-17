@@ -62,7 +62,7 @@ def load_torch_ckpt(
 
     try:
         ckpt_state_dict = torch.load(filepath, map_location=map_location, weights_only=True)
-    except:
+    except Exception:
         ckpt_state_dict = torch.load(filepath, map_location=map_location, weights_only=False)
 
     model_state_dict = ckpt_state_dict.pop("model")
@@ -79,7 +79,7 @@ def load_torch_ckpt(
             # as long as it can be converted into a str type.
             try:
                 metadata[k] = str(v)
-            except:
+            except Exception:
                 pass
 
     return model_state_dict, extra_state_dicts, metadata

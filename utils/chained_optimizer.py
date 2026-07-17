@@ -2,16 +2,17 @@ from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.optimizer import ParamsT
 from dataclasses import dataclass
-from typing import Any, Dict, List, Type, Callable, Optional, Iterable
+from typing import Any
+from collections.abc import Callable, Iterable
 
 
 @dataclass
 class OptimizerSpec:
     """Spec for creating an optimizer that is part of a `ChainedOptimizer`."""
 
-    class_type: Type[Optimizer]
-    init_args: Dict[str, Any]
-    param_filter: Optional[Callable[[Tensor], bool]]
+    class_type: type[Optimizer]
+    init_args: dict[str, Any]
+    param_filter: Callable[[Tensor], bool] | None
 
 
 class ChainedOptimizer(Optimizer):
@@ -26,15 +27,15 @@ class ChainedOptimizer(Optimizer):
     def __init__(
         self,
         params: ParamsT,
-        optimizer_specs: List[OptimizerSpec],
+        optimizer_specs: list[OptimizerSpec],
         lr: float,
         weight_decay: float = 0.0,
-        optimizer_selection_callback: Optional[Callable[[Tensor, int], None]] = None,
+        optimizer_selection_callback: Callable[[Tensor, int], None] | None = None,
         **common_kwargs,
     ):
         self.optimizer_specs = optimizer_specs
         self.optimizer_selection_callback = optimizer_selection_callback
-        self.optimizers: List[Optimizer] = []
+        self.optimizers: list[Optimizer] = []
         defaults = dict(lr=lr, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
@@ -61,13 +62,13 @@ class ChainedOptimizer(Optimizer):
             optimizer = spec.class_type(selected_params, **optimizer_args)
             self.optimizers.append(optimizer)
 
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
         return {
             "optimizers": [opt.state_dict() for opt in self.optimizers],
             **super().state_dict(),
         }
 
-    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+    def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         optimizers = state_dict.pop("optimizers")
         super().load_state_dict(state_dict)
         for i in range(len(self.optimizers)):
@@ -88,7 +89,7 @@ class ChainedOptimizer(Optimizer):
         for opt in self.optimizers:
             opt.step(closure)
 
-    def add_param_group(self, param_group: Dict[str, Any]) -> None:
+    def add_param_group(self, param_group: dict[str, Any]) -> None:
         super().add_param_group(param_group)
 
         # If optimizer has not been initialized, skip adding the param groups

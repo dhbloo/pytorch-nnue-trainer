@@ -1,4 +1,3 @@
-from typing import List
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.misc_utils import Registry, import_submodules
 from abc import ABC, abstractmethod
@@ -72,7 +71,7 @@ class IterativePipelineWarpper(IterableDataset):
             pass
 
 
-def build_data_pipeline(pipeline_args) -> List[BasePipeline]:
+def build_data_pipeline(pipeline_args) -> list[BasePipeline]:
     pipelines = []
     for pipeline_type, pipeline_kwargs in pipeline_args.items():
         assert pipeline_type in PIPELINES

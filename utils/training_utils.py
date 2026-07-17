@@ -67,13 +67,17 @@ def weights_init(init_cfg: dict):
 
 def build_optimizer(
     optim_type: str,
-    model: torch.nn.Module,
+    model: torch.nn.Module | list[torch.nn.Module],
     lr: float,
     weight_decay: float = 0.0,
     only_track_requires_grad=True,
     **kwargs,
 ):
-    parameters = model.parameters()
+    if isinstance(model, (list, tuple)):
+        from itertools import chain
+        parameters = chain(*(m.parameters() for m in model))
+    else:
+        parameters = model.parameters()
     if only_track_requires_grad:
         # only track parameters with requires_grad=True
         parameters = [p for p in parameters if p.requires_grad]
@@ -102,8 +106,12 @@ def build_optimizer(
         from utils.muon import Muon, get_params_for_muon
         from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
 
-        params_id_to_name = {id(p): name for name, p in model.named_parameters()}
-        muon_params_id_set = set(id(p) for p in get_params_for_muon(model))
+        models = model if isinstance(model, (list, tuple)) else [model]
+        params_id_to_name = {}
+        muon_params_id_set = set()
+        for m in models:
+            params_id_to_name.update({id(p): name for name, p in m.named_parameters()})
+            muon_params_id_set.update(id(p) for p in get_params_for_muon(m))
         muon_args = {"weight_decay": max(1e-2, 0.0 if weight_decay is None else weight_decay)}
         muon_args.update(kwargs.pop("muon_args", {}))
         adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
