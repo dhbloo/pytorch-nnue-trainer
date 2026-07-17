@@ -116,8 +116,8 @@ class ModelIOv1(torch.nn.Module):
             "stm_input": globalInputNC,
         }
 
-    def get_model_outputs(self, *retvals):
-        value, policy, *extra_outputs = retvals
+    def get_model_outputs(self, results):
+        value, policy = results["value"], results["policy"]
         assert value.ndim == 2 and value.shape[1] == 3, f"value.shape={value.shape}"
         assert policy.ndim == 3, f"policy.shape={policy.shape}"
         assert value.shape[0] == policy.shape[0]
@@ -129,8 +129,7 @@ class ModelIOv1(torch.nn.Module):
 
     def forward(self, boardInputNCHW: torch.Tensor, globalInputNC: torch.Tensor):
         input_data = self.get_data_from_model_inputs(boardInputNCHW, globalInputNC)
-        retvals = self.warpped_model(input_data)
-        return self.get_model_outputs(*retvals)
+        return self.get_model_outputs(self.warpped_model(input_data))
 
 
 def _warp_model_io(model, model_io_version=1, apply_policy_softmax=False, **kwargs):

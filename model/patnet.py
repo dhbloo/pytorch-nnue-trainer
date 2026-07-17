@@ -278,7 +278,7 @@ class PatNetBaseline(nn.Module):
         value = value + self.value_linear(value)
         value = self.value_linear_final(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -338,7 +338,7 @@ class PatNetv1(nn.Module):
         value = self.value_linear(value)
         value = self.value_final_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -394,7 +394,7 @@ class PatNetv2(nn.Module):
         value = self.value_linear2(value)
         value = self.value_final_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -439,7 +439,7 @@ class PatNNUEv1(nn.Module):
         value = self.value_linear(value)
         value = self.value_final_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -492,7 +492,7 @@ class PatNNUEv2(nn.Module):
         value = self.value_linear(value)
         value = self.value_final_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):

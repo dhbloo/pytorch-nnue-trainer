@@ -131,13 +131,13 @@ def compute_supervised_losses(
     value_loss_type, policy_loss_type = loss_type.split("+")
 
     # unpack model outputs
-    value, policy, *retvals = results
-    aux_losses = retvals[0] if len(retvals) >= 1 else None
-    aux_outputs = retvals[1] if len(retvals) >= 2 else None
-    board_mask = retvals[2] if len(retvals) >= 3 else None
+    value, policy = results["value"], results["policy"]
+    aux_losses = results.get("aux_losses")
+    aux_outputs = results.get("aux_outputs")
+    board_mask = results.get("board_mask")
 
     if kd_results is not None:
-        value_target, policy_target, *_ = kd_results
+        value_target, policy_target = kd_results["value"], kd_results["policy"]
     else:
         value_target, policy_target = data["value_target"], data["policy_target"]
 

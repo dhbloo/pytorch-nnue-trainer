@@ -246,7 +246,7 @@ class Mix6Net(nn.Module):
         value = value + self.value_linear(value)
         value = self.value_linear_final(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -327,7 +327,7 @@ class Mix7Net(nn.Module):
         value = torch.mean(value, dim=(2, 3))
         value = self.value_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         _, dim_policy, dim_value = self.model_size
@@ -365,7 +365,7 @@ class Mix7Net(nn.Module):
         print(f"value feature mean: \n{value}")
         value = self.value_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -550,7 +550,7 @@ class Mix8Net(nn.Module):
         )  # [B, dim_feature + 4 * dim_value_group]
         value = self.value_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         _, _, dim_policy, _, _ = self.model_size
@@ -659,7 +659,7 @@ class Mix8Net(nn.Module):
             value = linear(value)
             print(f"value feature after layer {i}: \n{value}")
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -974,7 +974,7 @@ class Mix9Net(nn.Module):
             )  # [B, dim_feature + dim_value * 4]
             value = self.value_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         _, _, dim_policy, _, _ = self.model_size
@@ -1138,7 +1138,7 @@ class Mix9Net(nn.Module):
                 value = linear(value)
                 print(f"value feature after layer {i}: \n{(value*128).int()}")
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -1408,7 +1408,7 @@ class Mix9sNet(nn.Module):
         )  # [B, dim_feature + dim_value * 4]
         value = self.value_linear(value)
 
-        return value, policy, aux_losses, aux_outputs
+        return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
 
     def forward_debug_print(self, data):
         _, _, dim_policy, _, _ = self.model_size
@@ -1522,7 +1522,7 @@ class Mix9sNet(nn.Module):
             value = linear(value)
             print(f"value feature after layer {i}: \n{(value*128).int()}")
 
-        return value, policy, aux_losses, aux_outputs
+        return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
 
     @property
     def weight_clipping(self):
@@ -2028,7 +2028,7 @@ class Mix10Net(nn.Module):
 
     def forward(self, data):
         # get feature from single side
-        feature, *retvals = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, aux_losses, aux_outputs, *extra = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
         value_small, value_small_feature = self.value_head_small(feature)
@@ -2038,18 +2038,26 @@ class Mix10Net(nn.Module):
         policy_small = self.policy_head_small(feature, value_small_feature)
         policy_large = self.policy_head_large(feature, value_large_feature)
 
-        retvals[0].update(
+        aux_losses.update(
             {
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
             }
         )
-        return value_large, policy_large, *retvals
+        out = {
+            "value": value_large,
+            "policy": policy_large,
+            "aux_losses": aux_losses,
+            "aux_outputs": aux_outputs,
+        }
+        if extra:
+            out["board_mask"] = extra[0]
+        return out
 
     def forward_debug_print(self, data):
         # get feature from single side
-        feature, *retvals = self.get_feature(data, False)  # [B, dim_feature, H, W]
+        feature, aux_losses, aux_outputs, *extra = self.get_feature(data, False)  # [B, dim_feature, H, W]
 
         # value head
         value_small, value_small_feature = self.value_head_small(feature)
@@ -2065,14 +2073,22 @@ class Mix10Net(nn.Module):
         print(f"Raw Policy Small: \n{(policy_small[0, 0]*32).int()}")
         print(f"Raw Policy Large: \n{(policy_large[0, 0]*32).int()}")
 
-        retvals[0].update(
+        aux_losses.update(
             {
                 "value_small": ("value_loss", value_small),
                 "policy_small": ("policy_loss", policy_small),
                 "policy_small_reg": ("policy_reg", policy_small),
             }
         )
-        return value_large, policy_large, *retvals
+        out = {
+            "value": value_large,
+            "policy": policy_large,
+            "aux_losses": aux_losses,
+            "aux_outputs": aux_outputs,
+        }
+        if extra:
+            out["board_mask"] = extra[0]
+        return out
 
     @property
     def weight_clipping(self):

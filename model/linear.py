@@ -68,7 +68,7 @@ class LinearModel(nn.Module):
         policy_oppo = policy_oppo * self.policy_stm_coef[1]
         policy = policy_self + policy_oppo
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -88,7 +88,8 @@ class LinearThreatModel(LinearModel):
         self.threat_table = nn.Embedding(num_embeddings=2048, embedding_dim=2 if has_draw_value else 1)
 
     def forward(self, data):
-        value, policy = super().forward(data)
+        out = super().forward(data)
+        value, policy = out["value"], out["policy"]
 
         assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
@@ -131,7 +132,7 @@ class LinearThreatModel(LinearModel):
         else:
             value = value[:, 0:1] + threat_value  # [B, 1]
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -153,7 +154,8 @@ class LinearP4CountMLPModel(LinearModel):
         self.linear3 = LinearBlock(16, 2 if has_draw_value else 1, norm="bn", activation="relu")
 
     def forward(self, data):
-        value, policy = super().forward(data)
+        out = super().forward(data)
+        value, policy = out["value"], out["policy"]
 
         assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
@@ -174,7 +176,7 @@ class LinearP4CountMLPModel(LinearModel):
         else:
             value = value[:, 0:1] + value_p4c  # [B, 1]
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):

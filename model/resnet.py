@@ -290,15 +290,13 @@ class ResNetv3(nn.Module):
             x = self.conv_input(input_plane)
             for conv_block in self.conv_trunk:
                 x = conv_block(x)
-            value, policy = self.output_head(x)
-            return value, policy
+            return self.output_head(x)
         else:
             input_plane, mask_plane = self.input_plane(data)
             x, mask = self.conv_input(input_plane, mask_plane)
             for conv_block in self.conv_trunk:
                 x, mask = conv_block(x, mask)
-            value, policy, mask = self.output_head(x, mask)
-            return value, policy, {}, {}, mask
+            return self.output_head(x, mask)
 
     @property
     def name(self):

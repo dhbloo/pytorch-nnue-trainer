@@ -264,7 +264,7 @@ class LineNNUEv1(nn.Module):
         )  # [B, dim_feature + dim_value * 4]
         value = self.value_linear(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):

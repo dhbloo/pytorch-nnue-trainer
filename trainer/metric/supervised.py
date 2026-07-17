@@ -84,7 +84,7 @@ def compute_supervised_metrics(data, results, do_cross_eval=False):
     Returns a dict of 0-dim tensors with CE losses, bestmove/top-k accuracy,
     value accuracy/MSE, draw metrics, and optional cross-eval errors.
     """
-    value, policy, *retvals = results
+    value, policy = results["value"], results["policy"]
     value_target = data["value_target"]
     policy_target = data["policy_target"]
 

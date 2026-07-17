@@ -129,7 +129,8 @@ def next_move(board, model, data):
             data[k] = torch.unsqueeze(data[k], dim=0)
 
     with torch.no_grad():
-        value, policy, *retvals = model(data)
+        results = model(data)
+    value, policy = results["value"], results["policy"]
 
     # remove batch dimension
     value = value.squeeze(0)
@@ -168,12 +169,13 @@ def debug_print(board, model, data):
     if hasattr(model, "forward_debug_print"):
         torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
         with torch.no_grad():
-            value, policy, *retvals = model.forward_debug_print(data)
+            results = model.forward_debug_print(data)
     else:
         with torch.no_grad():
-            value, policy, *retvals = model(data)
-    aux_losses = retvals[0] if len(retvals) >= 1 else None
-    aux_outputs = retvals[1] if len(retvals) >= 2 else None
+            results = model(data)
+    value, policy = results["value"], results["policy"]
+    aux_losses = results.get("aux_losses")
+    aux_outputs = results.get("aux_outputs")
 
     def print_value(value: torch.Tensor) -> torch.Tensor:
         value = value.squeeze(0)  # remove batch dimension

@@ -64,7 +64,7 @@ class FlatNNUEv1(nn.Module):
         # value head
         value = self.value(feature[:, dim_policy:])  # [B, 3]
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def name(self):
@@ -177,7 +177,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
             value = torch.clamp(value, min=0, max=127 / 128)
             value = layer(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         _, dim_policy, _ = self.model_size
@@ -202,7 +202,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
             value = layer(value)
             print(f"value output{i+1}: \n{(value * 128).int()}")
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -322,7 +322,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
             value = torch.clamp(value, min=0, max=127 / 128)
             value = layer(value)
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         _, dim_policy, _ = self.model_size
@@ -347,7 +347,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
             value = layer(value)
             print(f"value output{i+1}: \n{(value * 128).int()}")
 
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -525,7 +525,7 @@ class FlatLadder7x7NNUEv3(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         # get feature sum from chunks
@@ -541,7 +541,7 @@ class FlatLadder7x7NNUEv3(nn.Module):
             print(f"value output{i+1}: \n{(value * 128).int()}")
 
         policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -620,7 +620,7 @@ class FlatConv3x3NNUE(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -753,7 +753,7 @@ class FlatConv3x44x3NNUE(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -830,7 +830,7 @@ class FlatHashConvNNUE(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -930,7 +930,7 @@ class FlatHash7x7NNUEv1(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -1022,7 +1022,7 @@ class FlatSquare7x7NNUEv1(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -1136,7 +1136,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
@@ -1162,7 +1162,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
             print(f"value output{i+1}: \n{(value * 128).int()}")
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -1261,7 +1261,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
             value = layer(value)
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     def forward_debug_print(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
@@ -1290,7 +1290,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
             print(f"value output{i+1}: \n{(value * 128).int()}")
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return value, policy
+        return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
@@ -1416,7 +1416,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
 
-        return value, policy, aux_losses, aux_outputs
+        return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
 
     def forward_debug_print(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
@@ -1442,7 +1442,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
 
         policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
 
-        return value, policy, aux_losses, aux_outputs
+        return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
 
     @property
     def weight_clipping(self):

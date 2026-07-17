@@ -38,6 +38,6 @@ class OutputHeadV0(nn.Module):
 
         if mask is not None:
             mask = torch.squeeze(mask, dim=1)
-            return value, policy, mask
+            return {"value": value, "policy": policy, "board_mask": mask}
         else:
-            return value, policy
+            return {"value": value, "policy": policy}
