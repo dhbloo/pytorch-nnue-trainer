@@ -118,7 +118,11 @@ def save_torch_ckpt(
     # Add file name extension if not given
     if not os.path.splitext(filepath)[1]:
         filepath += ".pt"
-    torch.save(state_dict, filepath)
+    # Atomic write: a crash mid-save must not leave a truncated checkpoint
+    # that find_latest_ckpt would later pick up.
+    tmp_path = filepath + ".tmp"
+    torch.save(state_dict, tmp_path)
+    os.replace(tmp_path, filepath)
 
 
 def find_latest_ckpt(

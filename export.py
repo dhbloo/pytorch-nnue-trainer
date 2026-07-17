@@ -317,8 +317,10 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, expo
     if checkpoint is None:
         if rundir is None:
             raise RuntimeError("Either checkpoint or rundir must be specified.")
-        # try to find the latest checkpoint
-        checkpoint = find_latest_ckpt(rundir, f"ckpt_{model_name}")
+        # try to find the latest checkpoint (new layout under ckpts/, legacy in rundir root)
+        checkpoint = find_latest_ckpt(os.path.join(rundir, "ckpts"), f"ckpt_{model_name}")
+        if checkpoint is None:
+            checkpoint = find_latest_ckpt(rundir, f"ckpt_{model_name}")
         if checkpoint is None:
             raise RuntimeError(f"No checkpoint found in {rundir} (prefix=ckpt_{model_name})")
     elif not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):

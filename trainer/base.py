@@ -6,9 +6,11 @@ from accelerate import (
     DataLoaderConfiguration,
     DistributedDataParallelKwargs,
 )
+from accelerate.utils import GradientAccumulationPlugin
 from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
+import inspect
 import json
 import time
 import os
@@ -64,8 +66,11 @@ class BaseTrainer:
     Args:
         # Run
         rundir: Directory for checkpoints, logs, and TensorBoard events.
-        iterations: Total number of training iterations.
+        iterations: Total number of training iterations (optimizer steps).
         batch_size: Global batch size (split across processes).
+        gradient_accumulation_steps: Number of micro-batches accumulated per
+            optimizer step.  Each iteration consumes this many batches, so the
+            effective batch size is ``batch_size * gradient_accumulation_steps``.
         random_seed: Seed for all random number generators.
         performance_level: Torch performance level (0 = safe, 2 = fast).
         use_cpu: Force training on CPU even if CUDA is available.
@@ -106,6 +111,12 @@ class BaseTrainer:
         save_interval: Iterations between permanent checkpoints.
         val_interval: Iterations between validation runs.
         temp_save_interval: Iterations between temporary (rolling) checkpoints.
+        state_save_interval: Iterations between training-state saves, or ``None``
+            to save state at every checkpoint save.  State is only ever written
+            at iterations where model checkpoints are also saved, so that a
+            state file always has matching model files to resume from.
+        num_keep_states: Number of most recent training-state files to keep,
+            or ``-1`` to keep all.
         # Distributed
         find_unused_parameters: Enable ``find_unused_parameters`` in DDP wrapper.
     """
@@ -117,6 +128,7 @@ class BaseTrainer:
         rundir: str,
         iterations: int = 1_000_000,
         batch_size: int = 128,
+        gradient_accumulation_steps: int = 1,
         random_seed: int = 42,
         performance_level: int = 2,
         use_cpu: bool = False,
@@ -154,6 +166,8 @@ class BaseTrainer:
         save_interval: int = 100_000,
         val_interval: int = 50_000,
         temp_save_interval: int = 5000,
+        state_save_interval: int | None = None,
+        num_keep_states: int = 1,
         # Distributed
         find_unused_parameters: bool = False,
         # Extra (absorb unknown CLI keys like 'config')
@@ -163,6 +177,7 @@ class BaseTrainer:
         self.rundir = rundir
         self.iterations = iterations
         self.batch_size = batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.random_seed = random_seed
         self.performance_level = performance_level
         self.use_cpu = use_cpu
@@ -200,10 +215,15 @@ class BaseTrainer:
         self.save_interval = save_interval
         self.val_interval = val_interval
         self.temp_save_interval = temp_save_interval
+        self.state_save_interval = state_save_interval
+        self.num_keep_states = num_keep_states
 
         self.find_unused_parameters = find_unused_parameters
 
         self.state = TrainingState()
+        # Iterations of temporary (non-permanent) snapshots saved by this session;
+        # cleanup only ever deletes snapshots recorded here.
+        self._temp_snapshot_iters = set()
         self._setup_accelerator()
         self._setup_logging()
         self._setup_data()
@@ -275,6 +295,7 @@ class BaseTrainer:
         self.performance_level = performance_level
         self.find_unused_parameters = find_unused_parameters
 
+        self._apply_init_defaults()
         self._init_eval_attrs(**extra)
         self._setup_accelerator()
         self._setup_test_data()
@@ -283,8 +304,36 @@ class BaseTrainer:
         self._prepare_for_evaluation()
         return self
 
+    def _apply_init_defaults(self):
+        """Set every defaulted ``__init__`` parameter (across the MRO) as an
+        instance attribute, unless already set.
+
+        Relies on the convention that ``__init__`` parameter names equal
+        attribute names.  This lets :meth:`init_for_evaluation` skip
+        ``__init__`` without each subclass mirroring its defaults in
+        :meth:`_init_eval_attrs`; that hook only needs true overrides.
+        """
+        for klass in type(self).__mro__:
+            init = klass.__dict__.get("__init__")
+            if init is None:
+                continue
+            for name, param in inspect.signature(init).parameters.items():
+                if param.default is inspect.Parameter.empty:
+                    continue
+                if not hasattr(self, name):
+                    default = param.default
+                    # Match __init__'s `x or {}` normalization for dict params
+                    if default is None and (name.endswith("_args") or name == "init_cfg"):
+                        default = {}
+                    setattr(self, name, default)
+
     def _init_eval_attrs(self, **extra):
-        """Hook for subclasses to store extra attributes before the eval setup chain."""
+        """Hook for subclasses to store extra attributes before the eval setup chain.
+
+        Defaults for all ``__init__`` parameters are already applied by
+        :meth:`_apply_init_defaults`; only set attributes that need
+        eval-specific values.
+        """
 
     # ── Setup helpers (called from __init__) ──────────────────────
 
@@ -294,17 +343,25 @@ class BaseTrainer:
         ddp_kwargs = DistributedDataParallelKwargs(
             find_unused_parameters=self.find_unused_parameters
         )
+        # sync_with_dataloader=False: our micro-batch loop restarts the data
+        # iterator across epochs, so accumulation must not sync on dataloader
+        # exhaustion or the one-call-one-step invariant of _run_train_step breaks.
+        ga_plugin = GradientAccumulationPlugin(
+            num_steps=self.gradient_accumulation_steps,
+            sync_with_dataloader=False,
+        )
         self.accelerator = Accelerator(
             cpu=self.use_cpu,
             dataloader_config=dataloader_config,
             kwargs_handlers=[ddp_kwargs],
+            gradient_accumulation_plugin=ga_plugin,
         )
         seed_everything(self.random_seed)
         set_performance_level(self.performance_level)
 
     def _setup_logging(self):
         """Open TensorBoard writer and JSONL log file (main process only)."""
-        if self.accelerator.is_local_main_process:
+        if self.accelerator.is_main_process:
             self.tb_logger = SummaryWriter(os.path.join(self.rundir, "log"))
             self.log_file = open(os.path.join(self.rundir, "training_log.jsonl"), "a")
         else:
@@ -395,100 +452,288 @@ class BaseTrainer:
         self.models[self.model_name] = value
 
     def _setup_optimizer(self):
-        """Create the optimizer covering all trained models' parameters."""
+        """Create optimizers for all trained models, keyed by name.
+
+        The default implementation creates a single ``"main"`` optimizer covering
+        all trained models' parameters.  Subclasses may override to create several
+        optimizers (e.g. one per model for alternating optimization); all entries
+        are prepared, stepped, and checkpointed by the base class.
+        """
         trained_models = list(self.models.values())
         model_or_models = trained_models[0] if len(trained_models) == 1 else trained_models
-        self.optimizer = build_optimizer(
-            self.optim_type,
-            model_or_models,
-            lr=self.learning_rate,
-            weight_decay=self.weight_decay,
-            **self.optim_args,
-        )
+        self.optimizers = {
+            "main": build_optimizer(
+                self.optim_type,
+                model_or_models,
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+                **self.optim_args,
+            )
+        }
+
+    @property
+    def optimizer(self):
+        """The primary optimizer (shortcut into ``self.optimizers``)."""
+        return self.optimizers["main"]
+
+    @optimizer.setter
+    def optimizer(self, value):
+        self.optimizers["main"] = value
 
     def _setup_scheduler(self):
-        """Create the LR scheduler, resuming from the current iteration if applicable."""
-        self.scheduler = build_lr_scheduler(
-            self.optimizer,
-            self.lr_scheduler_type,
-            self.iterations,
-            last_it=self.state.iteration - 1,
-            **self.lr_scheduler_args,
-        )
+        """Create one LR scheduler per optimizer, resuming from the current iteration."""
+        self.schedulers = {
+            name: build_lr_scheduler(
+                opt,
+                self.lr_scheduler_type,
+                self.iterations,
+                last_it=self.state.iteration - 1,
+                **self.lr_scheduler_args,
+            )
+            for name, opt in self.optimizers.items()
+        }
+
+    @property
+    def scheduler(self):
+        """The primary LR scheduler (shortcut into ``self.schedulers``)."""
+        return self.schedulers["main"]
+
+    @scheduler.setter
+    def scheduler(self, value):
+        self.schedulers["main"] = value
 
     # ── Checkpoint ────────────────────────────────────────────────
+    #
+    # Layout (new format), under ``rundir/ckpts/``:
+    #   ckpt_{model_name}_{iteration:07d}.pt   one standard single-model file per
+    #                                          checkpointed model (weights + metadata)
+    #   state_{iteration:07d}.pt               training state: per-name optimizer
+    #                                          states, scaler state, and counters
+    #
+    # A state file is only written at iterations where model files are also
+    # written, so the latest state always has matching model files to resume
+    # from.  Legacy runs with merged ``ckpt_*`` files in the rundir root are
+    # still loadable (resume then continues in the new format).
+
+    @property
+    def ckpt_dir(self):
+        """Directory holding checkpoint and training-state files."""
+        return os.path.join(self.rundir, "ckpts")
+
+    def _checkpointed_models(self) -> dict:
+        """Models to save/load in checkpoints, keyed by name.
+
+        Defaults to all trained models.  Subclasses may override to add
+        stateful auxiliary models (e.g. an EMA teacher from ``aux_models``).
+        """
+        return self.models
+
+    def _model_ckpt_path(self, name: str, iteration: int) -> str:
+        return os.path.join(self.ckpt_dir, f"ckpt_{name}_{iteration:07d}.pt")
+
+    def _state_path(self, iteration: int) -> str:
+        return os.path.join(self.ckpt_dir, f"state_{iteration:07d}.pt")
 
     def _load_checkpoint(self):
-        """Resume from the latest checkpoint in *rundir*, or apply weight init / pretrained weights."""
-        ckpt_filename = find_latest_ckpt(self.rundir, f"ckpt_{self.model_name}")
+        """Resume from the latest training state in *ckpt_dir*, falling back to
+        legacy merged checkpoints in the rundir root, then to weight init /
+        pretrained weights."""
+        state_filename = find_latest_ckpt(self.ckpt_dir, "state_")
 
-        if ckpt_filename:
-            model_state_dict, training_state_dicts, metadata = load_torch_ckpt(ckpt_filename)
-            # Primary model is stored under the "model" key
-            self.model.load_state_dict(model_state_dict)
-            # Additional trained models are stored under their name
-            for name, m in self.models.items():
-                if name != self.model_name and name in training_state_dicts:
-                    m.load_state_dict(training_state_dicts.pop(name))
-            self.optimizer.load_state_dict(training_state_dicts["optimizer"])
-            if self.accelerator.scaler is not None and "scalar" in training_state_dicts:
-                self.accelerator.scaler.load_state_dict(training_state_dicts["scalar"])
-            self.accelerator.print(f"Loaded from {ckpt_filename}")
-            self.state.iteration = int(metadata.get("iteration", 0))
-            self.state.epoch = int(metadata.get("epoch", 0))
-            self.state.rows = int(metadata.get("rows", 0))
-        else:
-            for m in self.models.values():
-                m.apply(weights_init(self.init_cfg))
-            if self.load_from is not None:
-                model_state_dict, _, _ = load_torch_ckpt(self.load_from)
-                model_state_dict = state_dict_drop_size_unmatched(self.model, model_state_dict)
-                missing_keys, unexpected_keys = self.model.load_state_dict(
-                    model_state_dict, strict=False
-                )
-                if unexpected_keys:
-                    self.accelerator.print(
-                        f"unexpected keys in state_dict: {', '.join(unexpected_keys)}"
-                    )
-                if missing_keys:
-                    self.accelerator.print(
-                        f"missing keys in state_dict: {', '.join(missing_keys)}"
-                    )
-                self.accelerator.print(f"Loaded from pretrained: {self.load_from}")
-
-    def _save_checkpoint(self):
-        """Save all trained models, optimizer, and scaler state to disk."""
-        st = self.state
-        if not self.accelerator.is_local_main_process:
+        if state_filename:
+            self._load_state_checkpoint(state_filename)
             return
 
-        last_ckpt_filename = find_latest_ckpt(self.rundir, f"ckpt_{self.model_name}")
+        if os.path.isdir(self.ckpt_dir) and any(
+            fn.startswith("ckpt_") for fn in os.listdir(self.ckpt_dir)
+        ):
+            self.accelerator.print(
+                f"Warning: model checkpoints exist in {self.ckpt_dir} but no state file"
+                " was found; starting from scratch."
+            )
 
-        model_state_dict = self.unwrapped_model.state_dict()
-        training_state_dicts = {"optimizer": self.optimizer.state_dict()}
-        # Save additional trained models under their name
+        legacy_filename = find_latest_ckpt(self.rundir, f"ckpt_{self.model_name}")
+        if legacy_filename:
+            self._load_legacy_checkpoint(legacy_filename)
+            return
+
+        self._init_weights()
+
+    def _load_state_checkpoint(self, state_filename):
+        """Load models, optimizers, and scaler anchored on *state_filename*."""
+        iteration = get_iteration_from_ckpt_filename(state_filename)
+        if iteration is None:
+            raise RuntimeError(f"Cannot parse iteration from state file {state_filename}")
+
+        for name, m in self._checkpointed_models().items():
+            model_ckpt = self._model_ckpt_path(name, iteration)
+            if not os.path.isfile(model_ckpt):
+                raise FileNotFoundError(
+                    f"Training state {state_filename} refers to iteration {iteration},"
+                    f" but model checkpoint {model_ckpt} is missing"
+                )
+            model_state_dict, _, _ = load_torch_ckpt(model_ckpt)
+            m.load_state_dict(model_state_dict)
+
+        state = torch.load(state_filename, map_location="cpu", weights_only=True)
+        for name, opt_state in state["optimizers"].items():
+            self.optimizers[name].load_state_dict(opt_state)
+        if self.accelerator.scaler is not None and state.get("scaler") is not None:
+            self.accelerator.scaler.load_state_dict(state["scaler"])
+
+        metadata = state["metadata"]
+        self.state.iteration = int(metadata.get("iteration", 0))
+        self.state.epoch = int(metadata.get("epoch", 0))
+        self.state.rows = int(metadata.get("rows", 0))
+        self.accelerator.print(f"Loaded from {state_filename}")
+
+    def _load_legacy_checkpoint(self, ckpt_filename):
+        """Load a legacy merged checkpoint (models + optimizer in one file)."""
+        model_state_dict, training_state_dicts, metadata = load_torch_ckpt(ckpt_filename)
+        # Primary model is stored under the "model" key
+        self.model.load_state_dict(model_state_dict)
+        # Additional trained models are stored under their name
         for name, m in self.models.items():
-            if name != self.model_name:
-                training_state_dicts[name] = self._unwrap(m).state_dict()
-        if self.accelerator.scaler is not None:
-            training_state_dicts["scalar"] = self.accelerator.scaler.state_dict()
-        metadata_dict = {
+            if name != self.model_name and name in training_state_dicts:
+                m.load_state_dict(training_state_dicts.pop(name))
+        self.optimizer.load_state_dict(training_state_dicts["optimizer"])
+        if self.accelerator.scaler is not None and "scalar" in training_state_dicts:
+            self.accelerator.scaler.load_state_dict(training_state_dicts["scalar"])
+        self.accelerator.print(f"Loaded from legacy checkpoint {ckpt_filename}")
+        self.state.iteration = int(metadata.get("iteration", 0))
+        self.state.epoch = int(metadata.get("epoch", 0))
+        self.state.rows = int(metadata.get("rows", 0))
+
+    def _init_weights(self):
+        """Apply weight init to all trained models, then optional pretrained weights."""
+        for m in self.models.values():
+            m.apply(weights_init(self.init_cfg))
+        if self.load_from is not None:
+            model_state_dict, _, _ = load_torch_ckpt(self.load_from)
+            model_state_dict = state_dict_drop_size_unmatched(self.model, model_state_dict)
+            missing_keys, unexpected_keys = self.model.load_state_dict(
+                model_state_dict, strict=False
+            )
+            if unexpected_keys:
+                self.accelerator.print(
+                    f"unexpected keys in state_dict: {', '.join(unexpected_keys)}"
+                )
+            if missing_keys:
+                self.accelerator.print(
+                    f"missing keys in state_dict: {', '.join(missing_keys)}"
+                )
+            self.accelerator.print(f"Loaded from pretrained: {self.load_from}")
+
+    def _is_save_iteration(self, iteration: int) -> bool:
+        """Whether *iteration* is due for a checkpoint save per the configured intervals."""
+        return (
+            iteration % self.save_interval == 0
+            or iteration % self.temp_save_interval == 0
+            or (
+                self.state_save_interval is not None
+                and iteration % self.state_save_interval == 0
+            )
+        )
+
+    def _save_checkpoint(self, force_state: bool = False):
+        """Save per-model checkpoint files and (if due) the training state, then
+        prune temporary snapshots and old state files.
+
+        Args:
+            force_state: Save the training state even if ``state_save_interval``
+                does not match (used for the final save at end of training).
+        """
+        st = self.state
+        if not self.accelerator.is_main_process:
+            return
+
+        metadata = {
             "iteration": str(st.iteration),
             "epoch": str(st.epoch),
             "rows": str(st.rows),
         }
-        save_torch_ckpt(
-            os.path.join(self.rundir, f"ckpt_{self.model_name}_{st.iteration:07d}"),
-            model_state_dict,
-            training_state_dicts,
-            metadata_dict,
-        )
+        for name, m in self._checkpointed_models().items():
+            save_torch_ckpt(
+                self._model_ckpt_path(name, st.iteration),
+                self._unwrap(m).state_dict(),
+                {},
+                metadata,
+            )
+        if st.iteration % self.save_interval != 0:
+            self._temp_snapshot_iters.add(st.iteration)
 
-        # remove last snapshot if it's a temporary snapshot
-        if last_ckpt_filename is not None:
-            last_snapshot_iter = get_iteration_from_ckpt_filename(last_ckpt_filename)
-            if last_snapshot_iter is None or last_snapshot_iter % self.save_interval != 0:
-                os.remove(last_ckpt_filename)
+        if (
+            force_state
+            or self.state_save_interval is None
+            or st.iteration % self.state_save_interval == 0
+        ):
+            self._save_training_state()
+
+        self._cleanup_checkpoints()
+
+    def _save_training_state(self):
+        """Atomically write optimizer/scaler states and counters to a state file."""
+        st = self.state
+        state = {
+            "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
+            "scaler": (
+                self.accelerator.scaler.state_dict()
+                if self.accelerator.scaler is not None
+                else None
+            ),
+            "metadata": {
+                "iteration": st.iteration,
+                "epoch": st.epoch,
+                "rows": st.rows,
+            },
+        }
+        state_path = self._state_path(st.iteration)
+        tmp_path = state_path + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, state_path)
+
+    def _cleanup_checkpoints(self):
+        """Prune old state files beyond ``num_keep_states`` and temporary model
+        snapshots saved by this session that are no longer needed.
+
+        Only snapshots recorded in ``_temp_snapshot_iters`` (i.e. saved by this
+        session at a non-``save_interval`` iteration) are ever deleted, so
+        pre-existing snapshots survive even if ``save_interval`` changed
+        between runs.
+        """
+        if not os.path.isdir(self.ckpt_dir):
+            return
+
+        state_files = []  # (iteration, path)
+        model_groups = {}  # iteration -> [paths]
+        for fn in os.listdir(self.ckpt_dir):
+            path = os.path.join(self.ckpt_dir, fn)
+            if not os.path.isfile(path):
+                continue
+            iteration = get_iteration_from_ckpt_filename(fn)
+            if iteration is None:
+                continue
+            if fn.startswith("state_"):
+                state_files.append((iteration, path))
+            elif fn.startswith("ckpt_"):
+                model_groups.setdefault(iteration, []).append(path)
+
+        state_files.sort()
+        num_keep = len(state_files) if self.num_keep_states < 0 else self.num_keep_states
+        num_delete = max(0, len(state_files) - num_keep)
+        for _, path in state_files[:num_delete]:
+            os.remove(path)
+        kept_state_iters = {it for it, _ in state_files[num_delete:]}
+
+        latest_iter = max(model_groups, default=None)
+        for iteration in list(self._temp_snapshot_iters):
+            if iteration == latest_iter:
+                continue
+            if iteration in kept_state_iters:
+                continue
+            for path in model_groups.get(iteration, []):
+                os.remove(path)
+            self._temp_snapshot_iters.discard(iteration)
 
     def _load_eval_checkpoint(self):
         """Load only model weights from checkpoint for evaluation (no optimizer/scaler/state)."""
@@ -525,18 +770,21 @@ class BaseTrainer:
         return self._unwrap(self.model)
 
     def _prepare_for_training(self):
-        """Wrap trained models, optimizer and dataloaders with accelerator for distributed training."""
+        """Wrap trained models, optimizers and dataloaders with accelerator for distributed training."""
         accelerator = self.accelerator
-        # Prepare all trained models + optimizer + train dataloader together
+        # Prepare all trained models + optimizers + train dataloader together
         model_names = list(self.models.keys())
+        optimizer_names = list(self.optimizers.keys())
         to_prepare = [self.models[n] for n in model_names]
-        to_prepare.extend([self.optimizer, self.train_loader])
+        to_prepare.extend(self.optimizers[n] for n in optimizer_names)
+        to_prepare.append(self.train_loader)
         prepared = accelerator.prepare(*to_prepare)
-        # Unpack: first len(model_names) are models, then optimizer, then train_loader
+        # Unpack: models first, then optimizers, then train_loader
         for i, name in enumerate(model_names):
             self.models[name] = prepared[i]
-        self.optimizer = prepared[len(model_names)]
-        self.train_loader = prepared[len(model_names) + 1]
+        for i, name in enumerate(optimizer_names):
+            self.optimizers[name] = prepared[len(model_names) + i]
+        self.train_loader = prepared[len(model_names) + len(optimizer_names)]
         if self.val_loader is not None:
             self.val_loader = accelerator.prepare_data_loader(self.val_loader)
 
@@ -545,9 +793,32 @@ class BaseTrainer:
         from itertools import chain
         return chain(*(m.parameters() for m in self.models.values()))
 
+    def _clip_gradients(self, parameters=None):
+        """Apply gradient norm/value clipping to *parameters* if configured.
+
+        Defaults to all trained parameters.  Reusable by subclasses that
+        override :meth:`_run_train_step`.
+        """
+        if parameters is None:
+            parameters = self._all_trained_parameters()
+        if self.clip_grad_norm is not None:
+            self.accelerator.clip_grad_norm_(parameters, max_norm=self.clip_grad_norm)
+        elif self.clip_grad_value is not None:
+            self.accelerator.clip_grad_value_(parameters, clip_value=self.clip_grad_value)
+
     def _run_train_step(self, data):
-        """Execute one training iteration: forward, backward, optimizer step."""
-        extra_kwargs = self.on_before_step(data)
+        """Execute one training iteration: forward, backward, optimizer step.
+
+        With ``gradient_accumulation_steps > 1``, consumes additional
+        micro-batches from the train iterator; the optimizer steps once per
+        call, so one call always equals one optimizer step.
+
+        The default implementation assumes a single loss optimized by all
+        optimizers in one backward pass.  Paradigms with alternating
+        optimization (e.g. GANs) should override this method; helpers like
+        :meth:`_clip_gradients` and the hooks remain reusable.
+        """
+        accelerator = self.accelerator
 
         # apply weight clipping if needed (check all trained models)
         for m in self.models.values():
@@ -555,25 +826,40 @@ class BaseTrainer:
             if hasattr(unwrapped, "weight_clipping"):
                 weight_clipping(unwrapped.named_parameters(), unwrapped.weight_clipping)
 
-        accelerator = self.accelerator
-        with accelerator.accumulate(*self.models.values()), accelerator.autocast():
-            self.optimizer.zero_grad(set_to_none=True)
-            loss, loss_dict, aux_dict = self.train_step(data, **extra_kwargs)
-            accelerator.backward(loss)
+        total_loss_dict, total_aux_dict = {}, {}
+        for micro_step in range(self.gradient_accumulation_steps):
+            if micro_step > 0:
+                data = self._fetch_batch()
+            extra_kwargs = self.on_before_step(data)
+            with accelerator.accumulate(*self.models.values()), accelerator.autocast():
+                loss, loss_dict, aux_dict = self.train_step(data, **extra_kwargs)
+                accelerator.backward(loss)
 
-            if self.clip_grad_norm is not None:
-                accelerator.clip_grad_norm_(
-                    self._all_trained_parameters(), max_norm=self.clip_grad_norm
-                )
-            elif self.clip_grad_value is not None:
-                accelerator.clip_grad_value_(
-                    self._all_trained_parameters(), clip_value=self.clip_grad_value
-                )
+                if accelerator.sync_gradients:
+                    self._clip_gradients()
 
-            self.optimizer.step()
-            self.scheduler.step()
+                # step/zero_grad are skipped internally on non-sync micro-batches
+                for opt in self.optimizers.values():
+                    opt.step()
+                if accelerator.sync_gradients:
+                    # keep an LR unchanged when AMP overflow skipped its optimizer's
+                    # step; each optimizer decides overflow independently
+                    for name, sched in self.schedulers.items():
+                        if not getattr(self.optimizers[name], "step_was_skipped", False):
+                            sched.step()
+                for opt in self.optimizers.values():
+                    opt.zero_grad(set_to_none=True)
+            add_dict_to(total_loss_dict, loss_dict)
+            add_dict_to(total_aux_dict, aux_dict)
 
-        return loss_dict, aux_dict
+        if self.gradient_accumulation_steps > 1:
+            for metric_dict in (total_loss_dict, total_aux_dict):
+                for k in metric_dict:
+                    metric_dict[k] = metric_dict[k] / self.gradient_accumulation_steps
+
+        self.on_after_step(data)
+
+        return total_loss_dict, total_aux_dict
 
     def run(self):
         """Run the full training loop from ``state.iteration`` to ``iterations``."""
@@ -593,7 +879,7 @@ class BaseTrainer:
 
             data = self._fetch_batch()
             st.iteration += 1
-            st.rows += self.batch_size
+            st.rows += self.batch_size * self.gradient_accumulation_steps
 
             loss_dict, aux_dict = self._run_train_step(data)
 
@@ -619,16 +905,24 @@ class BaseTrainer:
             if st.iteration % self.show_interval == 0:
                 self._show_progress(loss_dict)
 
-            if (
-                st.iteration % self.save_interval == 0
-                or st.iteration % self.temp_save_interval == 0
-            ):
+            if self._is_save_iteration(st.iteration):
                 self._save_checkpoint()
 
             if st.iteration % self.val_interval == 0 and self.val_loader is not None:
                 self._validate()
 
-        if accelerator.is_local_main_process:
+        # Ensure the final iteration has both model checkpoints and a training
+        # state, so no progress is lost and a finished run is always resumable
+        # even when the intervals do not align.
+        final_state_saved = self._is_save_iteration(st.iteration) and (
+            self.state_save_interval is None
+            or st.iteration % self.state_save_interval == 0
+        )
+        if not final_state_saved:
+            self._save_checkpoint(force_state=True)
+
+        if accelerator.is_main_process:
+            self.tb_logger.close()
             self.log_file.close()
 
     def profile(self, *, wait=0, warmup=10, active=30, profile_memory=False):
@@ -641,7 +935,7 @@ class BaseTrainer:
         accelerator = self.accelerator
 
         def on_trace_ready(p: torch.profiler.profile):
-            if accelerator.is_local_main_process:
+            if accelerator.is_main_process:
                 dev_name = "cpu" if self.use_cpu else "cuda"
                 print(p.key_averages().table(sort_by=f"{dev_name}_time_total", row_limit=16))
                 print("Profile finished. Saving trace...")
@@ -691,7 +985,7 @@ class BaseTrainer:
     def _log_metrics(self, loss_dict, aux_dict):
         """Write training metrics to TensorBoard and the JSONL log file (main process only)."""
         st = self.state
-        if not self.accelerator.is_local_main_process:
+        if not self.accelerator.is_main_process:
             return
 
         log_value_dict(self.tb_logger, "train", loss_dict, st.iteration, st.rows)
@@ -705,9 +999,11 @@ class BaseTrainer:
             "rows": st.rows,
             "elapsed": elapsed_time,
             "it/s": iters_per_second,
-            "entry/s": iters_per_second * self.batch_size,
-            "lr": self.scheduler.get_last_lr()[0],
+            "entry/s": iters_per_second * self.batch_size * self.gradient_accumulation_steps,
         }
+        for name, sched in self.schedulers.items():
+            lr_key = "lr" if name == "main" else f"lr_{name}"
+            running_stat_dict[lr_key] = sched.get_last_lr()[0]
         log_value_dict(self.tb_logger, "running_stat", running_stat_dict, st.iteration, st.rows)
         self._log_last_it = st.iteration
         self._log_last_time = time.time()
@@ -720,6 +1016,13 @@ class BaseTrainer:
         }
         self.log_file.write(json.dumps(json_log_dict) + "\n")
         self.log_file.flush()
+
+    def _loss_summary(self, loss_dict: dict) -> str:
+        """One-line summary of *loss_dict* for progress prints.
+
+        Subclasses may override to include paradigm-specific loss components.
+        """
+        return f"{loss_dict['total_loss']:.4f}"
 
     def _show_progress(self, loss_dict):
         """Print a one-line training progress summary to stdout (main process only)."""
@@ -735,13 +1038,35 @@ class BaseTrainer:
             f" | Elapsed: {format_time(elapsed_time)}"
             f" | Speed: {iters_per_second:.2f} it/s"
             f" | ETA: {format_time(eta_time)}"
-            f" | Loss: {loss_dict['total_loss']:.4f}"
-            f", v={loss_dict['value_loss']:.4f}"
-            f", p={loss_dict['policy_loss']:.4f}",
+            f" | Loss: {self._loss_summary(loss_dict)}",
             flush=True,
         )
         self._show_last_it = st.iteration
         self._show_last_time = time.time()
+
+    def _gather_averaged_metrics(self, metric_dict, num_batches):
+        """Sum *metric_dict* across processes and average over the global batch count.
+
+        Values may be 0-dim tensors or Python scalars.  Must be called on all
+        processes (it performs a collective gather).  Returns
+        ``(averaged_dict, total_batches)`` on the main process and
+        ``(None, None)`` on other processes.
+        """
+        accelerator = self.accelerator
+        gathered = {}
+        for k, v in metric_dict.items():
+            if not isinstance(v, torch.Tensor):
+                v = torch.tensor([v], dtype=torch.float32, device=accelerator.device)
+            gathered[k] = v
+        gathered["num_batches"] = torch.tensor(
+            [num_batches], dtype=torch.long, device=accelerator.device
+        )
+        gathered = accelerator.gather(gathered)
+        if not accelerator.is_main_process:
+            return None, None
+        total_batches = int(torch.sum(gathered.pop("num_batches")).item())
+        averaged = {k: torch.sum(v).item() / total_batches for k, v in gathered.items()}
+        return averaged, total_batches
 
     def _validate(self):
         """Run a full validation pass, gather metrics across processes, and log results."""
@@ -751,7 +1076,7 @@ class BaseTrainer:
         val_start_time = time.time()
         val_loss_dict, val_aux_dict = {}, {}
         num_val_batches = 0
-        if accelerator.is_local_main_process:
+        if accelerator.is_main_process:
             print(
                 f"\nValidation at iteration {st.iteration}/{self.iterations}"
                 f" ({st.iteration/self.iterations*100:.2f}%)...",
@@ -769,26 +1094,17 @@ class BaseTrainer:
         for m in self.models.values():
             m.train()
 
-        # gather all loss dict across processes
-        val_loss_dict["num_val_batches"] = torch.tensor(
-            [num_val_batches], dtype=torch.long, device=accelerator.device
+        # gather and average metrics across processes
+        val_loss_dict, total_val_batches = self._gather_averaged_metrics(
+            val_loss_dict, num_val_batches
         )
-        all_val_loss_dict = accelerator.gather(val_loss_dict)
-        all_val_aux_dict = accelerator.gather(val_aux_dict)
+        val_aux_dict, _ = self._gather_averaged_metrics(val_aux_dict, num_val_batches)
+        val_elapsed_time = time.time() - val_start_time
 
-        if accelerator.is_local_main_process:
-            num_val_batches_tensor = all_val_loss_dict.pop("num_val_batches")
-            num_val_batches = torch.sum(num_val_batches_tensor).item()
-            val_loss_dict, val_aux_dict = {}, {}
-            for k, loss_tensor in all_val_loss_dict.items():
-                val_loss_dict[k] = torch.sum(loss_tensor).item() / num_val_batches
-            for k, aux_tensor in all_val_aux_dict.items():
-                val_aux_dict[k] = torch.sum(aux_tensor).item() / num_val_batches
-
-            val_elapsed_time = time.time() - val_start_time
+        if accelerator.is_main_process:
             elapsed_time = time.time() - self._start_time
             num_val_entries = (
-                num_val_batches * self.batch_size_per_process * self.eval_bs_multipler
+                total_val_batches * self.batch_size_per_process * self.eval_bs_multipler
             )
             log_value_dict(self.tb_logger, "validation", val_loss_dict, st.iteration, st.rows)
             if val_aux_dict:
@@ -809,22 +1125,22 @@ class BaseTrainer:
                 f"Validation finished with {num_val_entries} entries,"
                 f" using {format_time(val_elapsed_time)}."
             )
-            print(
-                f"Validation loss: {val_loss_dict['total_loss']:.4f},"
-                f" v={val_loss_dict['value_loss']:.4f},"
-                f" p={val_loss_dict['policy_loss']:.4f}"
-            )
+            print(f"Validation loss: {self._loss_summary(val_loss_dict)}")
             print(flush=True)
 
-            # subtract validation time from training time
-            self._log_last_time += val_elapsed_time
-            self._show_last_time += val_elapsed_time
+        # subtract validation time from training time on every process:
+        # progress prints run on each node's local main
+        self._log_last_time += val_elapsed_time
+        self._show_last_time += val_elapsed_time
 
     # ── Hooks for subclasses ──────────────────────────────────────
 
     def on_before_step(self, data):
         """Called before each training step. Return extra kwargs for train_step."""
         return {}
+
+    def on_after_step(self, data):
+        """Called after each optimizer step (e.g. for EMA model updates)."""
 
     def train_step(self, data, **kwargs):
         """Forward + loss. Must return (loss, loss_dict, aux_dict)."""
@@ -857,23 +1173,9 @@ class BaseTrainer:
                 if max_batches is not None and num_batches >= max_batches:
                     break
 
-        # Convert scalar metrics to tensors for gathering
-        for k, v in metric_dict.items():
-            if not isinstance(v, torch.Tensor):
-                metric_dict[k] = torch.tensor([v], dtype=torch.float32, device=accelerator.device)
-        metric_dict["num_batches"] = torch.tensor(
-            [num_batches], dtype=torch.long, device=accelerator.device
-        )
+        averaged, total_batches = self._gather_averaged_metrics(metric_dict, num_batches)
 
-        all_metric_dict = accelerator.gather(metric_dict)
-
-        if accelerator.is_local_main_process:
-            num_batches_tensor = all_metric_dict.pop("num_batches")
-            total_batches = torch.sum(num_batches_tensor).item()
-            averaged = {}
-            for k, tensor in all_metric_dict.items():
-                averaged[k] = torch.sum(tensor).item() / total_batches
-
+        if accelerator.is_main_process:
             elapsed = time.time() - start_time
             num_entries = int(total_batches * self.batch_size_per_process * self.eval_bs_multipler)
             print(f"Test finished with {num_entries} entries, in {elapsed:.2f}s.")

@@ -65,19 +65,10 @@ class SupervisedTrainer(BaseTrainer):
         super().__init__(**kwargs)
 
     def _init_eval_attrs(self, *, test_model_args=None, loss_type="CE+CE", **extra):
-        """Store supervised-specific attributes for evaluation before setup chain runs."""
+        """Apply eval-specific overrides (defaults come from ``_apply_init_defaults``)."""
         if test_model_args:
             deep_update_dict(self.model_args, test_model_args)
         self.loss_type = loss_type
-        self.loss_args = {}
-        # Disable KD branch entirely so _init_models skips teacher loading
-        self.kd_model_type = None
-        self.kd_model_args = {}
-        self.kd_checkpoint = None
-        self.kd_use_train_mode = False
-        self.kd_disable_amp = False
-        self.kd_T = 1.0
-        self.kd_alpha = 1.0
 
     def _init_models(self):
         """Build the main model and KD teacher model if ``kd_model_type`` is set."""
@@ -112,6 +103,14 @@ class SupervisedTrainer(BaseTrainer):
         if self._kd_model_key is None:
             return None
         return self.aux_models[self._kd_model_key]
+
+    def _loss_summary(self, loss_dict: dict) -> str:
+        """Show total loss with value and policy components."""
+        return (
+            f"{loss_dict['total_loss']:.4f}"
+            f", v={loss_dict['value_loss']:.4f}"
+            f", p={loss_dict['policy_loss']:.4f}"
+        )
 
     def on_before_step(self, data):
         """Run teacher model inference and return ``kd_results`` for the training step."""

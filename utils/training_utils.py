@@ -6,6 +6,9 @@ import torch.nn.init as init
 import torch.optim as optim
 from torch.utils.data import IterableDataset
 from torch.utils.data.dataloader import DataLoader
+from itertools import chain
+
+from utils.misc_utils import Registry
 
 
 def weights_init(init_cfg: dict):
@@ -65,6 +68,80 @@ def weights_init(init_cfg: dict):
     return init_fun
 
 
+OPTIMIZERS = Registry("optimizer")
+"""Registry of optimizer factories.
+
+Each entry is a callable ``(parameters, model_or_models, lr, weight_decay, **kwargs)
+-> Optimizer``, where *parameters* is the (already filtered) parameter list and
+*model_or_models* is the original model or list of models for factories that
+need module structure (e.g. muon's per-parameter routing).
+"""
+
+
+@OPTIMIZERS.register("adamw")
+def _make_adamw(parameters, model, lr, weight_decay, **kwargs):
+    args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay}
+    args.update(kwargs)
+    return optim.AdamW(parameters, **args)
+
+
+@OPTIMIZERS.register("adamw-ams")
+def _make_adamw_ams(parameters, model, lr, weight_decay, **kwargs):
+    args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay, "amsgrad": True}
+    args.update(kwargs)
+    return optim.AdamW(parameters, **args)
+
+
+@OPTIMIZERS.register("sgd")
+def _make_sgd(parameters, model, lr, weight_decay, **kwargs):
+    args = {"lr": lr, "momentum": 0, "dampening": 0, "weight_decay": weight_decay}
+    args.update(kwargs)
+    return optim.SGD(parameters, **args)
+
+
+@OPTIMIZERS.register("sgd-momentum")
+def _make_sgd_momentum(parameters, model, lr, weight_decay, **kwargs):
+    args = {"lr": lr, "momentum": 0.9, "dampening": 0.1, "nesterov": False, "weight_decay": weight_decay}
+    args.update(kwargs)
+    return optim.SGD(parameters, **args)
+
+
+@OPTIMIZERS.register("sgd-nesterov")
+def _make_sgd_nesterov(parameters, model, lr, weight_decay, **kwargs):
+    # Nesterov momentum requires zero dampening
+    args = {"lr": lr, "momentum": 0.9, "dampening": 0, "nesterov": True, "weight_decay": weight_decay}
+    args.update(kwargs)
+    return optim.SGD(parameters, **args)
+
+
+@OPTIMIZERS.register("muon-adamw")
+def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
+    from utils.muon import Muon, get_params_for_muon
+    from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
+
+    models = model if isinstance(model, (list, tuple)) else [model]
+    params_id_to_name = {}
+    muon_params_id_set = set()
+    for m in models:
+        params_id_to_name.update({id(p): name for name, p in m.named_parameters()})
+        muon_params_id_set.update(id(p) for p in get_params_for_muon(m))
+    muon_args = {"weight_decay": max(1e-2, 0.0 if weight_decay is None else weight_decay)}
+    muon_args.update(kwargs.pop("muon_args", {}))
+    adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
+    adamw_args.update(kwargs.pop("adamw_args", {}))
+    spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
+    spec_adamw = OptimizerSpec(optim.AdamW, adamw_args, None)
+    specs = [spec_muon, spec_adamw]
+    callback = None
+    if kwargs.pop("verbose", False):
+        callback = lambda p, spec_idx: print(
+            f"Adding param {params_id_to_name[id(p)]} ({p.shape}) to "
+            f"optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
+        )
+    kwargs.update({"lr": lr, "weight_decay": weight_decay, "optimizer_selection_callback": callback})
+    return ChainedOptimizer(parameters, specs, **kwargs)
+
+
 def build_optimizer(
     optim_type: str,
     model: torch.nn.Module | list[torch.nn.Module],
@@ -73,8 +150,10 @@ def build_optimizer(
     only_track_requires_grad=True,
     **kwargs,
 ):
+    if optim_type not in OPTIMIZERS:
+        raise ValueError(f"Unsupported optimizer: {optim_type}")
+
     if isinstance(model, (list, tuple)):
-        from itertools import chain
         parameters = chain(*(m.parameters() for m in model))
     else:
         parameters = model.parameters()
@@ -82,55 +161,7 @@ def build_optimizer(
         # only track parameters with requires_grad=True
         parameters = [p for p in parameters if p.requires_grad]
 
-    if optim_type == "adamw":
-        args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay}
-        args.update(kwargs)
-        opt = optim.AdamW(parameters, **args)
-    elif optim_type == "adamw-ams":
-        args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay, "amsgrad": True}
-        args.update(kwargs)
-        opt = optim.AdamW(parameters, **args)
-    elif optim_type == "sgd":
-        args = {"lr": lr, "momentum": 0, "dampening": 0, "weight_decay": weight_decay}
-        args.update(kwargs)
-        opt = optim.SGD(parameters, **args)
-    elif optim_type == "sgd-momentum":
-        args = {"lr": lr, "momentum": 0.9, "dampening": 0.1, "nesterov": False, "weight_decay": weight_decay}
-        args.update(kwargs)
-        opt = optim.SGD(parameters, **args)
-    elif optim_type == "sgd-nesterov":
-        args = {"lr": lr, "momentum": 0.9, "dampening": 0.1, "nesterov": True, "weight_decay": weight_decay}
-        args.update(kwargs)
-        opt = optim.SGD(parameters, **args)
-    elif optim_type == "muon-adamw":
-        from utils.muon import Muon, get_params_for_muon
-        from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
-
-        models = model if isinstance(model, (list, tuple)) else [model]
-        params_id_to_name = {}
-        muon_params_id_set = set()
-        for m in models:
-            params_id_to_name.update({id(p): name for name, p in m.named_parameters()})
-            muon_params_id_set.update(id(p) for p in get_params_for_muon(m))
-        muon_args = {"weight_decay": max(1e-2, 0.0 if weight_decay is None else weight_decay)}
-        muon_args.update(kwargs.pop("muon_args", {}))
-        adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
-        adamw_args.update(kwargs.pop("adamw_args", {}))
-        spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
-        spec_adamw = OptimizerSpec(optim.AdamW, adamw_args, None)
-        specs = [spec_muon, spec_adamw]
-        callback = None
-        if kwargs.pop("verbose", False):
-            callback = lambda p, spec_idx: print(
-                f"Adding param {params_id_to_name[id(p)]} ({p.shape}) to "
-                f"optimizer{spec_idx} {str(specs[spec_idx].class_type)}"
-            )
-        kwargs.update({"lr": lr, "weight_decay": weight_decay, "optimizer_selection_callback": callback})
-        opt = ChainedOptimizer(parameters, specs, **kwargs)
-    else:
-        raise ValueError(f"Unsupported optimizer: {optim_type}")
-
-    return opt
+    return OPTIMIZERS[optim_type](parameters, model, lr, weight_decay, **kwargs)
 
 
 def build_lr_scheduler(optimizer, lr_schedule_type, iterations, last_it=-1, **kwargs):
@@ -173,13 +204,16 @@ def build_data_loader(
     if "pin_memory" not in kwargs:
         kwargs["pin_memory"] = True
 
+    # Default to persistent workers to avoid worker restart cost between epochs
+    if "persistent_workers" not in kwargs:
+        kwargs["persistent_workers"] = num_workers > 0
+
     dataloader = DataLoader(
         dataset,
         batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
         drop_last=drop_last,
-        persistent_workers=(num_workers > 0),
         **kwargs,
     )
     return dataloader

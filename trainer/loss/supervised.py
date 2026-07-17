@@ -214,6 +214,9 @@ def compute_supervised_losses(
             value_policy_ratio=value_policy_ratio,
             **extra_args,
         )
+        if kd_alpha == 1.0:
+            # ground-truth loss is only logged; keep it out of the backward graph
+            real_loss = real_loss.detach()
         total_loss = kd_alpha * total_loss * (kd_T**2) + (1 - kd_alpha) * real_loss
         kd_loss_dict = {"kd_" + k: v for k, v in loss_dict.items()}
         loss_dict = real_loss_dict

@@ -1,4 +1,8 @@
-"""Supervised evaluation metrics: accuracy, MSE, and optional cross-eval error."""
+"""Supervised evaluation metrics: accuracy, MSE, and optional cross-eval error.
+
+All helpers return 0-dim GPU tensors; conversion to Python floats happens once
+at the end of evaluation (in ``BaseTrainer.test``) to avoid per-batch GPU syncs.
+"""
 
 import torch
 
@@ -10,26 +14,23 @@ def top_k_accuracy(policy, policy_target, k):
     """Compute top-k move overlap accuracy between policy and target."""
     _, topkmoves = torch.topk(policy, dim=1, k=k, sorted=False)
     _, topkmoves_target = torch.topk(policy_target, dim=1, k=k, sorted=False)
-    move_correct_count = 0
-    for moves, moves_target in zip(topkmoves, topkmoves_target):
-        moveset = set(moves.tolist())
-        moveset_target = set(moves_target.tolist())
-        move_correct_count += len(moveset.intersection(moveset_target))
-    return move_correct_count / k / len(topkmoves)
+    # Count per-sample intersection size; top-k indices are unique within a row,
+    # so checking each predicted move against all target moves counts overlaps.
+    overlap = (topkmoves.unsqueeze(2) == topkmoves_target.unsqueeze(1)).any(dim=2).sum(dim=1)
+    return overlap.float().mean() / k
 
 
 def _ce_loss_metrics(data, results):
-    """Compute CE loss metrics and return as ``{lossCE_<name>: float}``."""
+    """Compute CE loss metrics and return as ``{lossCE_<name>: tensor}``."""
     _, losses_ce_ce, _ = compute_supervised_losses("CE+CE", data, results)
-    return {f"lossCE_{k}": v.item() for k, v in losses_ce_ce.items()}
+    return {f"lossCE_{k}": v for k, v in losses_ce_ce.items()}
 
 
 def _policy_accuracy_metrics(policy, policy_target):
     """Compute bestmove and top-k policy accuracy metrics."""
     bestmove_eq = torch.argmax(policy, dim=1) == torch.argmax(policy_target, dim=1)
-    bestmove_acc = torch.sum(bestmove_eq) / bestmove_eq.size(0)
     return {
-        "bestmove_acc": bestmove_acc.item(),
+        "bestmove_acc": bestmove_eq.float().mean(),
         "top2move_acc": top_k_accuracy(policy, policy_target, k=2),
         "top3move_acc": top_k_accuracy(policy, policy_target, k=3),
     }
@@ -58,11 +59,11 @@ def _value_accuracy_metrics(value, value_target):
         drawrate_correct = value_isdraw == value_isdraw_target
         drawrate_mse = torch.mean((value[:, 2] - value_target[:, 2]) ** 2)
 
-        metrics["drawrate_acc"] = (torch.sum(drawrate_correct) / drawrate_correct.size(0)).item()
-        metrics["drawrate_mse"] = drawrate_mse.item()
+        metrics["drawrate_acc"] = drawrate_correct.float().mean()
+        metrics["drawrate_mse"] = drawrate_mse
 
-    metrics["winrate_acc"] = (torch.sum(winrate_correct) / winrate_correct.size(0)).item()
-    metrics["winrate_mse"] = winrate_mse.item()
+    metrics["winrate_acc"] = winrate_correct.float().mean()
+    metrics["winrate_mse"] = winrate_mse
     return metrics, value, value_target
 
 
@@ -70,17 +71,17 @@ def _cross_eval_metrics(value, value_target):
     """Compute absolute and relative value prediction errors."""
     abs_err = torch.abs(value - value_target)
     return {
-        "value_abserr_mean": abs_err.mean().item(),
-        "value_abserr_max": abs_err.max().item(),
-        "value_relerr_mean": (abs_err / (torch.abs(value) + 1e-4)).mean().item(),
-        "value_relerr_max": (abs_err / (torch.abs(value) + 1e-4)).max().item(),
+        "value_abserr_mean": abs_err.mean(),
+        "value_abserr_max": abs_err.max(),
+        "value_relerr_mean": (abs_err / (torch.abs(value) + 1e-4)).mean(),
+        "value_relerr_max": (abs_err / (torch.abs(value) + 1e-4)).max(),
     }
 
 
 def compute_supervised_metrics(data, results, do_cross_eval=False):
     """Compute supervised metrics from model outputs.
 
-    Returns a dict of Python floats with CE losses, bestmove/top-k accuracy,
+    Returns a dict of 0-dim tensors with CE losses, bestmove/top-k accuracy,
     value accuracy/MSE, draw metrics, and optional cross-eval errors.
     """
     value, policy, *retvals = results

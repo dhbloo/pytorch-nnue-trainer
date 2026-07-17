@@ -4,7 +4,7 @@ import yaml
 import os
 
 from utils.file_utils import make_dir
-from trainer.supervised import SupervisedTrainer
+from trainer import build_trainer
 
 
 def parse_args_and_init():
@@ -15,6 +15,7 @@ def parse_args_and_init():
     parser.add("-d", "--train_datas", nargs="+", help="Training dataset file or directory paths")
     parser.add("-v", "--val_datas", nargs="+", help="Validation dataset file or directory paths")
     parser.add("-r", "--rundir", required=True, help="Run directory")
+    parser.add("--trainer_type", default="supervised", help="Trainer type")
     parser.add("--load_from", help="Load pretrained weights from file")
     parser.add("--use_cpu", action="store_true", help="Use cpu only")
     parser.add("--dataset_type", required=True, help="Dataset type")
@@ -37,6 +38,13 @@ def parse_args_and_init():
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")
     parser.add("--batch_size", type=int, default=128, help="Total batch size of all GPUs")
+    parser.add(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="Num of micro-batches accumulated per optimizer step"
+        " (effective batch size = batch_size * this)",
+    )
     parser.add("--eval_bs_multipler", type=int, default=1, help="Eval batch size multipler")
     parser.add("--learning_rate", type=float, default=1e-3, help="Learning rate")
     parser.add("--weight_decay", type=float, default=1e-2, help="Weight decay")
@@ -52,6 +60,17 @@ def parse_args_and_init():
         type=int,
         default=5000,
         help="Num iterations to save a temporary snapshot (removed when there is newer one)",
+    )
+    parser.add(
+        "--state_save_interval",
+        type=int,
+        help="Num iterations to save training state (defaults to every snapshot save)",
+    )
+    parser.add(
+        "--num_keep_states",
+        type=int,
+        default=1,
+        help="Num of most recent training state files to keep (-1 to keep all)",
     )
     parser.add("--kd_model_type", help="Knowledge distillation model type")
     parser.add(
@@ -86,7 +105,7 @@ def parse_args_and_init():
 
     args, _ = parser.parse_known_args()  # parse args
 
-    if PartialState(cpu=args.use_cpu).is_local_main_process:
+    if PartialState(cpu=args.use_cpu).is_main_process:
         parser.print_values()  # print argument values
         make_dir(args.rundir)  # make run directory
         # write run config
@@ -106,7 +125,8 @@ def train(**kwargs):
     profile_memory = kwargs.pop("profile_memory", False)
     kwargs.pop("profile_finish_exit", None)
 
-    trainer = SupervisedTrainer(**kwargs)
+    trainer_type = kwargs.pop("trainer_type", "supervised")
+    trainer = build_trainer(trainer_type, **kwargs)
 
     if do_profile:
         trainer.profile(
