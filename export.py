@@ -118,6 +118,9 @@ class ModelIOv1(torch.nn.Module):
 
     def get_model_outputs(self, results):
         value, policy = results["value"], results["policy"]
+        if policy.ndim == 4 and policy.shape[1] == 1:
+            # heads like mixnet's output [B, 1, H, W]
+            policy = torch.squeeze(policy, dim=1)
         assert value.ndim == 2 and value.shape[1] == 3, f"value.shape={value.shape}"
         assert policy.ndim == 3, f"policy.shape={policy.shape}"
         assert value.shape[0] == policy.shape[0]

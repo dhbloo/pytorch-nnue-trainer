@@ -66,6 +66,9 @@ class DirectionalConvLayer(nn.Module):
             dim_out, dim_in, kernel_size = self.weight.shape
         else:
             kernel_size, dim_out, dim_in = self.weight.shape
+        # plain int: under torch.jit.trace shape elements are traced tensors,
+        # and conv2d/F.pad reject a 0-dim tensor as padding
+        kernel_size = int(kernel_size)
         zero = torch.zeros((dim_out, dim_in), dtype=self.weight.dtype, device=self.weight.device)
 
         if self.use_channel_last:
