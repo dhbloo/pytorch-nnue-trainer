@@ -6,7 +6,7 @@ from accelerate import (
     DataLoaderConfiguration,
     DistributedDataParallelKwargs,
 )
-from accelerate.utils import GradientAccumulationPlugin
+from accelerate.utils import DynamoBackend, GradientAccumulationPlugin
 from accelerate.utils.other import is_compiled_module
 from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
@@ -20,6 +20,8 @@ from tqdm.auto import tqdm
 from dataset import build_dataset
 from model import build_model
 from trainer.profiler import NULL_PROFILER, build_profiler
+from utils.compile_utils import model_inductor_config, with_inductor_options
+from utils.cuda_utils import configure_cuda_memory_limit
 from utils.training_utils import (
     build_lr_scheduler,
     build_optimizer,
@@ -28,6 +30,7 @@ from utils.training_utils import (
     resolve_weight_clipping,
     apply_weight_clipping,
     state_dict_drop_size_unmatched,
+    DeviceLoaderWrapper,
 )
 from utils.misc_utils import (
     seed_everything,
@@ -75,6 +78,8 @@ class BaseTrainer:
             effective batch size is ``batch_size * gradient_accumulation_steps``.
         random_seed: Seed for all random number generators.
         performance_level: Torch performance level (0 = safe, 2 = fast).
+        max_memory_fraction: Optional per-process CUDA allocator ceiling in
+            ``(0, 1]``. Applied before datasets and models allocate tensors.
         use_cpu: Force training on CPU even if CUDA is available.
         profiler_args: Profiler configuration, or ``None`` to disable (zero
             overhead).  Keys: ``timing`` (log per-region iteration times at
@@ -139,6 +144,7 @@ class BaseTrainer:
         gradient_accumulation_steps: int = 1,
         random_seed: int = 42,
         performance_level: int = 2,
+        max_memory_fraction: float | None = None,
         use_cpu: bool = False,
         profiler_args: dict | None = None,
         # Data
@@ -189,6 +195,7 @@ class BaseTrainer:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.random_seed = random_seed
         self.performance_level = performance_level
+        self.max_memory_fraction = max_memory_fraction
         self.use_cpu = use_cpu
         self.profiler_args = profiler_args or {}
 
@@ -235,6 +242,7 @@ class BaseTrainer:
         # cleanup only ever deletes snapshots recorded here.
         self._temp_snapshot_iters = set()
         self._setup_accelerator()
+        self._setup_cuda_memory_limit()
         self._setup_logging()
         self._setup_profiler()
         self._setup_data()
@@ -263,6 +271,7 @@ class BaseTrainer:
         use_cpu: bool = False,
         random_seed: int = 42,
         performance_level: int = 0,
+        max_memory_fraction: float | None = None,
         find_unused_parameters: bool = False,
         **extra,
     ):
@@ -286,6 +295,7 @@ class BaseTrainer:
             use_cpu: Force evaluation on CPU even if CUDA is available.
             random_seed: Seed for all random number generators.
             performance_level: Torch performance level (0 = safe, 2 = fast).
+            max_memory_fraction: Optional per-process CUDA allocator ceiling.
             find_unused_parameters: Enable ``find_unused_parameters`` in DDP wrapper.
             **extra: Additional keyword arguments forwarded to ``_init_eval_attrs``.
         """
@@ -304,11 +314,13 @@ class BaseTrainer:
         self.use_cpu = use_cpu
         self.random_seed = random_seed
         self.performance_level = performance_level
+        self.max_memory_fraction = max_memory_fraction
         self.find_unused_parameters = find_unused_parameters
 
         self._apply_init_defaults()
         self._init_eval_attrs(**extra)
         self._setup_accelerator()
+        self._setup_cuda_memory_limit()
         self._setup_test_data()
         self._init_models()
         self._load_eval_checkpoint()
@@ -371,6 +383,18 @@ class BaseTrainer:
         set_performance_level(self.performance_level)
         self.profiler = NULL_PROFILER
 
+    def _setup_cuda_memory_limit(self):
+        """Apply the configured allocator ceiling before data/model allocation."""
+        self.cuda_memory_limit_bytes = configure_cuda_memory_limit(
+            self.accelerator.device,
+            self.max_memory_fraction,
+        )
+        if self.cuda_memory_limit_bytes is not None:
+            limit_gib = self.cuda_memory_limit_bytes / (1024**3)
+            self.accelerator.print(
+                f"CUDA allocator limit: {self.max_memory_fraction:.1%} ({limit_gib:.2f} GiB)"
+            )
+
     def _setup_profiler(self):
         """Build the training profiler (a zero-overhead null object when disabled)."""
         self.profiler = build_profiler(
@@ -398,6 +422,7 @@ class BaseTrainer:
             self.train_datas,
             shuffle=shuffle,
             pipeline_args=self.data_pipelines,
+            batch_size=self.batch_size_per_process,
             **self.dataset_args,
         )
         self.train_loader = build_data_loader(
@@ -414,6 +439,7 @@ class BaseTrainer:
                 self.val_datas,
                 shuffle=False,
                 pipeline_args=self.data_pipelines,
+                batch_size=self.batch_size_per_process * self.eval_bs_multipler,
                 **(self.val_dataset_args if self.val_dataset_type else self.dataset_args),
             )
             self.val_loader = build_data_loader(
@@ -434,6 +460,7 @@ class BaseTrainer:
             self.dataset_type,
             self.test_datas,
             shuffle=False,
+            batch_size=self.batch_size_per_process * self.eval_bs_multipler,
             **self.dataset_args,
         )
         self.test_loader = build_data_loader(
@@ -460,6 +487,8 @@ class BaseTrainer:
         self.models = {}
         self.aux_models = {}
         model = build_model(self.model_type, **self.model_args)
+        self._primary_inductor_config = model_inductor_config(model)
+        self._configure_model_compilation(model)
         self.model_name = model.name
         self.models[self.model_name] = model
 
@@ -768,13 +797,20 @@ class BaseTrainer:
     def _prepare_for_evaluation(self):
         """Wrap trained models and test dataloader with accelerator for distributed evaluation."""
         accelerator = self.accelerator
+        batched_test = getattr(self.test_loader.dataset, "YIELDS_BATCHES", False)
         model_names = list(self.models.keys())
         to_prepare = [self.models[n] for n in model_names]
-        to_prepare.append(self.test_loader)
+        if not batched_test:
+            to_prepare.append(self.test_loader)
         prepared = accelerator.prepare(*to_prepare)
+        if len(to_prepare) == 1:
+            prepared = (prepared,)
         for i, name in enumerate(model_names):
             self.models[name] = prepared[i]
-        self.test_loader = prepared[len(model_names)]
+        if batched_test:
+            self.test_loader = self._prepare_data_loader(self.test_loader)
+        else:
+            self.test_loader = prepared[-1]
 
     # ── Training loop ─────────────────────────────────────────────
 
@@ -785,6 +821,49 @@ class BaseTrainer:
             m = m._orig_mod
         return m
 
+    def _maybe_compile(self, fn, *, inductor_config=None, **overrides):
+        """Compile *fn* with the accelerator's dynamo settings.
+
+        Returns *fn* unchanged when dynamo is disabled, so callers can use the
+        result unconditionally.  Use this to pull loss computation (and other
+        per-iteration tensor work) into the same compiled graph as the model
+        forward instead of running it eagerly.  Explicit overrides are intended
+        for model subgraphs that require e.g. dynamic shapes or a full graph;
+        backend and mode still come from the Accelerate configuration unless a
+        caller deliberately replaces them.
+        """
+        plugin = self.accelerator.state.dynamo_plugin
+        if plugin.backend == DynamoBackend.NO:
+            return fn
+        compile_kwargs = plugin.to_kwargs()
+        compile_kwargs.update(overrides)
+        if inductor_config is None:
+            inductor_config = self._primary_inductor_config
+        compile_kwargs = with_inductor_options(compile_kwargs, inductor_config)
+        return torch.compile(fn, **compile_kwargs)
+
+    def _configure_model_compilation(self, model):
+        """Inject the configured compiler into optional model subgraphs.
+
+        Models keep eager reference callables when used standalone.  A model
+        may implement ``configure_compilation(compile_fn)`` to compile an eager
+        graph-break region with the active compile policy and optional
+        subgraph-specific overrides.  This runs before Accelerate/DDP wraps
+        the model and does not add compiled callables to its state dict.
+        """
+        configure = getattr(model, "configure_compilation", None)
+        if configure is not None:
+            inductor_config = model_inductor_config(model)
+
+            def compile_fn(fn, **overrides):
+                return self._maybe_compile(
+                    fn,
+                    inductor_config=inductor_config,
+                    **overrides,
+                )
+
+            configure(compile_fn)
+
     @property
     def unwrapped_model(self):
         """Return the raw primary model, stripping DDP and ``torch.compile`` wrappers."""
@@ -794,21 +873,44 @@ class BaseTrainer:
         """Wrap trained models, optimizers and dataloaders with accelerator for distributed training."""
         accelerator = self.accelerator
         # Prepare all trained models + optimizers + train dataloader together
+        # (backends like DeepSpeed require the dataloader in the joint call;
+        # batch-yielding loaders cannot go through accelerate and are wrapped
+        # separately by _prepare_data_loader)
+        batched_train = getattr(self.train_loader.dataset, "YIELDS_BATCHES", False)
         model_names = list(self.models.keys())
         optimizer_names = list(self.optimizers.keys())
         to_prepare = [self.models[n] for n in model_names]
         to_prepare.extend(self.optimizers[n] for n in optimizer_names)
-        to_prepare.append(self.train_loader)
+        if not batched_train:
+            to_prepare.append(self.train_loader)
         prepared = accelerator.prepare(*to_prepare)
-        # Unpack: models first, then optimizers, then train_loader
         for i, name in enumerate(model_names):
             self.models[name] = prepared[i]
         for i, name in enumerate(optimizer_names):
             self.optimizers[name] = prepared[len(model_names) + i]
-        self.train_loader = prepared[len(model_names) + len(optimizer_names)]
+        if batched_train:
+            self.train_loader = self._prepare_data_loader(self.train_loader)
+        else:
+            self.train_loader = prepared[-1]
         if self.val_loader is not None:
-            self.val_loader = accelerator.prepare_data_loader(self.val_loader)
+            self.val_loader = self._prepare_data_loader(self.val_loader)
         self._setup_weight_clipping()
+
+    def _prepare_data_loader(self, dataloader):
+        """Prepare *dataloader* for this process: shard across ranks and move to device.
+
+        Batch-yielding datasets partition work by rank internally and
+        accelerate's ``IterableDatasetShard`` cannot handle their
+        ``batch_size=None`` loaders — for those only device placement is
+        needed, done by :class:`DeviceLoaderWrapper`.  Multi-process runs are
+        not supported with batched datasets yet: per-rank tail dropping can
+        yield unequal batch counts across ranks and deadlock collectives.
+        """
+        if getattr(dataloader.dataset, "YIELDS_BATCHES", False):
+            assert self.accelerator.num_processes == 1, \
+                "batch-yielding datasets are not supported in multi-process training yet"
+            return DeviceLoaderWrapper(dataloader, self.accelerator.device)
+        return self.accelerator.prepare_data_loader(dataloader)
 
     def _setup_weight_clipping(self):
         """Resolve per-model weight-clipping groups once for the training loop."""

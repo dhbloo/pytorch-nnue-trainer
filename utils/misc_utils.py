@@ -28,6 +28,11 @@ def add_dict_to(total_dict, dict_to_add):
     for k, v in dict_to_add.items():
         if k in total_dict:
             total_dict[k] += v
+        elif isinstance(v, torch.Tensor):
+            # Clone so the accumulator owns its storage. Aliasing v would break
+            # when it comes from a CUDA-graph replay (overwritten by the next
+            # run) and would corrupt v itself on the next in-place +=.
+            total_dict[k] = v.clone()
         else:
             total_dict[k] = v
 

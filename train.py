@@ -98,6 +98,11 @@ def parse_args_and_init():
         help="Performance level to use. A higher value will trade higher performance with less precision and reproducibility",
     )
     parser.add(
+        "--max_memory_fraction",
+        type=float,
+        help="Optional per-process CUDA allocator limit in (0, 1]",
+    )
+    parser.add(
         "--profiler_args",
         type=yaml.safe_load,
         default=None,

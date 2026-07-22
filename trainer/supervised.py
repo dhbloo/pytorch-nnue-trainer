@@ -2,6 +2,7 @@
 
 import torch
 from contextlib import nullcontext
+from accelerate.utils.other import is_compiled_module
 
 from model import build_model
 from utils.file_utils import load_torch_ckpt
@@ -78,6 +79,7 @@ class SupervisedTrainer(BaseTrainer):
 
         if self.kd_model_type is not None:
             kd_model = build_model(self.kd_model_type, **self.kd_model_args)
+            self._configure_model_compilation(kd_model)
             kd_state, _, _ = load_torch_ckpt(self.kd_checkpoint)
             kd_model.load_state_dict(kd_state)
             self.accelerator.print(
@@ -122,13 +124,30 @@ class SupervisedTrainer(BaseTrainer):
             kd_results = self.kd_model(data)
         return {"kd_results": kd_results}
 
-    def train_step(self, data, **kwargs):
-        """Forward pass through model, compute supervised losses, and return (loss, loss_dict, aux_dict)."""
-        results = self.model(data)
-        loss, loss_dict, aux_dict = compute_supervised_losses(
-            self.loss_type, data, results, **kwargs, **self._loss_kwargs
+    def _prepare_for_training(self):
+        """Additionally compile the fused forward+loss step function."""
+        super()._prepare_for_training()
+        # Compile model forward + loss as ONE graph: inductor fuses the loss
+        # kernels and the eager loss forward/backward launch overhead
+        # disappears.  The accelerate-compiled wrapper is bypassed (its
+        # `_orig_mod`, still DDP-wrapped if any) so there is a single compile
+        # entry point; accelerate's own wrapper still serves eval-mode calls.
+        model = self.model
+        if is_compiled_module(model):
+            model = model._orig_mod
+        self._train_forward_model = model
+        self._compiled_train_forward = self._maybe_compile(self._train_forward)
+
+    def _train_forward(self, data, kd_results=None):
+        """Model forward + supervised loss, fused into one compiled graph."""
+        results = self._train_forward_model(data)
+        return compute_supervised_losses(
+            self.loss_type, data, results, kd_results=kd_results, **self._loss_kwargs
         )
-        return loss, loss_dict, aux_dict
+
+    def train_step(self, data, kd_results=None, **kwargs):
+        """Run the fused (compiled) forward+loss and return (loss, loss_dict, aux_dict)."""
+        return self._compiled_train_forward(data, kd_results)
 
     def validate_step(self, data, **kwargs):
         """Eval-mode forward pass with optional KD teacher. Returns (loss_dict, aux_dict)."""

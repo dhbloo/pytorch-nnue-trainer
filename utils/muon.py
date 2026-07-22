@@ -139,22 +139,34 @@ class Muon(torch.optim.Optimizer):
             for key in shape_groups:
                 group_data = shape_groups[key]
                 g = torch.stack(group_data["grads"])
+                torch._foreach_lerp_(
+                    group_data["momentum_buffers"],
+                    group_data["grads"],
+                    1 - group["momentum"],
+                )
                 m = torch.stack(group_data["momentum_buffers"])
-                m.lerp_(g, 1 - group["momentum"])
                 g = g.lerp_(m, group["momentum"]) if group["nesterov"] else m
                 if g.ndim >= 4:  # for the case of 1d/2d conv filters
-                    g = g.view(g.size(0), g.size(1), -1)
+                    # Compiled convolutions may produce channels-last or other
+                    # non-contiguous gradient layouts.  ``reshape`` preserves
+                    # the flattening semantics while materializing a contiguous
+                    # tensor when ``view`` cannot represent that layout.
+                    g = g.reshape(g.size(0), g.size(1), -1)
                 g = zeropower_via_newtonschulz5(
                     g,
                     steps=group["ns_steps"],
                     use_baddbmm=self.use_baddbmm,
                     use_bf16=g.device in self.bf16_support_set,
                 )
-                for i, p in enumerate(group_data["params"]):
-                    if group["weight_decay"] > 0:
-                        p.data.mul_(1 - group["lr"] * group["weight_decay"])
-                    p.data.add_(g[i].view_as(p), alpha=-group["lr"] * max(g[i].size()) ** 0.5)
-                    self.state[p]["momentum_buffer"] = m[i].clone()
+                params = group_data["params"]
+                updates = [update.reshape_as(p) for update, p in zip(g.unbind(), params)]
+                if group["weight_decay"] > 0:
+                    torch._foreach_mul_(params, 1 - group["lr"] * group["weight_decay"])
+                torch._foreach_add_(
+                    params,
+                    updates,
+                    alpha=-group["lr"] * max(g[0].size()) ** 0.5,
+                )
 
         return loss
 

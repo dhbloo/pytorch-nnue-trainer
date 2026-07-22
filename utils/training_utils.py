@@ -81,8 +81,20 @@ need module structure (e.g. muon's per-parameter routing).
 @OPTIMIZERS.register("adamw")
 def _make_adamw(parameters, model, lr, weight_decay, **kwargs):
     args = {"lr": lr, "betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": weight_decay}
+    if torch.cuda.is_available():
+        # fused kernel replaces the multi-kernel foreach path: one launch per
+        # step and much less optimizer CPU overhead (override with fused: false)
+        args["fused"] = True
     args.update(kwargs)
-    return optim.AdamW(parameters, **args)
+    try:
+        return optim.AdamW(parameters, **args)
+    except (RuntimeError, ValueError):
+        # older torch versions reject fused=True for the CPU parameters the
+        # optimizer is constructed with (accelerate moves them to CUDA later)
+        if not args.get("fused") or "fused" in kwargs:
+            raise
+        args.pop("fused")
+        return optim.AdamW(parameters, **args)
 
 
 @OPTIMIZERS.register("adamw-ams")
@@ -128,6 +140,11 @@ def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
     muon_args = {"weight_decay": max(1e-2, 0.0 if weight_decay is None else weight_decay)}
     muon_args.update(kwargs.pop("muon_args", {}))
     adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
+    if torch.cuda.is_available():
+        # Muon routes biases and normalization parameters to AdamW.  ResNets
+        # contain many such small tensors, for which the fused multi-tensor
+        # implementation avoids a large number of per-parameter launches.
+        adamw_args["fused"] = True
     adamw_args.update(kwargs.pop("adamw_args", {}))
     spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
     spec_adamw = OptimizerSpec(optim.AdamW, adamw_args, None)
@@ -160,6 +177,9 @@ def build_optimizer(
     if only_track_requires_grad:
         # only track parameters with requires_grad=True
         parameters = [p for p in parameters if p.requires_grad]
+    else:
+        # materialize so factories can retry construction (e.g. fused fallback)
+        parameters = list(parameters)
 
     return OPTIMIZERS[optim_type](parameters, model, lr, weight_decay, **kwargs)
 
@@ -180,6 +200,32 @@ def build_lr_scheduler(optimizer, lr_schedule_type, iterations, last_it=-1, **kw
     return scheduler
 
 
+class DeviceLoaderWrapper:
+    """Iterate *dataloader* and move each batch to *device*.
+
+    Minimal replacement for accelerate's dataloader preparation for datasets
+    that yield whole batches and already partition work across ranks
+    themselves (``YIELDS_BATCHES``): only device placement is needed, and
+    accelerate's ``IterableDatasetShard`` cannot wrap a ``batch_size=None``
+    loader.
+    """
+
+    def __init__(self, dataloader, device, non_blocking=True):
+        self.dataloader = dataloader
+        self.device = device
+        self.non_blocking = non_blocking
+
+    @property
+    def dataset(self):
+        return self.dataloader.dataset
+
+    def __iter__(self):
+        from accelerate.utils import send_to_device
+
+        for batch in self.dataloader:
+            yield send_to_device(batch, self.device, non_blocking=self.non_blocking)
+
+
 def build_data_loader(
     dataset,
     batch_size=1,
@@ -196,9 +242,19 @@ def build_data_loader(
             dataset = ShuffleDataset(dataset, shuffle_buffer_size)
         shuffle = False
 
-    if batch_by_boardsize:
-        assert isinstance(dataset, IterableDataset), "batch_by_boardsize must be used with IterableDataset"
-        dataset = BatchByBoardSizeDataset(dataset, batch_size)
+    if getattr(dataset, "YIELDS_BATCHES", False):
+        # Dataset yields whole collated batches and prefetches with internal
+        # threads: run it in-process (worker->main IPC costs more per batch
+        # than the vectorized assembly itself) and disable automatic batching.
+        # Pinning costs more per batch than the pageable H2D copy it saves at
+        # these batch sizes, so default it off here (still overridable).
+        assert not batch_by_boardsize, "batch_by_boardsize cannot be used with a batched dataset"
+        return DataLoader(
+            dataset,
+            batch_size=None,
+            num_workers=0,
+            **kwargs,
+        )
 
     # Default to pin_memory=True for better performance
     if "pin_memory" not in kwargs:
@@ -207,6 +263,10 @@ def build_data_loader(
     # Default to persistent workers to avoid worker restart cost between epochs
     if "persistent_workers" not in kwargs:
         kwargs["persistent_workers"] = num_workers > 0
+
+    if batch_by_boardsize:
+        assert isinstance(dataset, IterableDataset), "batch_by_boardsize must be used with IterableDataset"
+        dataset = BatchByBoardSizeDataset(dataset, batch_size)
 
     dataloader = DataLoader(
         dataset,
