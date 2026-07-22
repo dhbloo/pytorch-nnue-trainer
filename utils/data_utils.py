@@ -324,6 +324,80 @@ def post_process_data(
     return data
 
 
+def post_process_batch(data: dict, fixed_side_input=False, symmetry_type=None) -> dict:
+    """Vectorized :func:`post_process_data` for a whole batch of samples.
+
+    Keys to be processed (leading dim is the batch dim N):
+        board_size: int8 ndarray of shape (N, 2), all rows equal.
+        board_input: int8 ndarray of shape (N, C, H, W).
+        stm_input: float ndarray of shape (N, 1).
+        value_target: float ndarray of shape (N, 3).
+        policy_target: float ndarray of shape (N, H, W) or (N, H*W+1) with pass move.
+
+    Per-sample random symmetry is preserved: each sample independently draws a
+    symmetry, then samples are grouped by symmetry index and each group is
+    transformed with one array op.  The batch is reordered (grouped) in the
+    process, which is statistically neutral for training batches.
+
+    All arrays must own their storage (they are mutated / reassembled in place).
+    ``fixed_board_size`` and ``position`` handling of the per-sample path are
+    not supported here.
+    """
+    if fixed_side_input:
+        stm = data["stm_input"]
+        white = (stm[:, 0] if stm.ndim > 1 else stm) > 0
+        if white.any():
+            data["board_input"][white] = data["board_input"][white, ::-1]
+            vt = data["value_target"]
+            # swap win/loss (channels 0/1), keep any further channels
+            perm = np.arange(vt.shape[1])
+            perm[[0, 1]] = [1, 0]
+            vt[white] = vt[white][:, perm]
+
+    if symmetry_type:
+        if symmetry_type == True:
+            symmetry_type = "default"
+        board_size = tuple(int(s) for s in data["board_size"][0])
+        symmetries = Symmetry.available_symmetries(board_size, symmetry_type)
+        n = len(data["board_input"])
+        picked = np.random.randint(len(symmetries), size=n)
+        order = np.argsort(picked, kind="stable")
+        counts = np.bincount(picked, minlength=len(symmetries))
+
+        policy = data["policy_target"]
+        policy_is_flat = policy.ndim == 2
+        if policy_is_flat:
+            assert policy.shape[1] == board_size[0] * board_size[1] + 1, (
+                f"Invalid policy target shape ({policy.shape}) for symmetry, must be (N, H*W+1)"
+            )
+
+        board_groups, policy_groups = [], []
+        start = 0
+        for sym, count in zip(symmetries, counts):
+            if count == 0:
+                continue
+            sel = order[start : start + count]
+            start += count
+            board_groups.append(sym.apply_to_array(data["board_input"][sel]))
+            pol = policy[sel]
+            if policy_is_flat:
+                pol_board = pol[:, :-1].reshape(count, *board_size)
+                pol_board = sym.apply_to_array(pol_board).reshape(count, -1)
+                pol = np.concatenate([pol_board, pol[:, -1:]], axis=1)
+            else:
+                pol = sym.apply_to_array(pol)
+            policy_groups.append(pol)
+
+        data["board_input"] = np.concatenate(board_groups, axis=0)
+        data["policy_target"] = np.concatenate(policy_groups, axis=0)
+        # reorder the remaining keys to keep all arrays aligned
+        for k in data:
+            if k not in ("board_input", "policy_target"):
+                data[k] = data[k][order]
+
+    return data
+
+
 def filter_data_by_condition(condition: str, data_dict: dict) -> int:
     """
     Filter the data dict (inplace) by the condition expression.

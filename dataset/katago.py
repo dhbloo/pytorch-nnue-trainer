@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.data_utils import *
 from . import DATASETS
@@ -431,3 +432,223 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
                 sample_rate=self.sample_rate,
             ):
                 yield dataset[index]
+
+
+@DATASETS.register("batched_processed_katago_numpy")
+class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
+    """
+    Batch-level variant of IterativeProcessedKatagoNumpyDataset: yields whole
+    collated batches (dicts of numpy arrays) instead of single samples, with
+    all per-sample work (dtype conversion, side flip, random symmetry)
+    vectorized over the batch.
+
+    Runs in-process with background loader threads instead of DataLoader
+    worker processes: worker->main IPC costs milliseconds per batch, far more
+    than vectorized batch assembly itself, so ``build_data_loader`` wraps this
+    dataset with ``DataLoader(batch_size=None, num_workers=0)`` and file
+    loading + batch assembly overlap the training loop via *prefetch_threads*
+    daemon threads filling a bounded batch queue.
+
+    Batches never cross worker-partition boundaries; a remainder smaller than
+    ``batch_size`` is carried over to the next file of the same loader thread
+    and only per-thread stream tails are dropped (like ``drop_last=True``).
+    Multi-process (DDP) training is not supported yet: per-rank tail dropping
+    can produce unequal batch counts across ranks.
+
+    Args (in addition to IterativeProcessedKatagoNumpyDataset):
+        batch_size: Number of samples per yielded batch.
+        apply_symmetry: Randomly transform each sample by a board symmetry
+            (vectorized; samples are grouped by drawn symmetry, so the batch
+            is reordered, which is neutral for training).
+        prefetch_threads: Background producer threads (0 = load and assemble
+            synchronously in the consumer thread).  With more than one thread
+            the batch order depends on thread timing; use 0 or 1 for a
+            deterministic, seed-reproducible stream.
+        prefetch_batches: Bounded batch-queue capacity across all threads.
+        pin_memory: Yield batches as pinned torch tensors for fast async H2D
+            copies, with the pinning cost paid in the producer threads instead
+            of the consumer.  Default: auto (pinned iff CUDA is available).
+    """
+
+    YIELDS_BATCHES = True
+
+    def __init__(
+        self,
+        *args,
+        batch_size: int,
+        apply_symmetry=False,
+        batch_pipelines=(),
+        prefetch_threads: int = 2,
+        prefetch_batches: int = 64,
+        pin_memory: bool | None = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.batch_size = batch_size
+        self.apply_symmetry = apply_symmetry
+        self.batch_pipelines = tuple(batch_pipelines)
+        self.prefetch_threads = prefetch_threads
+        self.prefetch_batches = prefetch_batches
+        self.pin_memory = torch.cuda.is_available() if pin_memory is None else pin_memory
+        self.has_pass_move = self.extra_kwargs.get("has_pass_move", False)
+        assert self.extra_kwargs.get("fixed_board_size") is None, \
+            "fixed_board_size is not supported by the batched dataset"
+
+    def _assemble_batch(self, parts, boardsize):
+        """Gather rows from raw file arrays and post-process as one batch.
+
+        *parts* is a list of ``(raw_dict, indices)`` pairs (more than one when a
+        carried remainder is completed from the next file).
+        """
+        h, w = boardsize
+
+        def gather(key, default_shape=None):
+            arrs = []
+            for raw, indices in parts:
+                if key in raw:
+                    arr = raw[key][indices]
+                    if key == "pt" and not self.has_pass_move and arr.ndim == 2:
+                        # flat (M, H*W+1) target: drop pass column, like the per-sample path
+                        arr = arr[:, : h * w].reshape(-1, h, w)
+                    arrs.append(arr)
+                else:
+                    assert default_shape is not None, f"missing required key {key} in npz data"
+                    arrs.append(np.zeros((len(indices),) + default_shape, dtype=np.float32))
+            return np.concatenate(arrs, axis=0) if len(arrs) > 1 else arrs[0]
+
+        data = {
+            "board_size": np.tile(np.array(boardsize, dtype=np.int8), (self.batch_size, 1)),
+            "board_input": gather("bf").astype(np.int8, copy=False),
+            "stm_input": gather("gf", default_shape=(1,)).astype(np.float32, copy=False),
+            "value_target": gather("vt").astype(np.float32, copy=False),
+            "policy_target": gather(
+                "pt", default_shape=(h * w + 1,) if self.has_pass_move else (h, w)
+            ).astype(np.float32, copy=False),
+        }
+        data = post_process_batch(data, self.fixed_side_input, self.apply_symmetry)
+        for pipeline in self.batch_pipelines:
+            data = pipeline.process_batch(data)
+        if self.pin_memory:
+            # np.flip in post-processing can leave negative strides that
+            # from_numpy rejects; ascontiguousarray is a no-op otherwise
+            data = {
+                k: torch.from_numpy(np.ascontiguousarray(v)).pin_memory()
+                for k, v in data.items()
+            }
+        return data
+
+    def _produce(self, file_indices, partition_per_file, partition_idx):
+        """Yield batches from *file_indices*, carrying remainders across files."""
+        batch_size = self.batch_size
+        leftover = []  # list of (raw_dict, boardsize, indices), < batch_size rows in total
+        leftover_count = 0
+
+        for file_index in file_indices:
+            filename = self.file_list[file_index]
+            dataset = ProcessedKatagoNumpyDataset(
+                file_list=[filename],
+                boardsizes=self.boardsizes,
+                fixed_side_input=self.fixed_side_input,
+                **self.extra_kwargs,
+            )
+            indices = np.fromiter(
+                make_subset_range(
+                    len(dataset),
+                    partition_num=partition_per_file,
+                    partition_idx=partition_idx % partition_per_file,
+                    shuffle=self.shuffle,
+                    sample_rate=self.sample_rate,
+                ),
+                dtype=np.int64,
+            )
+            raw, boardsize = dataset.data_dict, dataset.boardsize
+
+            pos = 0
+            if leftover_count:
+                if any(b != boardsize for _, b, _ in leftover):
+                    # batches cannot mix board sizes: drop the carried
+                    # remainder at a size boundary (like drop_last)
+                    leftover, leftover_count = [], 0
+                else:
+                    # complete the carried remainder with the head of this file
+                    pos = min(batch_size - leftover_count, len(indices))
+                    leftover.append((raw, boardsize, indices[:pos]))
+                    leftover_count += pos
+                    if leftover_count < batch_size:
+                        continue
+                    yield self._assemble_batch([(r, idx) for r, _, idx in leftover], boardsize)
+                    leftover, leftover_count = [], 0
+
+            while pos + batch_size <= len(indices):
+                yield self._assemble_batch([(raw, indices[pos : pos + batch_size])], boardsize)
+                pos += batch_size
+
+            if pos < len(indices):
+                leftover.append((raw, boardsize, indices[pos:]))
+                leftover_count += len(indices) - pos
+        # final leftover (< batch_size) is dropped, matching drop_last=True
+
+    def __iter__(self):
+        partition_num, partition_idx = get_partition_num_and_idx()
+        partition_per_file = min(partition_num, self.max_partition_per_file)
+        assert partition_num % partition_per_file == 0, \
+            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
+
+        file_indices = list(make_subset_range(
+            len(self.file_list),
+            partition_num=partition_num // partition_per_file,
+            partition_idx=partition_idx // partition_per_file,
+            shuffle=self.shuffle,
+        ))
+
+        num_threads = min(self.prefetch_threads, len(file_indices))
+        if num_threads <= 0:
+            yield from self._produce(file_indices, partition_per_file, partition_idx)
+            return
+
+        import queue as queue_mod
+        import threading
+
+        out_q = queue_mod.Queue(maxsize=self.prefetch_batches)
+        stop = threading.Event()
+
+        def put_stoppable(item):
+            """Blocking put that gives up once the consumer has stopped."""
+            while not stop.is_set():
+                try:
+                    out_q.put(item, timeout=0.1)
+                    return True
+                except queue_mod.Full:
+                    continue
+            return False
+
+        def producer(files):
+            try:
+                for batch in self._produce(files, partition_per_file, partition_idx):
+                    if not put_stoppable(("batch", batch)):
+                        return
+                put_stoppable(("done", None))
+            except BaseException as e:  # propagate errors to the consumer
+                put_stoppable(("error", e))
+
+        threads = [
+            # round-robin static split keeps per-thread file order deterministic
+            threading.Thread(target=producer, args=(file_indices[i::num_threads],), daemon=True)
+            for i in range(num_threads)
+        ]
+        for t in threads:
+            t.start()
+
+        remaining = len(threads)
+        try:
+            while remaining:
+                kind, payload = out_q.get()
+                if kind == "batch":
+                    yield payload
+                elif kind == "done":
+                    remaining -= 1
+                else:
+                    raise payload
+        finally:
+            # unblock producers if the consumer stops early (epoch break, error)
+            stop.set()

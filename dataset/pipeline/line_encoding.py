@@ -32,6 +32,24 @@ class LineEncodingPipeline(BasePipeline):
         data["line_encoding_total_num"] = self.line_encoding_total_num
         return data
 
+    def process_batch(self, data):
+        """Vectorized batch variant used by batch-yielding datasets."""
+        from line_encoding_cpp import transform_boards_to_line_encoding
+
+        board_input = data["board_input"]  # [B, 2, H, W]
+        B, _, H, W = board_input.shape
+        line_encoding = np.empty((B, 4, H, W), dtype=np.int32)
+        transform_boards_to_line_encoding(
+            board_input, line_encoding, self.line_length, raw_code=self.raw_code
+        )
+        data["line_encoding"] = line_encoding
+        # Per-sample processing produces a scalar that default_collate turns
+        # into [B]. Preserve that contract for models that validate this field.
+        data["line_encoding_total_num"] = np.full(
+            B, self.line_encoding_total_num, dtype=np.int64
+        )
+        return data
+
 
 def get_total_num_encoding(line_length: int) -> int:
     """Get total number of encoding for a line of given length."""

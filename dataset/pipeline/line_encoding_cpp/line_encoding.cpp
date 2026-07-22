@@ -4,6 +4,8 @@
 #include <cassert>
 #include <vector>
 #include <array>
+#include <memory>
+#include <mutex>
 
 namespace py = pybind11;
 
@@ -202,15 +204,17 @@ private:
     }
 };
 
-static std::vector<LineEncodingTable> EncodingTables;
+static std::vector<std::unique_ptr<LineEncodingTable>> EncodingTables;
+static std::mutex EncodingTablesMutex;
 
 /// Gets existing encoding table or create a new one.
 static const LineEncodingTable &get_line_encoding_table(int length)
 {
+    std::lock_guard<std::mutex> lock(EncodingTablesMutex);
     for (const auto &table : EncodingTables)
     {
-        if (table.line_length() == length)
-            return table;
+        if (table->line_length() == length)
+            return *table;
     }
 
     if (length % 2 != 1)
@@ -218,7 +222,7 @@ static const LineEncodingTable &get_line_encoding_table(int length)
     if (length >= 20)
         throw std::invalid_argument("max supported line length is 19");
 
-    return EncodingTables.emplace_back(length);
+    return *EncodingTables.emplace_back(std::make_unique<LineEncodingTable>(length));
 }
 
 /// Rotate right with the given shift amount.
@@ -254,37 +258,15 @@ void get_encoding_usage_flag(
     }
 }
 
-/// Transform a board input numpy array to 4 direction line encoding output numpy array.
-/// @param board_input Board numpy array of shape [2, H, W]. First/second channel is self/oppo.
-/// @param line_encoding_output Line encoding numpy array of shape [4, H, W].
-/// @param line_length The length of line to encode.
-/// @param raw_code Whether to output raw bit code instead of line encoding.
-void transform_board_to_line_encoding(
-    py::array_t<int8_t, py::array::c_style | py::array::forcecast> board_input,
-    py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encoding_output,
-    int line_length,
-    bool raw_code = false)
+static void transform_board_impl(
+    const int8_t *board,
+    int32_t *line_encoding,
+    int H,
+    int W,
+    const LineEncodingTable &encoding_table,
+    bool raw_code)
 {
     constexpr int MAX_BOARD_SIZE = 32;
-
-    auto board = board_input.unchecked<3>();
-    auto line_encoding = line_encoding_output.mutable_unchecked<3>();
-    int H = (int)board.shape(1), W = (int)board.shape(2);
-
-    // Check input legality
-    if (board.shape(0) != 2)
-        throw std::invalid_argument("board shape incorrect, must be [2,H,W]");
-    if (line_encoding.shape(0) != 4 || line_encoding.shape(1) != H || line_encoding.shape(2) != W)
-        throw std::invalid_argument("line_encoding shape incorrect, must be [4,H,W]");
-    if (H > MAX_BOARD_SIZE || W > MAX_BOARD_SIZE)
-        throw std::invalid_argument("board size must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
-    if (line_length % 2 == 0)
-        throw std::invalid_argument("the line length must be an odd number");
-    if (raw_code && line_length > 15)
-        throw std::invalid_argument("the maximum line length for raw code is 15");
-
-    const auto &encoding_table = get_line_encoding_table(line_length);
-
     // Initialize all bit key to 0b00 (WALL).
     uint64_t bit_key0[MAX_BOARD_SIZE] = {0};         // [RIGHT(MSB) - LEFT(LSB)]
     uint64_t bit_key1[MAX_BOARD_SIZE] = {0};         // [DOWN(MSB) - UP(LSB)]
@@ -305,10 +287,14 @@ void transform_board_to_line_encoding(
     // Set bit keys
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
-            set_bit_key(x, y, board(0, y, x), board(1, y, x));
+            set_bit_key(
+                x,
+                y,
+                board[y * W + x],
+                board[H * W + y * W + x]);
 
     // Query line encoding table for each pos and direction
-    const int half = line_length / 2;
+    const int half = encoding_table.line_length() / 2;
     for (int y = 0; y < H; y++)
         for (int x = 0; x < W; x++)
         {
@@ -320,19 +306,91 @@ void transform_board_to_line_encoding(
             if (raw_code)
             {
                 uint64_t mask = encoding_table.total_num_key() - 1;
-                line_encoding(0, y, x) = uint32_t(key0 & mask);
-                line_encoding(1, y, x) = uint32_t(key1 & mask);
-                line_encoding(2, y, x) = uint32_t(key2 & mask);
-                line_encoding(3, y, x) = uint32_t(key3 & mask);
+                line_encoding[0 * H * W + y * W + x] = uint32_t(key0 & mask);
+                line_encoding[1 * H * W + y * W + x] = uint32_t(key1 & mask);
+                line_encoding[2 * H * W + y * W + x] = uint32_t(key2 & mask);
+                line_encoding[3 * H * W + y * W + x] = uint32_t(key3 & mask);
             }
             else
             {
-                line_encoding(0, y, x) = encoding_table[key0];
-                line_encoding(1, y, x) = encoding_table[key1];
-                line_encoding(2, y, x) = encoding_table[key2];
-                line_encoding(3, y, x) = encoding_table[key3];
+                line_encoding[0 * H * W + y * W + x] = encoding_table[key0];
+                line_encoding[1 * H * W + y * W + x] = encoding_table[key1];
+                line_encoding[2 * H * W + y * W + x] = encoding_table[key2];
+                line_encoding[3 * H * W + y * W + x] = encoding_table[key3];
             }
         }
+}
+
+/// Transform a board input numpy array to 4 direction line encoding output numpy array.
+/// @param board_input Board numpy array of shape [2, H, W]. First/second channel is self/oppo.
+/// @param line_encoding_output Line encoding numpy array of shape [4, H, W].
+/// @param line_length The length of line to encode.
+/// @param raw_code Whether to output raw bit code instead of line encoding.
+void transform_board_to_line_encoding(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> board_input,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encoding_output,
+    int line_length,
+    bool raw_code = false)
+{
+    constexpr int MAX_BOARD_SIZE = 32;
+    auto board = board_input.unchecked<3>();
+    auto line_encoding = line_encoding_output.mutable_unchecked<3>();
+    int H = (int)board.shape(1), W = (int)board.shape(2);
+
+    if (board.shape(0) != 2)
+        throw std::invalid_argument("board shape incorrect, must be [2,H,W]");
+    if (line_encoding.shape(0) != 4 || line_encoding.shape(1) != H || line_encoding.shape(2) != W)
+        throw std::invalid_argument("line_encoding shape incorrect, must be [4,H,W]");
+    if (H > MAX_BOARD_SIZE || W > MAX_BOARD_SIZE)
+        throw std::invalid_argument("board size must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
+    if (line_length % 2 == 0)
+        throw std::invalid_argument("the line length must be an odd number");
+    if (raw_code && line_length > 15)
+        throw std::invalid_argument("the maximum line length for raw code is 15");
+
+    const auto &encoding_table = get_line_encoding_table(line_length);
+    py::gil_scoped_release release;
+    transform_board_impl(board_input.data(), line_encoding_output.mutable_data(), H, W, encoding_table, raw_code);
+}
+
+/// Batched variant of transform_board_to_line_encoding.
+void transform_boards_to_line_encoding(
+    py::array_t<int8_t, py::array::c_style | py::array::forcecast> boards_input,
+    py::array_t<int32_t, py::array::c_style | py::array::forcecast> line_encodings_output,
+    int line_length,
+    bool raw_code = false)
+{
+    constexpr int MAX_BOARD_SIZE = 32;
+    auto boards = boards_input.unchecked<4>();
+    auto line_encodings = line_encodings_output.mutable_unchecked<4>();
+    int B = (int)boards.shape(0), H = (int)boards.shape(2), W = (int)boards.shape(3);
+
+    if (boards.shape(1) != 2)
+        throw std::invalid_argument("boards shape incorrect, must be [B,2,H,W]");
+    if (line_encodings.shape(0) != B || line_encodings.shape(1) != 4 ||
+        line_encodings.shape(2) != H || line_encodings.shape(3) != W)
+        throw std::invalid_argument("line_encodings shape incorrect, must be [B,4,H,W]");
+    if (H > MAX_BOARD_SIZE || W > MAX_BOARD_SIZE)
+        throw std::invalid_argument("board size must be less or equal to " + std::to_string(MAX_BOARD_SIZE));
+    if (line_length % 2 == 0)
+        throw std::invalid_argument("the line length must be an odd number");
+    if (raw_code && line_length > 15)
+        throw std::invalid_argument("the maximum line length for raw code is 15");
+
+    const auto &encoding_table = get_line_encoding_table(line_length);
+    const size_t board_stride = 2 * H * W;
+    const size_t encoding_stride = 4 * H * W;
+    const int8_t *boards_ptr = boards_input.data();
+    int32_t *encodings_ptr = line_encodings_output.mutable_data();
+    py::gil_scoped_release release;
+    for (int b = 0; b < B; b++)
+        transform_board_impl(
+            boards_ptr + b * board_stride,
+            encodings_ptr + b * encoding_stride,
+            H,
+            W,
+            encoding_table,
+            raw_code);
 }
 
 /// Transform batched lines numpy array to line encoding output numpy array.
@@ -398,6 +456,11 @@ PYBIND11_MODULE(line_encoding_cpp, m)
     m.def("transform_board_to_line_encoding", &transform_board_to_line_encoding,
           "board_input"_a,
           "line_encoding_output"_a,
+          "line_length"_a,
+          "raw_code"_a = false);
+    m.def("transform_boards_to_line_encoding", &transform_boards_to_line_encoding,
+          "boards_input"_a,
+          "line_encodings_output"_a,
           "line_length"_a,
           "raw_code"_a = false);
     m.def("transform_lines_to_line_encoding", &transform_lines_to_line_encoding,

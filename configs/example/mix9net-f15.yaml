@@ -8,7 +8,7 @@ rundir: run_dirs/mix9/basicns128m64f32p64v32d-f15
 # Dataset configs
 
 # For example, if you have a processed katago dataset (.npz files with bf, gf, vt, pt keys)
-dataset_type: iterative_processed_katago_numpy
+dataset_type: batched_processed_katago_numpy
 # Or you have a raw katago selfplay dataset (.npz files directly produced by katago)
 # dataset_type: katago_numpy
 # Or you have a packed binary dataset (.binpack or .binpack.lz4 files) produced by c-gomoku-cli sampling mode

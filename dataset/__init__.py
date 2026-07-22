@@ -2,7 +2,7 @@ import numpy as np
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.file_utils import make_file_list
 from utils.misc_utils import Registry, import_submodules
-from .pipeline import warp_dataset_with_pipeline
+from .pipeline import build_data_pipeline, warp_dataset_with_pipeline
 
 DATASETS = Registry("dataset")
 import_submodules(__name__, recursive=False)
@@ -127,6 +127,7 @@ def build_dataset(
     fixed_board_size: None | int | tuple[int, int] = None,
     shuffle: bool=False,
     pipeline_args: None | dict = None,
+    batch_size: None | int = None,
     **kwargs,
 ) -> Dataset | IterableDataset:
     assert dataset_type in DATASETS, f"Unknown dataset type: {dataset_type}"
@@ -150,6 +151,18 @@ def build_dataset(
         fixed_board_size = (fixed_board_size, fixed_board_size)
     assert fixed_board_size is None or isinstance(fixed_board_size, tuple), \
         f"fixed_board_size must be None or tuple, but got {fixed_board_size}"
+
+    if getattr(dataset_cls, "YIELDS_BATCHES", False):
+        # batch-yielding datasets collate internally and need the batch size
+        assert batch_size is not None, f"dataset {dataset_type} yields batches and requires batch_size"
+        kwargs["batch_size"] = batch_size
+        if pipeline_args is not None:
+            batch_pipelines = build_data_pipeline(pipeline_args)
+            unsupported = [type(p).__name__ for p in batch_pipelines if not hasattr(p, "process_batch")]
+            assert not unsupported, \
+                f"pipelines do not support batched datasets: {', '.join(unsupported)}"
+            kwargs["batch_pipelines"] = batch_pipelines
+            pipeline_args = None
 
     dataset = dataset_cls(
         file_list=file_list,
