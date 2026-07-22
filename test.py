@@ -35,6 +35,11 @@ def parse_args_and_init():
     parser.add("--num_worker", type=int, default=8, help="Num of dataloader workers")
     parser.add("--max_batches", type=int, help="Test the amount of batches only")
     parser.add("--random_seed", type=int, default=42, help="Random seed")
+    parser.add(
+        "--max_memory_fraction",
+        type=float,
+        help="Optional per-process CUDA allocator limit in (0, 1]",
+    )
 
     args, _ = parser.parse_known_args()  # parse args
 
@@ -64,6 +69,7 @@ def test(
     num_worker,
     max_batches,
     random_seed,
+    max_memory_fraction,
     **kwargs,
 ):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
@@ -99,6 +105,7 @@ def test(
         num_worker=num_worker,
         use_cpu=use_cpu,
         random_seed=random_seed,
+        max_memory_fraction=max_memory_fraction,
     )
 
     trainer.test(
