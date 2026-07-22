@@ -123,6 +123,11 @@ Or to view a (optionally lz4 compressed) packed binary dataset file (`.binpack` 
 python visualize_dataset.py --dataset_type packed_binary <path to data file>
 ```
 
+### Develop model performance
+
+See [training performance](docs/performance.md) for the current measurements, retained optimizations,
+memory-safety policy, and the validation workflow for future performance changes.
+
 ## Serialized Weight Format
 
 In order to improve the ease of managing weights for different rules and board size configuration, binary serialized network weights are serialized with a standardized header, which contains information about the weights, including architecture id, applicable rules, board sizes, default settings and description. Binary weights data of the network is appended after the header.
@@ -137,4 +142,3 @@ struct Header {
   char description[desc_len]; // weight description (encoded in utf-8)
 }
 ```
-
