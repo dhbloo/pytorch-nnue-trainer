@@ -19,6 +19,16 @@ Rules:
     keys they require (missing keys fail fast with KeyError) and use ``.get()``
     for optional ones.
   * ``forward_debug_print`` mirrors ``forward``'s return convention.
+
+Optional compilation hook:
+  * A model may expose an ``inductor_config`` mapping of model-specific
+    ``torch.compile`` option defaults. Trainers and performance tools apply it
+    only with the Inductor backend; explicit caller options take precedence.
+  * A model with eager graph-break regions may define
+    ``configure_compilation(compile_fn)``. Trainers call it after construction
+    and before wrapping the model; ``compile_fn`` carries the active Accelerate
+    backend/mode and accepts explicit ``torch.compile`` keyword overrides.
+    Standalone models must remain correct before this hook is called.
 """
 
 from torch.nn import Module

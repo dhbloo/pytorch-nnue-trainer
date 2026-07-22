@@ -2,9 +2,16 @@ import torch
 import torch.nn as nn
 
 from . import MODELS
-from .blocks import Conv2dBlock, build_activation_layer
 from .input import build_input_plane
+from .layers.activation import build_activation_layer
+from .layers.convolution import Conv2dBlock
 from .head import build_head
+
+
+def _configure_channels_last_parameters(module: nn.Module, enabled: bool) -> None:
+    """Keep convolution parameters and gradients in their compiled native layout."""
+    if enabled:
+        module.to(memory_format=torch.channels_last)
 
 
 class ResBlock(nn.Module):
@@ -118,6 +125,7 @@ class ResNet(nn.Module):
         trunk_padding=1,
         trunk_norm="bn",
         trunk_activation="relu",
+        use_channel_last=True,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -147,6 +155,7 @@ class ResNet(nn.Module):
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
         self.output_head = build_head(head_type, dim_feature)
+        _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
         input_plane = self.input_plane(data)
@@ -182,6 +191,7 @@ class ResNetv2(nn.Module):
         trunk_norm1="bn",
         trunk_norm2="bn",
         trunk_activation="relu",
+        use_channel_last=True,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -212,6 +222,7 @@ class ResNetv2(nn.Module):
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
         self.output_head = build_head(head_type, dim_feature)
+        _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
         input_plane = self.input_plane(data)
@@ -249,6 +260,7 @@ class ResNetv3(nn.Module):
         trunk_norm2="maskbn",
         trunk_activation="relu",
         drop_mask=False,
+        use_channel_last=False,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -280,6 +292,7 @@ class ResNetv3(nn.Module):
             )
             self.conv_trunk.append(block)
         self.output_head = build_head(head_type, dim_feature)
+        _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
         if self.drop_mask:

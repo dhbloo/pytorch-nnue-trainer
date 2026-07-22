@@ -1,9 +1,9 @@
 import torch.nn as nn
 
 from . import MODELS
-from .blocks import Conv2dBlock
+from .head import build_head
 from .input import build_input_plane
-from .resnet import build_head
+from .layers.convolution import Conv2dBlock
 
 
 def depthwise_conv_block(in_dim, out_dim):

@@ -7,9 +7,27 @@ from accelerate.utils import gather, gather_object, reduce
 from pykeops.torch import LazyTensor
 from torch import Tensor
 
+from .ops import (
+    accelerated_cosine_argmin,
+    accelerated_l2_argmin,
+    accelerated_perplexity_stats,
+)
+from .ops.vector_quantization import _update_ema_codebook_
+
+
+_DEAD_CODE_BOUND_EPS = 1e-6
+_DEAD_CODE_SAFE_THRESHOLD_MULTIPLIER = 2
+
 
 def l2_norm(x: Tensor) -> Tensor:
     return F.normalize(x, p=2, dim=-1, eps=1e-7)
+
+
+def squared_l2_dist(x: Tensor, y: Tensor) -> LazyTensor:
+    """Compute pairwise squared L2 distances without materializing the matrix."""
+    x_i = LazyTensor(x[:, None, :])  # (N, 1, dim_feature)
+    y_j = LazyTensor(y[None, :, :])  # (1, M, dim_feature)
+    return ((x_i - y_j) ** 2).sum(-1)  # (N, M)
 
 
 def l2_dist(x: Tensor, y: Tensor) -> LazyTensor:
@@ -26,10 +44,7 @@ def l2_dist(x: Tensor, y: Tensor) -> LazyTensor:
     #       - 2 * torch.matmul(x, y.t())  # (N, M)
     # dists = torch.clamp(dists, min=0).sqrt()  # (N, M)
 
-    x_i = LazyTensor(x[:, None, :])  # (N, 1, dim_feature)
-    y_j = LazyTensor(y[None, :, :])  # (1, M, dim_feature)
-    dists = ((x_i - y_j) ** 2).sum(-1).sqrt()  # (N, M)
-    return dists
+    return squared_l2_dist(x, y).sqrt()
 
 
 def cosine_dist(x: Tensor, y: Tensor) -> LazyTensor:
@@ -194,13 +209,14 @@ def efficient_rotation_trick_transform(u: Tensor, q: Tensor, e: Tensor) -> Tenso
     """
     4.2 in https://arxiv.org/abs/2410.06424
     """
-    e = e[:, None, :]  # (N, 1, dim_feature)
     w = l2_norm(u + q).detach()  # (N, dim_feature)
+    # These are vector projections. Expressing them as reductions avoids
+    # launching two batches of tiny 1xD matrix multiplications.
     return (
         e
-        - 2 * (e @ w[:, :, None] @ w[:, None, :])
-        + 2 * (e @ u[:, :, None].detach() @ q[:, None, :].detach())
-    ).squeeze(1)
+        - 2 * (e * w).sum(dim=-1, keepdim=True) * w
+        + 2 * (e * u.detach()).sum(dim=-1, keepdim=True) * q.detach()
+    )
 
 
 def rotate_to(src: Tensor, tgt: Tensor):
@@ -242,6 +258,7 @@ class VectorQuantize(nn.Module):
         codebook_size: The number of embeddings in the codebook.
         dim_feature: Dimension of the embeddings.
         beta: commitment cost used in loss term, beta * ||x_q-sg(x)||^2
+        accelerated_search: Use a guarded Tensor-Core shortlist when available.
     """
 
     def __init__(
@@ -266,6 +283,7 @@ class VectorQuantize(nn.Module):
         use_simvq=False,
         codebook_transform=None,
         convert_to_fp32=True,
+        accelerated_search=True,
     ):
         super().__init__()
         self.codebook_size = codebook_size
@@ -286,8 +304,17 @@ class VectorQuantize(nn.Module):
         self.entropy_reg_temp = entropy_reg_temp
         self.use_simvq = use_simvq
         self.convert_to_fp32 = convert_to_fp32
+        self.accelerated_search = accelerated_search
+        # Conservative single-rank host bounds let the normal FP32 EMA path
+        # (0 <= decay <= 1) prove that no code can expire without synchronizing
+        # a CUDA boolean every step.
+        # They are derived from persistent buffers and never enter state_dict;
+        # DDP retains the exact distributed check because unique counts can
+        # differ across ranks.
+        self._invalidate_dead_code_cache()
 
         self.register_buffer("inited", torch.zeros([], dtype=torch.bool))
+        self._inited_python = None
         self.register_buffer("cluster_size", torch.ones(codebook_size))
         if kmeans_init:
             embed = torch.zeros(codebook_size, dim_feature)
@@ -321,6 +348,34 @@ class VectorQuantize(nn.Module):
         self.learnable_codebook = learnable_codebook and not self.ema_update
         self.embed = nn.Parameter(embed, requires_grad=self.learnable_codebook)
         self.register_buffer("embed_avg", embed.clone())
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        # Persistent buffers may have changed during a parent model load.
+        # Refresh their host-side hot-path caches on the next forward.
+        self._inited_python = None
+        self._invalidate_dead_code_cache()
+
+    def _invalidate_dead_code_cache(self):
+        self._dead_code_min_cluster_lower_python = None
+        self._dead_code_total_upper_python = None
 
     def _accumulate_input_batch(self, x):
         num_samples_remain = self._init_input_samples_per_process - self._init_input_count_this_process
@@ -370,11 +425,40 @@ class VectorQuantize(nn.Module):
         self.embed_avg.data.copy_(embed_sum)
         self.cluster_size.data.copy_(cluster_size)
         self.inited.data.fill_(True)
+        self._inited_python = True
+        self._invalidate_dead_code_cache()
 
     @torch.no_grad()
     def _expire_codes(self, inputs) -> Tensor | None:
         if self.threshold_ema_dead_code == 0:
             return None
+
+        if PartialState().num_processes == 1:
+            min_cluster = self._dead_code_min_cluster_lower_python
+            total_upper = self._dead_code_total_upper_python
+            if min_cluster is not None and total_upper is not None:
+                normalized_lower_bound = min_cluster * self.codebook_size / total_upper
+                # A wide margin absorbs FP32 lerp/reduction rounding while the
+                # cached bounds below are advanced conservatively.
+                if normalized_lower_bound >= (
+                    _DEAD_CODE_SAFE_THRESHOLD_MULTIPLIER
+                    * self.threshold_ema_dead_code
+                ):
+                    return None
+
+            stats = torch.stack((self.cluster_size.min(), self.cluster_size.sum()))
+            min_cluster, cluster_total = stats.tolist()
+            normalized_min = min_cluster * self.codebook_size / cluster_total
+            if normalized_min >= (
+                _DEAD_CODE_SAFE_THRESHOLD_MULTIPLIER * self.threshold_ema_dead_code
+            ):
+                self._dead_code_min_cluster_lower_python = min_cluster * (
+                    1 - _DEAD_CODE_BOUND_EPS
+                )
+                self._dead_code_total_upper_python = cluster_total * (
+                    1 + _DEAD_CODE_BOUND_EPS
+                )
+                return None
 
         expired_codes = self.normalized_cluster_size < self.threshold_ema_dead_code
         if not expired_codes.any():
@@ -390,6 +474,7 @@ class VectorQuantize(nn.Module):
         self.embed.data[expired_codes] = sampled
         self.embed_avg.data[expired_codes] = sampled * reset_cluster_size[:, None]
         self.cluster_size.data[expired_codes] = reset_cluster_size
+        self._invalidate_dead_code_cache()
 
         return num_expired_codes
 
@@ -397,23 +482,57 @@ class VectorQuantize(nn.Module):
     def _update_ema(self, x, embed_indices, cluster_size):
         cluster_size = cluster_size.float()
         ema_inplace(self.cluster_size, cluster_size, self.ema_decay)
+        if (
+            PartialState().num_processes == 1
+            and self._dead_code_min_cluster_lower_python is not None
+        ):
+            decay = self.ema_decay
+            self._dead_code_min_cluster_lower_python *= decay * (
+                1 - _DEAD_CODE_BOUND_EPS
+            )
+            self._dead_code_total_upper_python = (
+                self._dead_code_total_upper_python * decay
+                + x.shape[0] * (1 - decay)
+            ) * (1 + _DEAD_CODE_BOUND_EPS)
 
         if self.ema_update:
-            embed_sum = torch.zeros_like(self.embed_avg)  # (codebook_size, dim_feature)
-            embed_sum.scatter_add_(0, embed_indices[:, None].expand(-1, self.dim_feature), x)
+            if PartialState().num_processes == 1:
+                # On one rank, update the persistent accumulator directly.
+                # This avoids zeroing and then rereading a codebook-sized
+                # embed_sum buffer. Scaling each contribution before the
+                # atomic reduction changes only FP32 accumulation order.
+                self.embed_avg.mul_(self.ema_decay)
+                self.embed_avg.index_add_(
+                    0,
+                    embed_indices,
+                    x,
+                    alpha=1 - self.ema_decay,
+                )
+            else:
+                embed_sum = torch.zeros_like(self.embed_avg)  # (codebook_size, dim_feature)
+                embed_sum.scatter_add_(0, embed_indices[:, None].expand(-1, self.dim_feature), x)
 
-            embed_sum = reduce(embed_sum, reduction="sum")  # (codebook_size, dim_feature)
-            ema_inplace(self.embed_avg, embed_sum, self.ema_decay)
+                embed_sum = reduce(embed_sum, reduction="sum")  # (codebook_size, dim_feature)
+                ema_inplace(self.embed_avg, embed_sum, self.ema_decay)
 
-            def laplace_smoothing(x, n_categories, eps=1e-5, dim=-1):
-                x_sum = x.sum(dim=dim, keepdim=True)
-                return x_sum * (x + eps) / (x_sum + n_categories * eps)
+            # The fused normalization improves complete cosine-VQ steps. Keep
+            # L2 on the native path, which is faster in the complete Mix graph.
+            if not self.use_cosine_sim or not _update_ema_codebook_(
+                self.embed,
+                self.embed_avg,
+                self.cluster_size,
+                self.use_cosine_sim,
+            ):
 
-            cluster_size_smoothed = laplace_smoothing(self.cluster_size, self.codebook_size)
-            embed_normalized = self.embed_avg / cluster_size_smoothed[:, None]
-            if self.use_cosine_sim:
-                embed_normalized = l2_norm(embed_normalized)
-            self.embed.data.copy_(embed_normalized)
+                def laplace_smoothing(x, n_categories, eps=1e-5, dim=-1):
+                    x_sum = x.sum(dim=dim, keepdim=True)
+                    return x_sum * (x + eps) / (x_sum + n_categories * eps)
+
+                cluster_size_smoothed = laplace_smoothing(self.cluster_size, self.codebook_size)
+                embed_normalized = self.embed_avg / cluster_size_smoothed[:, None]
+                if self.use_cosine_sim:
+                    embed_normalized = l2_norm(embed_normalized)
+                self.embed.data.copy_(embed_normalized)
 
     def _loss(self, x, quantized, dists):
         # compute VQ-VAE loss
@@ -492,7 +611,9 @@ class VectorQuantize(nn.Module):
         if self.use_cosine_sim and not input_normalized:
             x = l2_norm(x)
 
-        if not self.inited:
+        if self._inited_python is None:
+            self._inited_python = bool(self.inited.item())
+        if not self._inited_python:
             self._accumulate_input_batch(x)
             return x, None
 
@@ -507,18 +628,29 @@ class VectorQuantize(nn.Module):
         codebook = self.codebook  # (codebook_size, dim_feature)
 
         # compute distances to codebook embeddings
+        stochastic_search = self.training and self.stochastic_sampling and self.sampling_temp > 0
         if self.use_cosine_sim:
             dists = cosine_dist(x, codebook)  # (N, codebook_size)
+            search_dists = dists
         else:
-            dists = l2_dist(x, codebook)  # (N, codebook_size)
+            squared_dists = squared_l2_dist(x, codebook)
+            dists = squared_dists.sqrt()  # Preserve the public distance semantics.
+            search_dists = dists if stochastic_search else squared_dists
 
         # find closest codebook embeddings
-        embed_indices = gumbel_sample(
-            logits=-dists,
-            stochastic=self.stochastic_sampling,
-            temperature=self.sampling_temp,
-            training=self.training,
-        )  # (N,)
+        embed_indices = None
+        if not stochastic_search and self.accelerated_search:
+            if self.use_cosine_sim:
+                embed_indices = accelerated_cosine_argmin(x, codebook)
+            else:
+                embed_indices = accelerated_l2_argmin(x, codebook)
+        if embed_indices is None:
+            embed_indices = gumbel_sample(
+                logits=-search_dists,
+                stochastic=self.stochastic_sampling,
+                temperature=self.sampling_temp,
+                training=self.training,
+            )  # (N,)
 
         # get quantized vectors
         quantized = F.embedding(embed_indices, codebook)  # (N, dim_feature)
@@ -532,7 +664,16 @@ class VectorQuantize(nn.Module):
         # compute perplexity
         cluster_size = torch.bincount(embed_indices.view(-1), minlength=self.codebook_size)
         cluster_size = reduce(cluster_size, reduction="sum")
-        perplexity = compute_perplexity(cluster_size)
+        perplexity_stats = (
+            accelerated_perplexity_stats(cluster_size, x.shape[0])
+            if PartialState().num_processes == 1
+            else None
+        )
+        if perplexity_stats is None:
+            perplexity = compute_perplexity(cluster_size)
+            normalized_perplexity = perplexity / self.codebook_size
+        else:
+            perplexity, normalized_perplexity = perplexity_stats
 
         # compute VQ losses
         total_loss, loss_terms = self._loss(x, quantized, dists)
@@ -542,7 +683,7 @@ class VectorQuantize(nn.Module):
             "dists": dists,
             "embed_indices": embed_indices,
             "perplexity": perplexity,
-            "normalized_perplexity": perplexity / self.codebook_size,
+            "normalized_perplexity": normalized_perplexity,
             "num_expired_codes": num_expired_codes,
             "loss": total_loss,
             **loss_terms,

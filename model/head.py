@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 
-from .blocks import Conv2dBlock, LinearBlock
+from .layers.convolution import Conv2dBlock
+from .layers.linear import LinearBlock
 
 
 def build_head(head_type, dim_feature):

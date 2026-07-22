@@ -3,8 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock, build_activation_layer
-from .mixnet import StarBlock
+from .layers.activation import build_activation_layer
+from .layers.convolution import Conv2dBlock
+from .layers.linear import LinearBlock
+from .layers.star import StarBlock
+from .ops import dynamic_pointwise_conv2d, quantized_avg4, quantized_sum_3x3_regions
 from utils.quant_utils import fake_quant
 
 
@@ -178,29 +181,18 @@ class LineNNUEv1(nn.Module):
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
 
         # value feature accumulator of nine groups
-        B, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        B = feature.shape[0]
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = quantized_sum_3x3_regions(feature)
 
         # policy head
         dim_pm = self.policy_middle_dim
@@ -208,17 +200,7 @@ class LineNNUEv1(nn.Module):
         pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
         pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
         policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy, H, W),
-                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_pm)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
         policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
         policy = self.policy_output(policy)  # [B, 1, H, W]
@@ -234,19 +216,10 @@ class LineNNUEv1(nn.Module):
         value_21 = self.value_edge(feature_21)
         value_22 = self.value_corner(feature_22)
 
-        def avg4(a, b, c, d):
-            a = fake_quant(a, floor=True)
-            b = fake_quant(b, floor=True)
-            c = fake_quant(c, floor=True)
-            d = fake_quant(d, floor=True)
-            ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
-            cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
-            return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
-
-        value_q00 = avg4(value_00, value_01, value_10, value_11)
-        value_q01 = avg4(value_01, value_02, value_11, value_12)
-        value_q10 = avg4(value_10, value_11, value_20, value_21)
-        value_q11 = avg4(value_11, value_12, value_21, value_22)
+        value_q00 = quantized_avg4(value_00, value_01, value_10, value_11)
+        value_q01 = quantized_avg4(value_01, value_02, value_11, value_12)
+        value_q10 = quantized_avg4(value_10, value_11, value_20, value_21)
+        value_q11 = quantized_avg4(value_11, value_12, value_21, value_22)
         value_q00 = self.value_quad(value_q00)
         value_q01 = self.value_quad(value_q01)
         value_q10 = self.value_quad(value_q10)

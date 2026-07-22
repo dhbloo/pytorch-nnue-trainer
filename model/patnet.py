@@ -3,29 +3,41 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import Conv2dBlock, LinearBlock, ChannelWiseLeakyReLU
+from .layers.activation import ChannelWiseLeakyReLU
+from .layers.convolution import Conv2dBlock
+from .layers.linear import LinearBlock
+from .ops import small_table_embedding
 
 
-def build_embedding(type, feature_dim, board_size=15, pcode_dim=2380, **kwargs):
+def build_embedding(
+    type, feature_dim, board_size=15, pcode_dim=2380, channels_last=False, **kwargs
+):
     if type == "pcode":
-        return PatternCodeEmbedding(feature_dim, pcode_dim)
+        return PatternCodeEmbedding(feature_dim, pcode_dim, channels_last)
     elif type == "pcode-twoside":
-        return PatternCodeTwoSideEmbedding(feature_dim, pcode_dim)
+        return PatternCodeTwoSideEmbedding(feature_dim, pcode_dim, channels_last)
     elif type == "pcode-board":
-        return PatternCodeBoardEmbedding(feature_dim, board_size, pcode_dim)
+        return PatternCodeBoardEmbedding(feature_dim, board_size, pcode_dim, channels_last)
     elif type == "pcode-symboard":
-        return PatternCodeSymBoardEmbedding(feature_dim, board_size, pcode_dim, **kwargs)
+        return PatternCodeSymBoardEmbedding(
+            feature_dim, board_size, pcode_dim, channels_last=channels_last, **kwargs
+        )
     elif type == "pcode-symouterboard":
-        return PatternCodeSymOuterBoardEmbedding(feature_dim, board_size, pcode_dim, **kwargs)
+        return PatternCodeSymOuterBoardEmbedding(
+            feature_dim, board_size, pcode_dim, channels_last=channels_last, **kwargs
+        )
     else:
         raise ValueError(f"Unsupported embedding: {type}")
 
 
 class PatternCodeEmbedding(nn.Module):
-    def __init__(self, feature_dim, pcode_dim=2380):
+    def __init__(self, feature_dim, pcode_dim=2380, channels_last=False):
         super().__init__()
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
+        self.output_memory_format = (
+            torch.channels_last if channels_last else torch.contiguous_format
+        )
         self.pcode_embedding = nn.Embedding(num_embeddings=2 * (pcode_dim + 1), embedding_dim=feature_dim)
 
     def forward(self, data):
@@ -42,17 +54,22 @@ class PatternCodeEmbedding(nn.Module):
         pcode_sparse_input[:, 1] += self.pcode_dim + 1
 
         # convert sparse input to dense feature through embedding
-        pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
+        pcode_feature = small_table_embedding(
+            pcode_sparse_input, self.pcode_embedding.weight
+        )  # [B, 2, H, W, feature_dim]
         pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
+        return pcode_feature.contiguous(memory_format=self.output_memory_format)
 
 
 class PatternCodeTwoSideEmbedding(nn.Module):
-    def __init__(self, feature_dim, pcode_dim=2380):
+    def __init__(self, feature_dim, pcode_dim=2380, channels_last=False):
         super().__init__()
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
+        self.output_memory_format = (
+            torch.channels_last if channels_last else torch.contiguous_format
+        )
         self.pcode_embedding = nn.Embedding(num_embeddings=(pcode_dim + 1) ** 2, embedding_dim=feature_dim)
 
     def forward(self, data):
@@ -73,16 +90,19 @@ class PatternCodeTwoSideEmbedding(nn.Module):
         # convert sparse input to dense feature through embedding
         pcode_feature = self.pcode_embedding(pcode_two_side_sparse_input)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
+        return pcode_feature.contiguous(memory_format=self.output_memory_format)
 
 
 class PatternCodeBoardEmbedding(nn.Module):
-    def __init__(self, feature_dim, board_size, pcode_dim=2380):
+    def __init__(self, feature_dim, board_size, pcode_dim=2380, channels_last=False):
         super().__init__()
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
         self.board_size = board_size
         self.cell_dim = board_size * board_size
+        self.output_memory_format = (
+            torch.channels_last if channels_last else torch.contiguous_format
+        )
 
         embed_dim = 2 * (pcode_dim + 1)
         self.pcode_embedding = nn.Embedding(num_embeddings=embed_dim, embedding_dim=feature_dim)
@@ -107,22 +127,27 @@ class PatternCodeBoardEmbedding(nn.Module):
         pcode_board_sparse_input = pcode_sparse_input + self.board_offset
 
         # convert sparse input to dense feature through embedding
-        pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
+        pcode_feature = small_table_embedding(pcode_sparse_input, self.pcode_embedding.weight)
         pcode_board_feature = self.pcode_board_embedding(pcode_board_sparse_input)
         pcode_feature = pcode_feature + pcode_board_feature
 
         pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
+        return pcode_feature.contiguous(memory_format=self.output_memory_format)
 
 
 class PatternCodeSymBoardEmbedding(nn.Module):
-    def __init__(self, feature_dim, board_size, pcode_dim=2380, max_offset=None):
+    def __init__(
+        self, feature_dim, board_size, pcode_dim=2380, max_offset=None, channels_last=False
+    ):
         super().__init__()
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
         self.board_size = board_size
         self.cell_dim = board_size * board_size
+        self.output_memory_format = (
+            torch.channels_last if channels_last else torch.contiguous_format
+        )
 
         embed_dim = 2 * (pcode_dim + 1)
         self.pcode_embedding = nn.Embedding(num_embeddings=embed_dim, embedding_dim=feature_dim)
@@ -165,22 +190,27 @@ class PatternCodeSymBoardEmbedding(nn.Module):
         pcode_symboard_sparse_input = pcode_sparse_input + self.offset_map
 
         # convert sparse input to dense feature through embedding
-        pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
+        pcode_feature = small_table_embedding(pcode_sparse_input, self.pcode_embedding.weight)
         pcode_board_feature = self.pcode_symboard_embedding(pcode_symboard_sparse_input)
         pcode_feature = pcode_feature + pcode_board_feature
 
         pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
+        return pcode_feature.contiguous(memory_format=self.output_memory_format)
 
 
 class PatternCodeSymOuterBoardEmbedding(nn.Module):
-    def __init__(self, feature_dim, board_size, pcode_dim=2380, outer_size=5):
+    def __init__(
+        self, feature_dim, board_size, pcode_dim=2380, outer_size=5, channels_last=False
+    ):
         super().__init__()
         self.feature_dim = feature_dim
         self.pcode_dim = pcode_dim
         self.board_size = board_size
         self.cell_dim = board_size * board_size
+        self.output_memory_format = (
+            torch.channels_last if channels_last else torch.contiguous_format
+        )
 
         embed_dim = 2 * (pcode_dim + 1)
         self.pcode_embedding = nn.Embedding(num_embeddings=embed_dim, embedding_dim=feature_dim)
@@ -225,13 +255,13 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
         pcode_outerboard_sparse_input = pcode_sparse_input + self.offset_map
 
         # convert sparse input to dense feature through embedding
-        pcode_feature = self.pcode_embedding(pcode_sparse_input)  # [B, 2, H, W, feature_dim]
+        pcode_feature = small_table_embedding(pcode_sparse_input, self.pcode_embedding.weight)
         pcode_board_feature = self.pcode_outerboard_embedding(pcode_outerboard_sparse_input)
         pcode_feature = pcode_feature + pcode_board_feature
 
         pcode_feature = torch.sum(pcode_feature, dim=1, keepdim=False)  # [B, H, W, feature_dim]
         pcode_feature = torch.permute(pcode_feature, (0, 3, 1, 2))  # [B, feature_dim, H, W]
-        return pcode_feature.contiguous()
+        return pcode_feature.contiguous(memory_format=self.output_memory_format)
 
 
 @MODELS.register("patnetbaseline")
@@ -348,14 +378,28 @@ class PatNetv1(nn.Module):
 
 @MODELS.register("patnetv2")
 class PatNetv2(nn.Module):
-    def __init__(self, dim_policy=16, dim_value=32, board_size=15, embedding_type="pcode-symboard", **kwargs):
+    def __init__(
+        self,
+        dim_policy=16,
+        dim_value=32,
+        board_size=15,
+        embedding_type="pcode-symboard",
+        channels_last=True,
+        **kwargs,
+    ):
         super().__init__()
         self.model_size = (dim_policy, dim_value)
         self.board_size = board_size
         self.embedding_type = embedding_type
         in_dim = dim_policy + dim_value
 
-        self.embedding = build_embedding(embedding_type, in_dim, board_size, **kwargs)
+        self.embedding = build_embedding(
+            embedding_type,
+            in_dim,
+            board_size,
+            channels_last=channels_last,
+            **kwargs,
+        )
         self.conv = Conv2dBlock(
             in_dim, in_dim, ks=3, st=1, padding=1, groups=in_dim, activation="relu", pad_type="zeros"
         )

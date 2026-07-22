@@ -3,199 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .blocks import (
-    Conv2dBlock,
-    LinearBlock,
-    ChannelWiseLeakyReLU,
-    QuantPReLU,
-    SwitchGate,
-    SwitchLinearBlock,
-    SwitchPReLU,
-    SequentialWithExtraArguments,
-    build_activation_layer,
-    build_norm2d_layer,
-)
+from .layers.activation import ChannelWiseLeakyReLU, QuantPReLU, SwitchPReLU
+from .layers.convolution import Conv2dBlock
+from .layers.linear import LinearBlock
+from .layers.normalization import build_norm2d_layer
+from .layers.star import StarBlock
+from .layers.switch import SwitchGate, SwitchLinearBlock
 from .input import build_input_plane
+from .mixnet_components import Mapping
+from .ops import (
+    dynamic_pointwise_conv2d,
+    mean_3x3_regions,
+    quantized_avg4 as avg4,
+    quantized_sum_3x3_regions,
+    split_3x3_regions,
+)
 from utils.quant_utils import fake_quant
 
 
-def tuple_op(f, x):
-    return tuple((f(xi) if xi is not None else None) for xi in x)
-
-
-def add_op(t):
-    return None if (t[0] is None and t[1] is None) else t[0] + t[1]
-
-
-def avg4(a, b, c, d):
-    a = fake_quant(a, floor=True)
-    b = fake_quant(b, floor=True)
-    c = fake_quant(c, floor=True)
-    d = fake_quant(d, floor=True)
-    ab = fake_quant((a + b + 1 / 128) / 2, floor=True)
-    cd = fake_quant((c + d + 1 / 128) / 2, floor=True)
-    return fake_quant((ab + cd + 1 / 128) / 2, floor=True)
-
-
-class DirectionalConvLayer(nn.Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_out,
-        use_nonzero_padding=False,
-        use_channel_last=True,
-        fix_direction_order=False,
-    ):
-        super().__init__()
-        weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
-        self.weight = nn.Parameter(torch.empty(weight_shape))
-        self.bias = nn.Parameter(torch.zeros((dim_out,)))
-        self.use_nonzero_padding = use_nonzero_padding
-        self.use_channel_last = use_channel_last
-        self.fix_direction_order = fix_direction_order
-
-    def initialize(self):
-        if self.use_channel_last:
-            nn.init.kaiming_normal_(self.weight.data)
-        else:
-            nn.init.kaiming_normal_(self.weight.data.permute(1, 0, 2))
-        self.bias.data.zero_()
-
-    def _conv1d_direction(self, x, dir):
-        if self.use_channel_last:
-            dim_out, dim_in, kernel_size = self.weight.shape
-        else:
-            kernel_size, dim_out, dim_in = self.weight.shape
-        # plain int: under torch.jit.trace shape elements are traced tensors,
-        # and conv2d/F.pad reject a 0-dim tensor as padding
-        kernel_size = int(kernel_size)
-        zero = torch.zeros((dim_out, dim_in), dtype=self.weight.dtype, device=self.weight.device)
-
-        if self.use_channel_last:
-            w_0_, w_1_, w_2_ = self.weight[..., 0], self.weight[..., 1], self.weight[..., 2]
-        else:
-            w_0_, w_1_, w_2_ = self.weight[0], self.weight[1], self.weight[2]
-
-        if self.fix_direction_order:
-            weight_func_map = [
-                lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
-                lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
-                lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
-                lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
-            ]
-        else:
-            weight_func_map = [
-                lambda w: (zero, zero, zero, w_0_, w_1_, w_2_, zero, zero, zero),
-                lambda w: (zero, w_0_, zero, zero, w_1_, zero, zero, w_2_, zero),
-                lambda w: (w_0_, zero, zero, zero, w_1_, zero, zero, zero, w_2_),
-                lambda w: (zero, zero, w_2_, zero, w_1_, zero, w_0_, zero, zero),
-            ]
-
-        weight = torch.stack(weight_func_map[dir](self.weight), dim=2)
-        weight = weight.reshape(dim_out, dim_in, kernel_size, kernel_size)
-        if self.use_nonzero_padding:
-            x = F.pad(
-                x,
-                pad=(kernel_size // 2, kernel_size // 2, kernel_size // 2, kernel_size // 2),
-                mode="constant",
-                value=1,
-            )
-            return torch.conv2d(x, weight, self.bias, padding=0)
-        else:
-            return torch.conv2d(x, weight, self.bias, padding=kernel_size // 2)
-
-    def forward(self, x):
-        assert len(x) == 4, f"must be 4 directions, got {len(x)}"
-        return tuple((self._conv1d_direction(xi, i) if xi is not None else None) for i, xi in enumerate(x))
-
-
-class DirectionalConvResBlock(nn.Module):
-    def __init__(self, dim, act, norm, **dirconv_kwargs):
-        super().__init__()
-        self.d_conv = DirectionalConvLayer(dim, dim, **dirconv_kwargs)
-        self.norm = build_norm2d_layer(norm, dim)
-        self.conv1x1 = nn.Conv2d(dim, dim, kernel_size=1)
-        self.activation = build_activation_layer(act)
-
-    def forward(self, x, mask=None):
-        residual = x
-        x = self.d_conv(x)
-        if self.norm is not None:
-            x = tuple_op(lambda t: self.norm(t) if mask is None else self.norm(t, mask=mask), x)
-        x = tuple_op(self.activation, x)
-        x = tuple_op(self.conv1x1, x)
-        x = tuple_op(self.activation, x)
-        x = tuple_op(add_op, zip(x, residual))
-        return x
-
-
-class Conv0dResBlock(nn.Module):
-    def __init__(self, dim, activation, middle_dim_multipler=1):
-        super().__init__()
-        middle_dim = middle_dim_multipler * dim
-        self.conv1 = nn.Conv2d(dim, middle_dim, kernel_size=1)
-        self.conv2 = nn.Conv2d(middle_dim, dim, kernel_size=1)
-        self.activation = build_activation_layer(activation)
-
-    def forward(self, x, mask=None):
-        residual = x
-        x = tuple_op(self.conv1, x)
-        x = tuple_op(self.activation, x)
-        x = tuple_op(self.conv2, x)
-        x = tuple_op(self.activation, x)
-        x = tuple_op(add_op, zip(x, residual))
-        return x
-
-
-class Mapping(nn.Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_middle,
-        dim_out,
-        use_channel_last=True,
-        fix_direction_order=False,
-        activation="silu",
-        normalization="none",
-        line_length=11,
-    ):
-        super().__init__()
-        self.d_conv = DirectionalConvLayer(
-            dim_in,
-            dim_middle,
-            use_nonzero_padding=False,
-            use_channel_last=use_channel_last,
-            fix_direction_order=fix_direction_order,
-        )
-        self.norm = build_norm2d_layer(normalization, dim_middle)
-        self.convs = SequentialWithExtraArguments(
-            *[
-                DirectionalConvResBlock(
-                    dim_middle,
-                    activation,
-                    normalization,
-                    use_nonzero_padding=False,
-                    use_channel_last=use_channel_last,
-                    fix_direction_order=fix_direction_order,
-                )
-                for _ in range((line_length // 2) - 1)
-            ],
-            Conv0dResBlock(dim_middle, activation),
-        )
-        self.final_conv = nn.Conv2d(dim_middle, dim_out, kernel_size=1)
-        self.activation = build_activation_layer(activation)
-
-    def forward(self, x, mask=None, dirs=[0, 1, 2, 3]):
-        x = tuple((x if i in dirs else None) for i in range(4))
-        x = self.d_conv(x)
-        if self.norm is not None:
-            x = tuple_op(lambda t: self.norm(t) if mask is None else self.norm(t, mask=mask), x)
-        x = tuple_op(self.activation, x)
-        x = self.convs(x, mask=mask)
-        x = tuple_op(self.final_conv, x)
-        x = tuple(xi for xi in x if xi is not None)
-        x = torch.stack(x, dim=1)  # [B, <=4, dim_out, H, W]
-        return x
+_MAPPING_GEMM_INDUCTOR_CONFIG = {"conv_1x1_as_mm": True}
 
 
 @MODELS.register("mix6")
@@ -489,37 +315,25 @@ class Mix8Net(nn.Module):
         # value feature accumulator
         feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature]
 
-        # value feature accumulator of four quadrants
-        B, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        # value feature accumulator of nine regions
+        B = feature.shape[0]
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = mean_3x3_regions(feature)
 
         # policy head
         pwconv_weight = self.policy_pwconv_weight_linear(feature_mean)
         pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy, H, W),
-                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(4)
-            ],
-            dim=1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value head
@@ -566,21 +380,19 @@ class Mix8Net(nn.Module):
         feature_mean = torch.mean(feature, dim=(2, 3))  # [B, dim_feature, H, W]
         print(f"feature mean: \n{feature_mean}")
 
-        # value feature accumulator of four quadrants
-        B, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.mean(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.mean(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.mean(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.mean(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.mean(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.mean(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.mean(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.mean(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.mean(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
+        # value feature accumulator of nine regions
+        B = feature.shape[0]
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = mean_3x3_regions(feature)
         print(f"feature 00 mean: \n{feature_00}")
         print(f"feature 01 mean: \n{feature_01}")
         print(f"feature 02 mean: \n{feature_02}")
@@ -597,17 +409,7 @@ class Mix8Net(nn.Module):
         pwconv_weight = pwconv_weight.reshape(B, 4 * dim_policy, 1, 1)
         policy = feature[:, :dim_policy]  # [B, dim_policy, H, W]
         print(f"policy after dwconv at (0,0): \n{policy[..., 0, 0]}")
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy, H, W),
-                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(4)
-            ],
-            dim=1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         print(f"policy after dynamic pwconv at (0,0): \n{policy[..., 0, 0]}")
         policy = self.policy_output(policy)  # [B, 1, H, W]
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
@@ -700,43 +502,12 @@ class Mix8Net(nn.Module):
         return f"mix8_{self.input_type}_{f}f{p}p{v}v{q}q{d}d"
 
 
-class StarBlock(nn.Module):
-    def __init__(self, dim_in, dim_out, expand=1):
-        super().__init__()
-        self.up1 = LinearBlock(dim_in, dim_out * 2 * expand, activation="relu", quant=True)
-        self.up2 = LinearBlock(dim_in, dim_out * 2 * expand, activation="none", quant=True)
-        self.down = LinearBlock(dim_out * expand, dim_out, activation="relu", quant=True)
-
-    def forward(self, x):
-        x1 = self.up1(x)
-        x2 = self.up2(x)
-        x1 = fake_quant(x1, scale=128, num_bits=8, floor=True)
-        x2 = fake_quant(x2, scale=128, num_bits=8, floor=True)
-        # i32 dot product of two adjacent pairs of u8 and i8
-        x = (x1 * x2).view(*x.shape[:-1], -1, 2).sum(-1)
-        # clamp to int8, scale=128, [-1,1]
-        x = fake_quant(x, scale=128, num_bits=8, floor=True)
-        x = self.down(x)  # int8 linear layer with signed input
-        return x
-
-    def forward_debug_print(self, x, name="starblock"):
-        x1 = self.up1(x)
-        x2 = self.up2(x)
-        x1 = fake_quant(x1, scale=128, num_bits=8, floor=True)
-        x2 = fake_quant(x2, scale=128, num_bits=8, floor=True)
-        print(f"{name} up1: \n{(x1*128).int()}")
-        print(f"{name} up2: \n{(x2*128).int()}")
-        # i32 dot product of two adjacent pairs of u8 and i8
-        x = (x1 * x2).view(*x.shape[:-1], -1, 2).sum(-1)
-        x = fake_quant(x, scale=128, num_bits=8, floor=True)
-        print(f"{name} dot2 product: \n{(x*128).int()}")
-        x = self.down(x)  # int8 linear layer with signed input
-        print(f"{name} down: \n{(x*128).int()}")
-        return x
-
-
 @MODELS.register("mix9")
 class Mix9Net(nn.Module):
+    # Mapping contains many large 1x1 convolutions.  On Ada, explicit GEMM
+    # lowering improves both forward and backward without changing parameters.
+    inductor_config = _MAPPING_GEMM_INDUCTOR_CONFIG
+
     def __init__(
         self,
         dim_middle=128,
@@ -898,17 +669,7 @@ class Mix9Net(nn.Module):
             pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
             pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
             policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-            policy = torch.cat(
-                [
-                    F.conv2d(
-                        input=policy.reshape(1, B * dim_policy, H, W),
-                        weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                        groups=B,
-                    ).reshape(B, 1, H, W)
-                    for i in range(dim_pm)
-                ],
-                1,
-            )
+            policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
             pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
                 B, dim_pm, 1, 1
             )  # int32, scale=128*128*128
@@ -922,28 +683,17 @@ class Mix9Net(nn.Module):
             value = self.value_linear(feature_sum)
         else:
             # value feature accumulator of nine groups
-            H0, W0 = 0, 0
-            H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-            H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-            H3, W3 = H, W
-            feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            (
+                feature_00,
+                feature_01,
+                feature_02,
+                feature_10,
+                feature_11,
+                feature_12,
+                feature_20,
+                feature_21,
+                feature_22,
+            ) = quantized_sum_3x3_regions(feature)
 
             # value head
             value_00 = self.value_corner(feature_00)
@@ -1008,17 +758,7 @@ class Mix9Net(nn.Module):
             print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
             policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
             print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
-            policy = torch.cat(
-                [
-                    F.conv2d(
-                        input=policy.reshape(1, B * dim_policy, H, W),
-                        weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                        groups=B,
-                    ).reshape(B, 1, H, W)
-                    for i in range(dim_pm)
-                ],
-                1,
-            )
+            policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
             print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
             pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
                 B, dim_pm, 1, 1
@@ -1039,28 +779,17 @@ class Mix9Net(nn.Module):
                 print(f"value feature after layer {i}: \n{(value*128).int()}")
         else:
             # value feature accumulator of nine groups
-            H0, W0 = 0, 0
-            H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-            H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-            H3, W3 = H, W
-            feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-            feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-            feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-            feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-            feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+            (
+                feature_00,
+                feature_01,
+                feature_02,
+                feature_10,
+                feature_11,
+                feature_12,
+                feature_20,
+                feature_21,
+                feature_22,
+            ) = quantized_sum_3x3_regions(feature)
             print(f"feature 00 sum: \n{(feature_00*128).int()}")
             print(f"feature 01 sum: \n{(feature_01*128).int()}")
             print(f"feature 02 sum: \n{(feature_02*128).int()}")
@@ -1220,6 +949,8 @@ class Mix9Net(nn.Module):
 
 @MODELS.register("mix9s")
 class Mix9sNet(nn.Module):
+    inductor_config = _MAPPING_GEMM_INDUCTOR_CONFIG
+
     def __init__(
         self,
         dim_middle=128,
@@ -1338,17 +1069,7 @@ class Mix9sNet(nn.Module):
         pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
         pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
         policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy, H, W),
-                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_pm)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
             B, dim_pm, 1, 1
         )  # int32, scale=128*128*128
@@ -1356,28 +1077,17 @@ class Mix9sNet(nn.Module):
         policy = self.policy_output(policy)  # [B, 1, H, W]
 
         # value feature accumulator of nine groups
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = quantized_sum_3x3_regions(feature)
 
         # value head
         value_00 = self.value_corner(feature_00)
@@ -1436,17 +1146,7 @@ class Mix9sNet(nn.Module):
         print(f"policy pwconv weight: \n{(pwconv_weight.flatten(1, -1)*128*128).int()}")
         policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
         print(f"policy after dwconv at (0,0): \n{(policy[..., 0, 0]*128).int()}")
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy, H, W),
-                    weight=pwconv_weight[:, dim_policy * i : dim_policy * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_pm)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         print(f"policy after dynamic pwconv at (0,0): \n{(policy[..., 0, 0]*128*128*128).int()}")
         pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(
             B, dim_pm, 1, 1
@@ -1458,28 +1158,17 @@ class Mix9sNet(nn.Module):
         print(f"policy output at (0,0): \n{policy[..., 0, 0]}")
 
         # value feature accumulator of nine groups
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = torch.sum(feature[:, :, H0:H1, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_01 = torch.sum(feature[:, :, H0:H1, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_02 = torch.sum(feature[:, :, H0:H1, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_10 = torch.sum(feature[:, :, H1:H2, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_11 = torch.sum(feature[:, :, H1:H2, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_12 = torch.sum(feature[:, :, H1:H2, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_20 = torch.sum(feature[:, :, H2:H3, W0:W1], dim=(2, 3))  # [B, dim_feature]
-        feature_21 = torch.sum(feature[:, :, H2:H3, W1:W2], dim=(2, 3))  # [B, dim_feature]
-        feature_22 = torch.sum(feature[:, :, H2:H3, W2:W3], dim=(2, 3))  # [B, dim_feature]
-        feature_00 = fake_quant(feature_00 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_01 = fake_quant(feature_01 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_02 = fake_quant(feature_02 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_10 = fake_quant(feature_10 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_11 = fake_quant(feature_11 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_12 = fake_quant(feature_12 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_20 = fake_quant(feature_20 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_21 = fake_quant(feature_21 / 32, scale=128, num_bits=32, floor=True)  # srai 5
-        feature_22 = fake_quant(feature_22 / 32, scale=128, num_bits=32, floor=True)  # srai 5
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = quantized_sum_3x3_regions(feature)
         print(f"feature 00 sum: \n{(feature_00*128).int()}")
         print(f"feature 01 sum: \n{(feature_01*128).int()}")
         print(f"feature 02 sum: \n{(feature_02*128).int()}")
@@ -1576,6 +1265,10 @@ class Mix9sNet(nn.Module):
 
 @MODELS.register("mix9svq")
 class Mix9sVQNet(Mix9sNet):
+    # VQ search dominates this graph; forcing the inherited GEMM lowering was
+    # slower in repeated complete-step measurements.
+    inductor_config = {}
+
     def __init__(
         self,
         dim_middle=128,
@@ -1588,7 +1281,7 @@ class Mix9sVQNet(Mix9sNet):
         num_codebooks=1,
         **vq_kwargs,
     ):
-        from .vq import ProductVectorQuantize
+        from .vq import ProductVectorQuantize, rotate_to
 
         super().__init__(
             dim_middle=dim_middle,
@@ -1611,7 +1304,30 @@ class Mix9sVQNet(Mix9sNet):
                 for _ in range(2)
             ]
         )
+        # The VQ path itself has data-dependent unique-vector shapes and stays
+        # eager, but its per-position rotation has a stable graph. Trainers
+        # replace this eager reference through configure_compilation().
+        self._rotate_to = rotate_to
         self._cached_positions = None
+        self.register_buffer(
+            "_vq_quantile_levels",
+            torch.tensor([0.01, 0.1, 0.5, 0.9, 0.99]),
+            persistent=False,
+        )
+
+    def configure_compilation(self, compile_fn):
+        """Compile the rotation STE with a VQ-specific Dynamo policy."""
+        from .vq import rotate_to
+
+        # Inductor's max-autotune mode currently selects a slower forward and
+        # backward kernel for the large [B*2*H*W, C] rotation workload. Keep
+        # the configured backend, but use its default kernel policy here.
+        self._rotate_to = compile_fn(
+            rotate_to,
+            mode="default",
+            fullgraph=True,
+            dynamic=True,
+        )
 
     @torch.compiler.disable
     def _quantize_line_feature(self, feature, line_encoding, vq_layer_idx):
@@ -1653,8 +1369,23 @@ class Mix9sVQNet(Mix9sNet):
         # quantize the features
         feature_per_line_encoding_vq, info, _ = self.vq_layers[vq_layer_idx](feature_per_line_encoding)
 
-        # gather the quantized features back to the original shape
-        feature_vq = feature_per_line_encoding_vq[inverse_indices]  # [N, dim_feature]
+        # Gather quantized values back to all positions, but apply the
+        # straight-through gradient at every occurrence. Mapping features are
+        # a pure function of the 11-cell line encoding, so occurrences with
+        # the same encoding are identical. This is gradient-equivalent for
+        # mapping parameters and avoids the highly contended atomic scatter
+        # produced by gather's backward into one representative occurrence.
+        feature_vq_target = feature_per_line_encoding_vq[inverse_indices].detach()
+        vq_module = self.vq_layers[vq_layer_idx].vq_modules[0]
+        if vq_module.rotation_trick:
+            feature_groups = feature.chunk(self.num_codebooks, dim=-1)
+            target_groups = feature_vq_target.chunk(self.num_codebooks, dim=-1)
+            feature_vq = torch.cat(
+                [self._rotate_to(src, tgt) for src, tgt in zip(feature_groups, target_groups)],
+                dim=-1,
+            )
+        else:
+            feature_vq = feature + (feature_vq_target - feature).detach()
         feature_vq = feature_vq.reshape(batch_size, num_directions, H, W, dim_feature)
         feature_vq = feature_vq.permute(0, 1, 4, 2, 3)  # [B, num_directions, dim_feature, H, W]
 
@@ -1678,15 +1409,19 @@ class Mix9sVQNet(Mix9sNet):
                     self.vq_layers[1].normalized_cluster_size,
                 ]
             )
+            cluster_size_quantiles = torch.quantile(
+                cluster_size,
+                q=self._vq_quantile_levels,
+            )
             aux_outputs = {
                 "vq_perplexity": (info_1["perplexity"] + info_2["perplexity"]) / 2,
                 "vq_normed_perplexity": (info_1["normalized_perplexity"] + info_2["normalized_perplexity"])
                 / 2,
-                "vq_cluster_size_q01": torch.quantile(cluster_size, q=0.01),
-                "vq_cluster_size_q10": torch.quantile(cluster_size, q=0.1),
-                "vq_cluster_size_q50": torch.quantile(cluster_size, q=0.5),
-                "vq_cluster_size_q90": torch.quantile(cluster_size, q=0.9),
-                "vq_cluster_size_q99": torch.quantile(cluster_size, q=0.99),
+                "vq_cluster_size_q01": cluster_size_quantiles[0],
+                "vq_cluster_size_q10": cluster_size_quantiles[1],
+                "vq_cluster_size_q50": cluster_size_quantiles[2],
+                "vq_cluster_size_q90": cluster_size_quantiles[3],
+                "vq_cluster_size_q99": cluster_size_quantiles[4],
                 "vq_num_expired_codes": info_1["num_expired_codes"] + info_2["num_expired_codes"],
             }
 
@@ -1700,6 +1435,8 @@ class Mix9sVQNet(Mix9sNet):
 
 @MODELS.register("mix10")
 class Mix10Net(nn.Module):
+    inductor_config = _MAPPING_GEMM_INDUCTOR_CONFIG
+
     def __init__(
         self,
         dim_middle=128,
@@ -1878,8 +1615,8 @@ class Mix10Net(nn.Module):
         feature_mod = fake_quant(feature_mod, scale=128, num_bits=8, floor=True)
 
         # value feature accumulator of nine groups
-        def get_group_feature(y0, y1, x0, x1, mod):
-            f = torch.sum(feature[:, :, y0:y1, x0:x1], dim=(2, 3))  # [B, dim_feature]
+        def get_group_feature(region, mod):
+            f = torch.sum(region, dim=(2, 3))  # [B, dim_feature]
             f = fake_quant(f / 32, scale=128, num_bits=8, floor=True)  # srai 5
             f = torch.cat([f, f], dim=1)  # [B, dim_feature * 2]
             # i16 dot product of two adjacent pairs of u8 and i8
@@ -1888,20 +1625,17 @@ class Mix10Net(nn.Module):
             x = fake_quant(x, scale=128, num_bits=8, floor=True)
             return x
 
-        _, _, H, W = feature.shape
-        H0, W0 = 0, 0
-        H1, W1 = (H // 3) + (H % 3 == 2), (W // 3) + (W % 3 == 2)
-        H2, W2 = (H // 3) * 2 + (H % 3 > 0), (W // 3) * 2 + (W % 3 > 0)
-        H3, W3 = H, W
-        feature_00 = get_group_feature(H0, H1, W0, W1, feature_mod)  # [B, dim_feature]
-        feature_01 = get_group_feature(H0, H1, W1, W2, feature_mod)  # [B, dim_feature]
-        feature_02 = get_group_feature(H0, H1, W2, W3, feature_mod)  # [B, dim_feature]
-        feature_10 = get_group_feature(H1, H2, W0, W1, feature_mod)  # [B, dim_feature]
-        feature_11 = get_group_feature(H1, H2, W1, W2, feature_mod)  # [B, dim_feature]
-        feature_12 = get_group_feature(H1, H2, W2, W3, feature_mod)  # [B, dim_feature]
-        feature_20 = get_group_feature(H2, H3, W0, W1, feature_mod)  # [B, dim_feature]
-        feature_21 = get_group_feature(H2, H3, W1, W2, feature_mod)  # [B, dim_feature]
-        feature_22 = get_group_feature(H2, H3, W2, W3, feature_mod)  # [B, dim_feature]
+        (
+            feature_00,
+            feature_01,
+            feature_02,
+            feature_10,
+            feature_11,
+            feature_12,
+            feature_20,
+            feature_21,
+            feature_22,
+        ) = tuple(get_group_feature(region, feature_mod) for region in split_3x3_regions(feature))
         value_00 = self.value_corner(feature_00)  # [B, dim_value]
         value_01 = self.value_edge(feature_01)  # [B, dim_value]
         value_02 = self.value_corner(feature_02)  # [B, dim_value]
@@ -1949,17 +1683,7 @@ class Mix10Net(nn.Module):
         policy = fake_quant(
             feature[:, :dim_policy_small_in], scale=128, num_bits=16
         )  # [B, dim_policy_small_in, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy_small_in, H, W),
-                    weight=pwconv_weight[:, dim_policy_small_in * i : dim_policy_small_in * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_policy_small_out)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
         policy = torch.clamp(
             policy + pwconv_bias, min=0
         )  # [B, dim_policy_small_out, H, W] int32, scale=128*128*128, relu
@@ -1987,17 +1711,7 @@ class Mix10Net(nn.Module):
         policy = fake_quant(
             feature[:, :dim_policy_large_in], scale=128, num_bits=16
         )  # [B, dim_policy_large_in, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy_large_in, H, W),
-                    weight=pwconv_weight_1[:, dim_policy_large_in * i : dim_policy_large_in * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_policy_large_mid)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight_1)
         policy = torch.clamp(
             policy + pwconv_bias_1, min=0
         )  # [B, dim_policy_large_mid, H, W] int32, scale=128*128*128, relu
@@ -2010,17 +1724,7 @@ class Mix10Net(nn.Module):
         )  # int32, scale=128*128*128
 
         policy = fake_quant(policy, scale=128, num_bits=16, floor=True)  # [B, dim_policy_large_mid, H, W]
-        policy = torch.cat(
-            [
-                F.conv2d(
-                    input=policy.reshape(1, B * dim_policy_large_mid, H, W),
-                    weight=pwconv_weight_2[:, dim_policy_large_mid * i : dim_policy_large_mid * (i + 1)],
-                    groups=B,
-                ).reshape(B, 1, H, W)
-                for i in range(dim_policy_large_out)
-            ],
-            1,
-        )
+        policy = dynamic_pointwise_conv2d(policy, pwconv_weight_2)
         policy = torch.clamp(
             policy + pwconv_bias_2, min=0
         )  # [B, dim_policy_large_out, H, W] int32, scale=128*128*128, relu

@@ -1,8 +1,8 @@
 import torch
 import torch.nn as nn
 
-from model.blocks import LinearBlock
 from . import MODELS
+from .layers.linear import LinearBlock
 
 
 @MODELS.register("linear")
@@ -94,7 +94,9 @@ class LinearThreatModel(LinearModel):
         assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
 
-        p4count = torch.zeros(len(p4_sparse_input), 2, self.p4_dim)  # [B, 2, p4_dim]
+        p4count = torch.zeros(
+            len(p4_sparse_input), 2, self.p4_dim, device=p4_sparse_input.device
+        )  # [B, 2, p4_dim]
         for p4 in range(1, self.p4_dim):
             p4count[:, :, p4] = torch.count_nonzero(p4_sparse_input == p4, dim=(2, 3))
 
@@ -160,7 +162,9 @@ class LinearP4CountMLPModel(LinearModel):
         assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
 
-        p4count = torch.zeros(len(p4_sparse_input), 2, self.p4_dim)  # [B, 2, p4_dim]
+        p4count = torch.zeros(
+            len(p4_sparse_input), 2, self.p4_dim, device=p4_sparse_input.device
+        )  # [B, 2, p4_dim]
         for p4 in range(1, self.p4_dim):
             p4count[:, :, p4] = torch.count_nonzero(p4_sparse_input == p4, dim=(2, 3))
 

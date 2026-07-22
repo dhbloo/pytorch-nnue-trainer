@@ -8,8 +8,10 @@ except ImportError:
     from collections import Iterable
 
 from . import MODELS
-from .blocks import LinearBlock, Conv2dBlock, HashLayer
 from .input import build_input_plane
+from .layers.convolution import Conv2dBlock
+from .layers.hashing import HashLayer
+from .layers.linear import LinearBlock
 from .vq import VectorQuantize
 from utils.quant_utils import fake_quant
 
@@ -391,6 +393,39 @@ class FlatLadder7x7NNUEv3(nn.Module):
                 LinearBlock(32, 32, activation="none", quant=True),
                 LinearBlock(32, dim_vhead, activation="none", quant=True),
             ]
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Checkpoints created before 0aa40c1 contain 25 convolution
+        # mappings, even though forward only ever referenced mappings 0-5.
+        # Drop those unused tensors while retaining strict validation for all
+        # parameters that can affect the model output.
+        legacy_prefix = f"{prefix}convs."
+        for key in tuple(state_dict):
+            if not key.startswith(legacy_prefix):
+                continue
+            mapping_index = key[len(legacy_prefix) :].partition(".")[0]
+            if mapping_index.isdigit():
+                mapping_index = int(mapping_index)
+                if len(self.convs) <= mapping_index < 25:
+                    del state_dict[key]
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     def _make_ladder_mapping(self, dim_middle, dim_mapping):
@@ -1477,6 +1512,11 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         )
         self.codebook_size = codebook_size
         self.use_cosine_sim = use_cosine_sim
+        self.register_buffer(
+            "_cluster_size_quantile_levels",
+            torch.tensor([0.1, 0.5, 0.9]),
+            persistent=False,
+        )
         self.vq_layer = nn.ModuleList(
             [
                 VectorQuantize(
@@ -1493,9 +1533,7 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         loss = []
         perplexity = []
         normalized_perplexity = []
-        cluster_size_q10 = []
-        cluster_size_q50 = []
-        cluster_size_q90 = []
+        cluster_sizes = []
 
         for i, feature in enumerate(feature_groups):
             # fix feature if vq layer is not inited
@@ -1509,10 +1547,7 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                 loss.append(info["loss"])
                 perplexity.append(info["perplexity"])
                 normalized_perplexity.append(info["normalized_perplexity"])
-                cluster_size = self.vq_layer[i].normalized_cluster_size
-                cluster_size_q10.append(torch.quantile(cluster_size, q=0.1))
-                cluster_size_q50.append(torch.quantile(cluster_size, q=0.5))
-                cluster_size_q90.append(torch.quantile(cluster_size, q=0.9))
+                cluster_sizes.append(self.vq_layer[i].normalized_cluster_size)
 
         aux_losses = {}
         if len(loss) > 0:
@@ -1523,15 +1558,18 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
         if len(perplexity) > 0:
             perplexity = torch.stack(perplexity).mean()
             normalized_perplexity = torch.stack(normalized_perplexity).mean()
-            cluster_size_q10 = torch.stack(cluster_size_q10).mean()
-            cluster_size_q50 = torch.stack(cluster_size_q50).mean()
-            cluster_size_q90 = torch.stack(cluster_size_q90).mean()
+            # Batch all codebooks and quantile levels into one segmented sort.
+            cluster_size_quantiles = torch.quantile(
+                torch.stack(cluster_sizes),
+                q=self._cluster_size_quantile_levels,
+                dim=1,
+            ).mean(dim=1)
             aux_outputs = {
                 "vq_perplexity": perplexity,
                 "vq_normed_perplexity": normalized_perplexity,
-                "vq_cluster_size_q10": cluster_size_q10,
-                "vq_cluster_size_q50": cluster_size_q50,
-                "vq_cluster_size_q90": cluster_size_q90,
+                "vq_cluster_size_q10": cluster_size_quantiles[0],
+                "vq_cluster_size_q50": cluster_size_quantiles[1],
+                "vq_cluster_size_q90": cluster_size_quantiles[2],
             }
         return feature_groups, aux_losses, aux_outputs
 
