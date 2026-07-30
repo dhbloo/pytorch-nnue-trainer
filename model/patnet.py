@@ -7,17 +7,18 @@ from .layers.activation import ChannelWiseLeakyReLU
 from .layers.convolution import Conv2dBlock
 from .layers.linear import LinearBlock
 from .ops import small_table_embedding
+from .validation import validate_batch_shared_value
 
 
 def build_embedding(
     type, feature_dim, board_size=15, pcode_dim=2380, channels_last=False, **kwargs
 ):
     if type == "pcode":
-        return PatternCodeEmbedding(feature_dim, pcode_dim, channels_last)
+        return PatternCodeEmbedding(feature_dim, pcode_dim, channels_last, **kwargs)
     elif type == "pcode-twoside":
-        return PatternCodeTwoSideEmbedding(feature_dim, pcode_dim, channels_last)
+        return PatternCodeTwoSideEmbedding(feature_dim, pcode_dim, channels_last, **kwargs)
     elif type == "pcode-board":
-        return PatternCodeBoardEmbedding(feature_dim, board_size, pcode_dim, channels_last)
+        return PatternCodeBoardEmbedding(feature_dim, board_size, pcode_dim, channels_last, **kwargs)
     elif type == "pcode-symboard":
         return PatternCodeSymBoardEmbedding(
             feature_dim, board_size, pcode_dim, channels_last=channels_last, **kwargs
@@ -41,7 +42,11 @@ class PatternCodeEmbedding(nn.Module):
         self.pcode_embedding = nn.Embedding(num_embeddings=2 * (pcode_dim + 1), embedding_dim=feature_dim)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
 
         # set sparse input at non-empty cell
@@ -73,7 +78,11 @@ class PatternCodeTwoSideEmbedding(nn.Module):
         self.pcode_embedding = nn.Embedding(num_embeddings=(pcode_dim + 1) ** 2, embedding_dim=feature_dim)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
 
         # set sparse input at non-empty cell
@@ -111,7 +120,11 @@ class PatternCodeBoardEmbedding(nn.Module):
         self.board_offset = nn.parameter.Parameter(board_cell_index * embed_dim, False)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
 
         # set sparse input at non-empty cell
@@ -174,7 +187,11 @@ class PatternCodeSymBoardEmbedding(nn.Module):
         return map, torch.max(map)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
 
         # set sparse input at non-empty cell
@@ -239,7 +256,11 @@ class PatternCodeSymOuterBoardEmbedding(nn.Module):
         return map, torch.max(map)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
 
         # set sparse input at non-empty cell

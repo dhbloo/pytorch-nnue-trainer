@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .convolution import pointwise_matmul
+
 
 class DirectionalConvLayer(nn.Module):
     """Apply one learned three-tap kernel along each board direction."""
@@ -17,19 +19,20 @@ class DirectionalConvLayer(nn.Module):
         fix_direction_order=False,
     ):
         super().__init__()
-        weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
-        self.weight = nn.Parameter(torch.empty(weight_shape))
-        self.bias = nn.Parameter(torch.zeros((dim_out,)))
         self.use_nonzero_padding = use_nonzero_padding
         self.use_channel_last = use_channel_last
         self.fix_direction_order = fix_direction_order
+        weight_shape = (dim_out, dim_in, 3) if use_channel_last else (3, dim_out, dim_in)
+        self.weight = nn.Parameter(torch.empty(weight_shape))
+        self.bias = nn.Parameter(torch.empty((dim_out,)))
+        self.reset_parameters()
 
-    def initialize(self):
+    def reset_parameters(self):
         if self.use_channel_last:
-            nn.init.kaiming_normal_(self.weight.data)
+            nn.init.kaiming_normal_(self.weight)
         else:
-            nn.init.kaiming_normal_(self.weight.data.permute(1, 0, 2))
-        self.bias.data.zero_()
+            nn.init.kaiming_normal_(self.weight.permute(1, 0, 2))
+        nn.init.zeros_(self.bias)
 
     def _conv1d_direction(self, x, dir):
         if self.use_channel_last:
@@ -56,6 +59,10 @@ class DirectionalConvLayer(nn.Module):
         # other in the channel dimension so the actual computation is a 1x1
         # convolution.  Inductor fuses the padding/slicing/concatenation into a
         # single channels-last copy and the convolution uses a tensor-core GEMM.
+        # It is emitted as a matmul rather than a 1x1 conv2d for the reason given
+        # in `pointwise_matmul`; leaving it as a conv2d while the surrounding 1x1
+        # convolutions are matmuls also forces a layout conflict that cost 5% of
+        # the diagonal-direction kernel time when measured.
         if not self.use_nonzero_padding and dir >= 2:
             height, width = x.shape[-2:]
             padded = F.pad(x, (1, 1, 1, 1))
@@ -73,7 +80,7 @@ class DirectionalConvLayer(nn.Module):
                 )
             input_1x1 = torch.cat(shifted, dim=1)
             weight_1x1 = torch.cat(tuple(weight_1d.unbind(dim=2)), dim=1)
-            return F.conv2d(input_1x1, weight_1x1[:, :, None, None], self.bias)
+            return pointwise_matmul(input_1x1, weight_1x1, self.bias)
 
         zero = torch.zeros((dim_out, dim_in), dtype=self.weight.dtype, device=self.weight.device)
 

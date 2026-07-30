@@ -3,102 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .layers.activation import build_activation_layer
 from .layers.convolution import Conv2dBlock
-from .layers.linear import LinearBlock
-from .layers.star import StarBlock
-from .ops import dynamic_pointwise_conv2d, quantized_avg4, quantized_sum_3x3_regions
+from .mixnet_components import QuantizedHeadMixin
+from .ops import quantized_sum_3x3_regions
+from .validation import validate_batch_shared_value
+from dataset.pipeline.line_encoding import get_total_num_encoding
 from utils.quant_utils import fake_quant
 
 
-def get_total_num_line_encoding(length):
-    half = length // 2
-    code = 2 * 3**length
-    for i in range(0, half + 1):
-        code += 2 * 3**i
-    for i in range(half + 2, length):
-        code += 1 * 3**i
-    return code + 1
-
-
-class LineEncodingMapping(nn.Module):
-    def __init__(self, dim_middle, dim_out, line_length=11, activation="silu"):
-        super().__init__()
-        self.line_length = line_length
-        self.dim_middle = dim_middle
-        self.dim_out = dim_out
-        self.total_num = 4**line_length
-        assert line_length % 2 == 1, "Line length must be odd"
-        assert line_length >= 5, "Line length must be at least 5"
-
-        self.act = build_activation_layer(activation)
-        self.input_conv = nn.Conv1d(4, dim_middle, kernel_size=5, padding=2)
-        self.conv1x1_layers = nn.ModuleList()
-        self.conv_layers = nn.ModuleList()
-        for _ in range(line_length // 2 - 2):
-            conv1x1 = nn.Conv1d(dim_middle, dim_middle, kernel_size=1)
-            conv = nn.Conv1d(dim_middle, dim_middle, kernel_size=3, padding=1)
-            self.conv1x1_layers.append(conv1x1)
-            self.conv_layers.append(conv)
-        self.output_fc1 = nn.Linear(dim_middle, dim_middle)
-        self.output_fc2 = nn.Linear(dim_middle, dim_out)
-
-    def convert_index_to_feature(self, line_index):
-        fs_indices = []
-        for i in range(self.line_length):
-            f = torch.bitwise_right_shift(line_index, i * 2)
-            f = torch.bitwise_and(f, 0b11)
-            fs_indices.append(f)
-        fs_indices = torch.stack(fs_indices, dim=-1)  # [..., line_length]
-        fs_onehot = torch.stack(
-            [
-                fs_indices == 0,
-                fs_indices == 1,
-                fs_indices == 2,
-                fs_indices == 3,
-            ],
-            dim=-2,
-        )  # [..., 4, line_length]
-        return fs_onehot.float()
-
-    def forward_line_encoding(self, line_encoding):
-        fs = self.convert_index_to_feature(line_encoding)  # [N, 4, line_length]
-        fs = self.act(self.input_conv(fs))  # [N, dim_middle, line_length]
-        for conv1x1, conv in zip(self.conv1x1_layers, self.conv_layers):
-            fs_redisual = fs
-            fs = self.act(conv1x1(fs))
-            fs = self.act(conv(fs))
-            fs = fs + fs_redisual
-        fs = fs[..., self.line_length // 2 : self.line_length // 2 + 1]  # [N, dim_middle, 1]
-        fs = torch.squeeze(fs, dim=-1)  # [N, dim_middle]
-        fs = self.act(self.output_fc1(fs))  # [N, dim_middle]
-        fs = self.output_fc2(fs)  # [N, dim_out]
-        return fs
-
-    def forward(self, data):
-        # Must be raw code
-        assert torch.all(
-            data["line_encoding_total_num"] == self.total_num
-        ), "Incorrect total number of line encoding, must set raw_code=True"
-        # line_encoding: [B, 4, H, W]
-        # enc_unique: [N_unique, 4, line_length]
-        # inv_indices: [B, 4, H, W]
-        enc_unique, inv_indices = torch.unique(data["line_encoding"], return_inverse=True)
-        fs = self.forward_line_encoding(enc_unique)  # [N_unique, dim_out]
-        fs = F.embedding(inv_indices.flatten(), fs)  # [B*4*H*W, dim_out]
-        fs = fs.view(*inv_indices.shape, self.dim_out)  # [B, 4, H, W, dim_out]
-        fs = fs.permute(0, 1, 4, 2, 3)  # [B, 4, dim_out, H, W]
-        return fs
-
 
 @MODELS.register("linennuev1")
-class LineNNUEv1(nn.Module):
+class LineNNUEv1(QuantizedHeadMixin, nn.Module):
     LINE_LENGTH = 11
 
     def __init__(self, dim_feature=64, dim_policy=32, dim_value=64, dim_dwconv=32):
         super().__init__()
         self.model_size = (dim_feature, dim_policy, dim_value, dim_dwconv)
-        self.line_encoding_total_num = get_total_num_line_encoding(self.LINE_LENGTH)
+        self.line_encoding_total_num = get_total_num_encoding(self.LINE_LENGTH)
 
         self.mapping = nn.Embedding(self.line_encoding_total_num, dim_feature)
 
@@ -118,28 +39,11 @@ class LineNNUEv1(nn.Module):
             weight_quant_bits=16,
             bias_quant_scale=128,
             bias_quant_bits=16,
+            weight_scale=0.25,
         )
 
-        # policy head (point-wise conv)
-        dim_pm = self.policy_middle_dim = 16
-        self.policy_pwconv_weight_linear = nn.Sequential(
-            LinearBlock(dim_feature, dim_policy * 2, activation="relu", quant=True),
-            LinearBlock(dim_policy * 2, dim_pm * dim_policy + dim_pm, activation="none", quant=True),
-        )
-        self.policy_output = nn.Conv2d(dim_pm, 1, 1)
-
-        self.value_corner = StarBlock(dim_feature, dim_value)
-        self.value_edge = StarBlock(dim_feature, dim_value)
-        self.value_center = StarBlock(dim_feature, dim_value)
-        self.value_quad = StarBlock(dim_value, dim_value)
-        self.value_linear = nn.Sequential(
-            LinearBlock(dim_feature + 4 * dim_value, dim_value, activation="relu", quant=True),
-            LinearBlock(dim_value, dim_value, activation="relu", quant=True),
-            LinearBlock(dim_value, 3, activation="none", quant=True),
-        )
-
-    def initialize(self):
-        self.feature_dwconv.conv.weight.data.mul_(0.25)
+        self._init_quantized_policy_head(dim_feature, dim_policy)
+        self._init_quantized_grouped_value_head(dim_feature, dim_value)
 
     def get_feature(self, data):
         # get per-point 4-direction cell features
@@ -170,7 +74,11 @@ class LineNNUEv1(nn.Module):
         return feature
 
     def forward(self, data):
-        assert torch.all(data["line_encoding_total_num"] == self.line_encoding_total_num)
+        validate_batch_shared_value(
+            "line_encoding_total_num",
+            data["line_encoding_total_num"],
+            self.line_encoding_total_num,
+        )
         _, dim_policy, _, _ = self.model_size
 
         # get feature from single side
@@ -181,61 +89,13 @@ class LineNNUEv1(nn.Module):
         feature_sum = fake_quant(feature_sum / 256, scale=128, num_bits=32, floor=True)  # srai 8
 
         # value feature accumulator of nine groups
-        B = feature.shape[0]
-        (
-            feature_00,
-            feature_01,
-            feature_02,
-            feature_10,
-            feature_11,
-            feature_12,
-            feature_20,
-            feature_21,
-            feature_22,
-        ) = quantized_sum_3x3_regions(feature)
+        regions = quantized_sum_3x3_regions(feature)
 
         # policy head
-        dim_pm = self.policy_middle_dim
-        pwconv_output = self.policy_pwconv_weight_linear(feature_sum)
-        pwconv_weight = pwconv_output[:, : dim_pm * dim_policy].reshape(B, dim_pm * dim_policy, 1, 1)
-        pwconv_weight = fake_quant(pwconv_weight, scale=128 * 128, num_bits=16, floor=True)
-        policy = fake_quant(feature[:, :dim_policy], scale=128, num_bits=16)  # [B, dim_policy, H, W]
-        policy = dynamic_pointwise_conv2d(policy, pwconv_weight)
-        pwconv_bias = pwconv_output[:, dim_pm * dim_policy :].reshape(B, dim_pm, 1, 1)  # int32, scale=128*128*128
-        policy = torch.clamp(policy + pwconv_bias, min=0)  # [B, dim_pm, H, W] int32, scale=128*128*128, relu
-        policy = self.policy_output(policy)  # [B, 1, H, W]
+        policy = self._forward_quantized_policy(feature, feature_sum, dim_policy)
 
         # value head
-        value_00 = self.value_corner(feature_00)
-        value_01 = self.value_edge(feature_01)
-        value_02 = self.value_corner(feature_02)
-        value_10 = self.value_edge(feature_10)
-        value_11 = self.value_center(feature_11)
-        value_12 = self.value_edge(feature_12)
-        value_20 = self.value_corner(feature_20)
-        value_21 = self.value_edge(feature_21)
-        value_22 = self.value_corner(feature_22)
-
-        value_q00 = quantized_avg4(value_00, value_01, value_10, value_11)
-        value_q01 = quantized_avg4(value_01, value_02, value_11, value_12)
-        value_q10 = quantized_avg4(value_10, value_11, value_20, value_21)
-        value_q11 = quantized_avg4(value_11, value_12, value_21, value_22)
-        value_q00 = self.value_quad(value_q00)
-        value_q01 = self.value_quad(value_q01)
-        value_q10 = self.value_quad(value_q10)
-        value_q11 = self.value_quad(value_q11)
-
-        value = torch.cat(
-            [
-                feature_sum,
-                value_q00,
-                value_q01,
-                value_q10,
-                value_q11,
-            ],
-            1,
-        )  # [B, dim_feature + dim_value * 4]
-        value = self.value_linear(value)
+        value = self._forward_quantized_grouped_value(feature_sum, regions)
 
         return {"value": value, "policy": policy}
 
@@ -245,29 +105,7 @@ class LineNNUEv1(nn.Module):
         # In this range, prelu is the same as `max(x, ax)`.
         return [
             {"params": ["feature_dwconv.conv.weight"], "min_weight": -32768 / 65536, "max_weight": 32767 / 65536},
-            {
-                "params": [
-                    "value_corner.up1.fc.weight",
-                    "value_corner.up2.fc.weight",
-                    "value_corner.down.fc.weight",
-                    "value_edge.up1.fc.weight",
-                    "value_edge.up2.fc.weight",
-                    "value_edge.down.fc.weight",
-                    "value_center.up1.fc.weight",
-                    "value_center.up2.fc.weight",
-                    "value_center.down.fc.weight",
-                    "value_quad.up1.fc.weight",
-                    "value_quad.up2.fc.weight",
-                    "value_quad.down.fc.weight",
-                    "value_linear.0.fc.weight",
-                    "value_linear.1.fc.weight",
-                    "value_linear.2.fc.weight",
-                    "policy_pwconv_weight_linear.0.fc.weight",
-                    "policy_pwconv_weight_linear.1.fc.weight",
-                ],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
+            *self._quantized_head_weight_clipping(combine_policy_with_value=True),
         ]
 
     @property

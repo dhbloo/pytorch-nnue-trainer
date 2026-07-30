@@ -25,7 +25,6 @@ from utils.cuda_utils import configure_cuda_memory_limit
 from utils.training_utils import (
     build_lr_scheduler,
     build_optimizer,
-    weights_init,
     build_data_loader,
     resolve_weight_clipping,
     apply_weight_clipping,
@@ -104,7 +103,6 @@ class BaseTrainer:
         # Model
         model_type: Registered model class name (passed to ``build_model``).
         model_args: Extra keyword arguments forwarded to the model constructor.
-        init_cfg: Weight initialization config passed to ``weights_init``.
         load_from: Path to a pretrained checkpoint to load before training, or
             ``None`` to skip.
         # Optimizer
@@ -162,7 +160,6 @@ class BaseTrainer:
         # Model
         model_type: str,
         model_args: dict | None = None,
-        init_cfg: dict | None = None,
         load_from: str | None = None,
         # Optimizer
         optim_type: str = "adamw",
@@ -213,7 +210,6 @@ class BaseTrainer:
 
         self.model_type = model_type
         self.model_args = model_args or {}
-        self.init_cfg = init_cfg or {}
         self.load_from = load_from
 
         self.optim_type = optim_type
@@ -346,7 +342,7 @@ class BaseTrainer:
                 if not hasattr(self, name):
                     default = param.default
                     # Match __init__'s `x or {}` normalization for dict params
-                    if default is None and (name.endswith("_args") or name == "init_cfg"):
+                    if default is None and name.endswith("_args"):
                         default = {}
                     setattr(self, name, default)
 
@@ -586,7 +582,7 @@ class BaseTrainer:
 
     def _load_checkpoint(self):
         """Resume from the latest training state in *ckpt_dir*, falling back to
-        legacy merged checkpoints in the rundir root, then to weight init /
+        legacy merged checkpoints in the rundir root, then to optional
         pretrained weights."""
         state_filename = find_latest_ckpt(self.ckpt_dir, "state_")
 
@@ -607,7 +603,7 @@ class BaseTrainer:
             self._load_legacy_checkpoint(legacy_filename)
             return
 
-        self._init_weights()
+        self._load_pretrained_weights()
 
     def _load_state_checkpoint(self, state_filename):
         """Load models, optimizers, and scaler anchored on *state_filename*."""
@@ -654,10 +650,8 @@ class BaseTrainer:
         self.state.epoch = int(metadata.get("epoch", 0))
         self.state.rows = int(metadata.get("rows", 0))
 
-    def _init_weights(self):
-        """Apply weight init to all trained models, then optional pretrained weights."""
-        for m in self.models.values():
-            m.apply(weights_init(self.init_cfg))
+    def _load_pretrained_weights(self):
+        """Load optional pretrained weights into the locally initialized model."""
         if self.load_from is not None:
             model_state_dict, _, _ = load_torch_ckpt(self.load_from)
             model_state_dict = state_dict_drop_size_unmatched(self.model, model_state_dict)

@@ -1,5 +1,5 @@
-import types
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from accelerate.state import PartialState
@@ -7,6 +7,7 @@ from accelerate.utils import gather, gather_object, reduce
 from pykeops.torch import LazyTensor
 from torch import Tensor
 
+from .layers.linear import Linear
 from .ops import (
     accelerated_cosine_argmin,
     accelerated_l2_argmin,
@@ -17,6 +18,92 @@ from .ops.vector_quantization import _update_ema_codebook_
 
 _DEAD_CODE_BOUND_EPS = 1e-6
 _DEAD_CODE_SAFE_THRESHOLD_MULTIPLIER = 2
+_DDP_ZERO_LINK_ONLY_ATTR = "_vq_ddp_zero_link_only"
+_VQ_INIT_CONTINUATION_VERSION = 1
+_VQ_FINITE_CHECK_CHUNK_ELEMENTS = 1024 * 1024
+
+
+class _DDPPreinitIdentity(torch.autograd.Function):
+    """Preserve a tensor exactly while making selected parameters graph-visible."""
+
+    @staticmethod
+    def forward(ctx, x, *parameters):
+        ctx.save_for_backward(*parameters)
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output, *(torch.zeros_like(parameter) for parameter in ctx.saved_tensors)
+
+
+class _DDPRealUseIdentity(torch.autograd.Function):
+    """Mark real use from a graph-local codebook identity."""
+
+    @staticmethod
+    def forward(ctx, tensor, parameters):
+        ctx.parameters = parameters
+        return tensor
+
+    @staticmethod
+    def backward(ctx, gradient):
+        mark_ddp_parameter_use(ctx.parameters)
+        return gradient, None
+
+
+def _ddp_zero_link_enabled():
+    return (
+        torch.is_grad_enabled()
+        and dist.is_available()
+        and dist.is_initialized()
+        and dist.get_world_size() > 1
+    )
+
+
+def ddp_preinit_identity(x, parameters):
+    """Attach a DDP-only zero-gradient link without changing ``x``."""
+    if not _ddp_zero_link_enabled():
+        return x
+    parameters = tuple(parameter for parameter in parameters if parameter.requires_grad)
+    if not parameters:
+        return x
+    for parameter in parameters:
+        if getattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR, True):
+            setattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR, True)
+    return _DDPPreinitIdentity.apply(x, *parameters)
+
+
+def mark_ddp_parameter_use(parameters):
+    """Record real use after an earlier zero-link in this accumulation window."""
+    for parameter in parameters:
+        if hasattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR):
+            setattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR, False)
+
+
+def mark_ddp_parameter_use_on_backward(tensor, parameters):
+    """Record real parameter use only if backward reaches ``tensor``."""
+    if not _ddp_zero_link_enabled() or not tensor.requires_grad:
+        return tensor
+    return _DDPRealUseIdentity.apply(tensor, tuple(parameters))
+
+
+def clear_ddp_preinit_gradients(parameters):
+    """Remove zero-link-only gradients before clipping or optimizer mutation."""
+    for parameter in parameters:
+        zero_link_only = getattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR, None)
+        if zero_link_only:
+            parameter.grad = None
+        if zero_link_only is not None:
+            delattr(parameter, _DDP_ZERO_LINK_ONLY_ATTR)
+
+
+def _vq_all_finite_chunked(tensor):
+    flat = tensor.reshape(-1)
+    for offset in range(0, flat.numel(), _VQ_FINITE_CHECK_CHUNK_ELEMENTS):
+        if not torch.isfinite(
+            flat[offset : offset + _VQ_FINITE_CHECK_CHUNK_ELEMENTS]
+        ).all():
+            return False
+    return True
 
 
 def l2_norm(x: Tensor) -> Tensor:
@@ -112,16 +199,29 @@ def compute_perplexity(cluster_size: Tensor) -> Tensor:
     return perplexity
 
 
-def entropy_regularization(logits: LazyTensor, temperature=1.0) -> Tensor:
+def entropy_probability_sum(logits: LazyTensor, temperature=1.0) -> Tensor:
     logits = logits * (1.0 / temperature)  # (N, codebook_size)
     logits_max_and_exp = logits.reduction("Max_SumShiftExp", dim=1)  # (N, 2)
     logits_max = logits_max_and_exp[:, 0].contiguous()
     logits_sumexp = logits_max_and_exp[:, 1].contiguous()
     logits_exp = (logits - LazyTensor(logits_max[:, None], axis=0)).exp()  # (N, codebook_size)
     softprobs = logits_exp / LazyTensor(logits_sumexp[:, None], axis=0)  # (N, codebook_size)
-    avg_probs = (softprobs.sum(0) / softprobs.shape[0]).squeeze(1)  # (codebook_size,)
+    return softprobs.sum(0).squeeze(1)
+
+
+def entropy_regularization_from_probability_sum(
+    probability_sum: Tensor, count: int
+) -> Tensor:
+    avg_probs = probability_sum / count
     entropy = (-avg_probs * torch.log(avg_probs.clamp_min(1e-7))).sum(dim=-1)
     return -entropy
+
+
+def entropy_regularization(logits: LazyTensor, temperature=1.0) -> Tensor:
+    probability_sum = entropy_probability_sum(logits, temperature)
+    return entropy_regularization_from_probability_sum(
+        probability_sum, logits.shape[0]
+    )
 
 
 def sample_vectors(inputs: Tensor, num_samples: int) -> Tensor:
@@ -305,6 +405,7 @@ class VectorQuantize(nn.Module):
         self.use_simvq = use_simvq
         self.convert_to_fp32 = convert_to_fp32
         self.accelerated_search = accelerated_search
+        self.accelerated_search_fallback_count = 0
         # Conservative single-rank host bounds let the normal FP32 EMA path
         # (0 <= decay <= 1) prove that no code can expire without synchronizing
         # a CUDA boolean every step.
@@ -315,11 +416,19 @@ class VectorQuantize(nn.Module):
 
         self.register_buffer("inited", torch.zeros([], dtype=torch.bool))
         self._inited_python = None
+        self._init_consensus_checked = False
         self.register_buffer("cluster_size", torch.ones(codebook_size))
+        self._eval_cluster_size = None
+        self._collect_eval_stats = True
+        self._eval_entry_mask = None
         if kmeans_init:
             embed = torch.zeros(codebook_size, dim_feature)
+            num_processes = PartialState().num_processes
+            self._init_input_samples_target_per_process = (
+                codebook_size * kmeans_sample_multiplier + num_processes - 1
+            ) // num_processes
             self._init_input_samples_per_process = (
-                codebook_size * kmeans_sample_multiplier // PartialState().num_processes
+                self._init_input_samples_target_per_process
             )
             self._init_input_batches_this_process = []
             self._init_input_count_this_process = 0
@@ -334,15 +443,9 @@ class VectorQuantize(nn.Module):
 
         if use_simvq:
             if codebook_transform is None:
-                codebook_transform = nn.Linear(dim_feature, dim_feature, bias=False)
+                codebook_transform = Linear(dim_feature, dim_feature, bias=False)
                 if kmeans_init:
-
-                    def initialize(self):
-                        nn.init.eye_(self.weight.data)
-
-                    setattr(
-                        codebook_transform, "initialize", types.MethodType(initialize, codebook_transform)
-                    )
+                    nn.init.eye_(codebook_transform.weight)
             self.code_transform = codebook_transform
 
         self.learnable_codebook = learnable_codebook and not self.ema_update
@@ -371,11 +474,194 @@ class VectorQuantize(nn.Module):
         # Persistent buffers may have changed during a parent model load.
         # Refresh their host-side hot-path caches on the next forward.
         self._inited_python = None
+        self._init_consensus_checked = False
         self._invalidate_dead_code_cache()
 
     def _invalidate_dead_code_cache(self):
         self._dead_code_min_cluster_lower_python = None
         self._dead_code_total_upper_python = None
+
+    def is_initialized(self) -> bool:
+        """Return the initialization state through its lazy host-side cache."""
+        if self._inited_python is None:
+            self._inited_python = bool(self.inited.item())
+        return self._inited_python
+
+    def _vq_init_continuation_descriptor(self):
+        return {
+            "codebook_size": self.codebook_size,
+            "dim_feature": self.dim_feature,
+            "kmeans_sample_multiplier": self.kmeans_sample_multiplier,
+            "kmeans_iter": self.kmeans_iter,
+            "use_cosine_sim": self.use_cosine_sim,
+            "use_simvq": self.use_simvq,
+            "convert_to_fp32": self.convert_to_fp32,
+            "parameter_dtype": str(self.embed.dtype),
+            "target_samples": getattr(
+                self,
+                "_init_input_samples_target_per_process",
+                0,
+            ),
+        }
+
+    def _vq_init_continuation_state(self):
+        """Export rank-local pending k-means inputs outside ``state_dict``."""
+        initialized = torch.equal(
+            self.inited.detach(),
+            self.inited.new_ones(()),
+        )
+        batches = (
+            []
+            if initialized
+            else self._init_input_batches_this_process
+        )
+        count = (
+            0
+            if initialized
+            else self._init_input_count_this_process
+        )
+        target = self._vq_init_continuation_descriptor()["target_samples"]
+        if not 0 <= count <= target:
+            raise ValueError(
+                f"pending VQ sample count {count} is outside [0, {target}]"
+            )
+        if sum(len(batch) for batch in batches) != count:
+            raise ValueError("pending VQ sample batches do not match their count")
+        dtype = (
+            batches[0].dtype
+            if batches
+            else (
+                torch.float32
+                if self.convert_to_fp32
+                else self.embed.dtype
+            )
+        )
+        samples = torch.empty(
+            (count, self.dim_feature),
+            dtype=dtype,
+            device="cpu",
+        )
+        offset = 0
+        for batch in batches:
+            if (
+                batch.ndim != 2
+                or batch.shape[1] != self.dim_feature
+                or batch.dtype != dtype
+            ):
+                raise ValueError(
+                    "pending VQ sample batch shape or dtype is inconsistent"
+                )
+            samples[offset : offset + len(batch)].copy_(
+                batch.detach(),
+                non_blocking=False,
+            )
+            offset += len(batch)
+        if not _vq_all_finite_chunked(samples):
+            raise ValueError("pending VQ samples contain non-finite values")
+        return {
+            "version": _VQ_INIT_CONTINUATION_VERSION,
+            "descriptor": self._vq_init_continuation_descriptor(),
+            "dtype": str(dtype),
+            "inited": initialized,
+            "count": count,
+            "samples": samples,
+        }
+
+    def _load_vq_init_continuation_state(self, state):
+        """Restore rank-local pending k-means inputs after device placement."""
+        if not isinstance(state, dict):
+            raise ValueError("VQ continuation payload must be a dictionary")
+        if set(state) != {
+            "version",
+            "descriptor",
+            "dtype",
+            "inited",
+            "count",
+            "samples",
+        }:
+            raise ValueError(
+                "VQ continuation payload has missing or unexpected fields"
+            )
+        if state.get("version") != _VQ_INIT_CONTINUATION_VERSION:
+            raise ValueError(
+                f"unsupported VQ continuation version {state.get('version')!r}"
+            )
+        descriptor = state.get("descriptor")
+        expected_descriptor = self._vq_init_continuation_descriptor()
+        if descriptor != expected_descriptor:
+            raise ValueError(
+                "VQ continuation descriptor differs: "
+                f"saved={descriptor!r}, current={expected_descriptor!r}"
+            )
+        initialized = state.get("inited")
+        if type(initialized) is not bool:
+            raise ValueError("VQ continuation inited flag must be a bool")
+        loaded_initialized = torch.equal(
+            self.inited.detach(),
+            self.inited.new_full((), initialized),
+        )
+        if not loaded_initialized:
+            raise ValueError(
+                "VQ continuation inited flag differs from loaded model state"
+            )
+        count = state.get("count")
+        target = expected_descriptor["target_samples"]
+        if type(count) is not int or not 0 <= count <= target:
+            raise ValueError(
+                f"VQ continuation count {count!r} is outside [0, {target}]"
+            )
+        samples = state.get("samples")
+        if not isinstance(samples, Tensor):
+            raise ValueError("VQ continuation samples must be a tensor")
+        if samples.device.type != "cpu" or not samples.is_contiguous():
+            raise ValueError(
+                "VQ continuation samples must be contiguous on CPU"
+            )
+        if tuple(samples.shape) != (count, self.dim_feature):
+            raise ValueError(
+                "VQ continuation sample shape differs from count/feature dimension"
+            )
+        if str(samples.dtype) != state.get("dtype"):
+            raise ValueError("VQ continuation sample dtype metadata differs")
+        if self.convert_to_fp32 and samples.dtype != torch.float32:
+            raise ValueError("FP32-converting VQ requires FP32 pending samples")
+        if not samples.is_floating_point():
+            raise ValueError("VQ continuation samples must be floating point")
+        if not _vq_all_finite_chunked(samples):
+            raise ValueError("VQ continuation samples contain non-finite values")
+        if initialized and count:
+            raise ValueError("initialized VQ cannot restore pending samples")
+
+        self._inited_python = None
+        if initialized:
+            return
+        restored = samples.to(device=self.embed.device)
+        self._init_input_batches_this_process = [restored] if count else []
+        self._init_input_count_this_process = count
+        self._init_consensus_checked = False
+
+    def reset_eval_perplexity_stats(self):
+        """Reset code-usage counts accumulated by subsequent evaluation forwards."""
+        self._eval_cluster_size = self.cluster_size.new_zeros(
+            self.cluster_size.shape,
+            dtype=torch.long,
+        )
+        self._collect_eval_stats = True
+
+    def set_eval_perplexity_stats_enabled(self, enabled: bool):
+        """Include or exclude subsequent evaluation forwards from code-usage counts."""
+        self._collect_eval_stats = enabled
+
+    def set_eval_entry_mask(self, mask):
+        """Select quantizer input entries that represent real evaluation rows."""
+        self._eval_entry_mask = (
+            None if mask is None else mask.to(device=self.embed.device, dtype=torch.bool)
+        )
+
+    def eval_perplexity_from_cluster_size(self, cluster_size: Tensor):
+        """Compute this codebook's perplexity metrics from global usage counts."""
+        perplexity = compute_perplexity(cluster_size)
+        return perplexity, perplexity / self.codebook_size
 
     def _accumulate_input_batch(self, x):
         num_samples_remain = self._init_input_samples_per_process - self._init_input_count_this_process
@@ -398,6 +684,45 @@ class VectorQuantize(nn.Module):
         del self._init_input_batches_this_process
         del self._init_input_count_this_process
         self._init_embed(inputs)
+
+    def _check_first_forward_consensus(self, x):
+        if (
+            self._init_consensus_checked
+            or PartialState().num_processes <= 1
+        ):
+            return
+        descriptor = {
+            "kmeans_init": self.kmeans_init,
+            "initialized": self._inited_python,
+            "codebook_size": self.codebook_size,
+            "dim_feature": self.dim_feature,
+            "kmeans_sample_multiplier": self.kmeans_sample_multiplier,
+            "kmeans_iter": self.kmeans_iter,
+            "target_samples": getattr(
+                self,
+                "_init_input_samples_target_per_process",
+                0,
+            ),
+            "use_cosine_sim": self.use_cosine_sim,
+            "use_simvq": self.use_simvq,
+            "ema_update": self.ema_update,
+            "threshold_ema_dead_code": self.threshold_ema_dead_code,
+            "reset_cluster_size": self.reset_cluster_size,
+            "training": self.training,
+            "input_dtype": str(x.dtype),
+            "input_device": x.device.type,
+        }
+        descriptors = gather_object([descriptor])
+        if any(value != descriptors[0] for value in descriptors[1:]):
+            raise RuntimeError(
+                "VQ first-forward configuration or initialization status "
+                "differs across ranks: "
+                + "; ".join(
+                    f"rank {rank}={value!r}"
+                    for rank, value in enumerate(descriptors)
+                )
+            )
+        self._init_consensus_checked = True
 
     @torch.no_grad()
     def _init_embed(self, inputs):
@@ -534,7 +859,9 @@ class VectorQuantize(nn.Module):
                     embed_normalized = l2_norm(embed_normalized)
                 self.embed.data.copy_(embed_normalized)
 
-    def _loss(self, x, quantized, dists):
+    def _loss(
+        self, x, quantized, dists, entropy_probability_sum_value=None
+    ):
         # compute VQ-VAE loss
         loss_embed = (quantized - x.detach()).square().mean()
         loss_commitment = (quantized.detach() - x).square().mean()
@@ -546,7 +873,15 @@ class VectorQuantize(nn.Module):
 
         # add entropy regularization loss
         if self.entropy_reg_weight > 0:
-            entropy_reg_loss = entropy_regularization(-dists, self.entropy_reg_temp)
+            entropy_reg_loss = (
+                entropy_regularization(
+                    -dists, self.entropy_reg_temp
+                )
+                if entropy_probability_sum_value is None
+                else entropy_regularization_from_probability_sum(
+                    entropy_probability_sum_value, len(x)
+                )
+            )
             loss = loss + self.entropy_reg_weight * entropy_reg_loss
             loss_terms["loss_entropy"] = entropy_reg_loss
 
@@ -611,11 +946,12 @@ class VectorQuantize(nn.Module):
         if self.use_cosine_sim and not input_normalized:
             x = l2_norm(x)
 
-        if self._inited_python is None:
-            self._inited_python = bool(self.inited.item())
-        if not self._inited_python:
-            self._accumulate_input_batch(x)
-            return x, None
+        initialized = self.is_initialized()
+        self._check_first_forward_consensus(x)
+        if not initialized:
+            if self.training:
+                self._accumulate_input_batch(x)
+            return ddp_preinit_identity(x, self.parameters()), None
 
         # expire codes if we are in training mode
         num_expired_codes = None
@@ -625,7 +961,10 @@ class VectorQuantize(nn.Module):
             num_expired_codes = torch.zeros((), device=x.device)
 
         # get codebook embeddings
-        codebook = self.codebook  # (codebook_size, dim_feature)
+        codebook = mark_ddp_parameter_use_on_backward(
+            self.codebook,
+            self.parameters(),
+        )  # (codebook_size, dim_feature)
 
         # compute distances to codebook embeddings
         stochastic_search = self.training and self.stochastic_sampling and self.sampling_temp > 0
@@ -639,12 +978,17 @@ class VectorQuantize(nn.Module):
 
         # find closest codebook embeddings
         embed_indices = None
-        if not stochastic_search and self.accelerated_search:
+        accelerated_search_requested = (
+            not stochastic_search and self.accelerated_search
+        )
+        if accelerated_search_requested:
             if self.use_cosine_sim:
                 embed_indices = accelerated_cosine_argmin(x, codebook)
             else:
                 embed_indices = accelerated_l2_argmin(x, codebook)
         if embed_indices is None:
+            if accelerated_search_requested:
+                self.accelerated_search_fallback_count += 1
             embed_indices = gumbel_sample(
                 logits=-search_dists,
                 stochastic=self.stochastic_sampling,
@@ -661,22 +1005,102 @@ class VectorQuantize(nn.Module):
         else:  # standard STE to get gradients through VQ layer.
             x_q = x + (quantized - x).detach()
 
-        # compute perplexity
-        cluster_size = torch.bincount(embed_indices.view(-1), minlength=self.codebook_size)
-        cluster_size = reduce(cluster_size, reduction="sum")
+        eval_mask = None
+        if not self.training and self._eval_entry_mask is not None:
+            eval_mask = self._eval_entry_mask
+            if eval_mask.ndim != 1 or len(eval_mask) != len(embed_indices):
+                raise ValueError(
+                    "evaluation VQ mask must contain one flag per quantizer entry"
+                )
+
+        # Compute evaluation statistics and losses from real entries only.
+        stats_indices = (
+            embed_indices[eval_mask] if eval_mask is not None else embed_indices
+        )
+        cluster_size = torch.bincount(
+            stats_indices.view(-1), minlength=self.codebook_size
+        )
+        if self.training:
+            cluster_size = reduce(cluster_size, reduction="sum")
+        elif self._collect_eval_stats:
+            if self._eval_cluster_size is None:
+                self.reset_eval_perplexity_stats()
+            self._eval_cluster_size.add_(cluster_size)
+        stats_count = len(stats_indices)
         perplexity_stats = (
-            accelerated_perplexity_stats(cluster_size, x.shape[0])
-            if PartialState().num_processes == 1
+            accelerated_perplexity_stats(cluster_size, stats_count)
+            if stats_count > 0 and PartialState().num_processes == 1
             else None
         )
-        if perplexity_stats is None:
+        if stats_count == 0:
+            perplexity = cluster_size.new_zeros((), dtype=x.dtype)
+            normalized_perplexity = perplexity
+        elif perplexity_stats is None:
             perplexity = compute_perplexity(cluster_size)
             normalized_perplexity = perplexity / self.codebook_size
         else:
             perplexity, normalized_perplexity = perplexity_stats
 
         # compute VQ losses
-        total_loss, loss_terms = self._loss(x, quantized, dists)
+        selected_loss_dists = None
+        selected_probability_sum = None
+        if eval_mask is not None:
+            if stats_count:
+                loss_x = x[eval_mask]
+                loss_quantized = quantized[eval_mask]
+                if self.entropy_reg_weight > 0:
+                    selected_loss_dists = (
+                        cosine_dist(loss_x, codebook)
+                        if self.use_cosine_sim
+                        else squared_l2_dist(loss_x, codebook).sqrt()
+                    )
+                    selected_probability_sum = entropy_probability_sum(
+                        -selected_loss_dists, self.entropy_reg_temp
+                    )
+                total_loss, loss_terms = self._loss(
+                    loss_x,
+                    loss_quantized,
+                    selected_loss_dists,
+                    selected_probability_sum,
+                )
+            else:
+                total_loss = x.sum() * 0
+                loss_terms = {
+                    "loss_embed": total_loss,
+                    "loss_commitment": total_loss,
+                }
+                if self.entropy_reg_weight > 0:
+                    loss_terms["loss_entropy"] = total_loss
+        else:
+            if not self.training and self.entropy_reg_weight > 0:
+                selected_loss_dists = dists
+                selected_probability_sum = entropy_probability_sum(
+                    -selected_loss_dists, self.entropy_reg_temp
+                )
+            total_loss, loss_terms = self._loss(
+                x, quantized, dists, selected_probability_sum
+            )
+
+        loss_stats = None
+        if not self.training:
+            stats_x = x if eval_mask is None else x[eval_mask]
+            stats_quantized = quantized if eval_mask is None else quantized[eval_mask]
+            embed_sum = (stats_quantized - stats_x.detach()).square().sum()
+            commit_sum = (stats_quantized.detach() - stats_x).square().sum()
+            loss_stats = {
+                "embed_sum": embed_sum,
+                "commit_sum": commit_sum,
+                "elements": int(stats_x.numel()),
+                "vectors": int(len(stats_x)),
+                "commitment_weight": float(self.commitment_weight),
+                "entropy_weight": float(self.entropy_reg_weight),
+            }
+            if self.entropy_reg_weight > 0:
+                if len(stats_x):
+                    probability_sum = selected_probability_sum
+                else:
+                    probability_sum = x.new_zeros(self.codebook_size)
+                loss_stats["probability_sum"] = probability_sum
 
         # gather inference and loss statistics
         info = {
@@ -686,6 +1110,7 @@ class VectorQuantize(nn.Module):
             "normalized_perplexity": normalized_perplexity,
             "num_expired_codes": num_expired_codes,
             "loss": total_loss,
+            "loss_stats": loss_stats,
             **loss_terms,
         }
 
@@ -778,7 +1203,11 @@ class ProductVectorQuantize(nn.Module):
             raw_info = {k: [info_groups[i][k] for i in range(self.num_codebooks)] for k in info_groups[0]}
 
             mean_attributes = ["perplexity", "normalized_perplexity"]
-            mean_attributes += [key for key in raw_info.keys() if key.startswith("loss")]
+            mean_attributes += [
+                key
+                for key in raw_info.keys()
+                if key.startswith("loss") and key != "loss_stats"
+            ]
 
             aggregated_info = {key: list_mean(raw_info[key]) for key in mean_attributes}
             aggregated_info["embed_indices"] = torch.stack(
@@ -787,5 +1216,6 @@ class ProductVectorQuantize(nn.Module):
             aggregated_info["num_expired_codes"] = torch.sum(
                 torch.stack([info["num_expired_codes"] for info in info_groups])
             )
+            aggregated_info["loss_stats"] = raw_info["loss_stats"]
 
         return x_q, aggregated_info, raw_info

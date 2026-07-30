@@ -137,18 +137,18 @@ if triton is not None:
                 x_ptr + query_offsets[:, None] * DIM + dim0[None, :],
                 mask=query_mask[:, None],
                 other=0.0,
-            ).to(tl.float16)
+            )
             x1 = tl.load(
                 x_ptr + query_offsets[:, None] * DIM + dim1[None, :],
                 mask=query_mask[:, None],
                 other=0.0,
-            ).to(tl.float16)
+            )
             codebook0 = tl.load(
                 codebook_ptr + code_offsets[:, None] * DIM + dim0[None, :]
-            ).to(tl.float16)
+            )
             codebook1 = tl.load(
                 codebook_ptr + code_offsets[:, None] * DIM + dim1[None, :]
-            ).to(tl.float16)
+            )
             dots = tl.dot(x0, tl.trans(codebook0), out_dtype=tl.float32)
             dots += tl.dot(x1, tl.trans(codebook1), out_dtype=tl.float32)
         else:
@@ -158,12 +158,12 @@ if triton is not None:
                 x_ptr + query_offsets[:, None] * DIM + dim_offsets[None, :],
                 mask=query_mask[:, None] & dim_mask[None, :],
                 other=0.0,
-            ).to(tl.float16)
+            )
             codebook = tl.load(
                 codebook_ptr + code_offsets[:, None] * DIM + dim_offsets[None, :],
                 mask=dim_mask[None, :],
                 other=0.0,
-            ).to(tl.float16)
+            )
             dots = tl.dot(x, tl.trans(codebook), out_dtype=tl.float32)
         x_norm = tl.load(x_norm_ptr + query_offsets, mask=query_mask, other=0.0)
         codebook_norm = tl.load(codebook_norm_ptr + code_offsets)
@@ -291,6 +291,7 @@ if triton is not None:
         offsets = query * NUM_TILES + tile_offsets
         codes = tl.load(tile_code_ptr + offsets)
         dists = tl.load(tile_dist_ptr + offsets)
+        dists = tl.where(dists == dists, dists, float("inf"))
         best_dist = tl.min(dists, axis=0)
         best_code = tl.min(
             tl.where(dists == best_dist, codes, 2147483647),
@@ -500,6 +501,7 @@ if triton is not None:
                 )
                 difference = candidate - x[None, :]
                 dists = tl.sum(difference * difference, axis=1)
+            dists = tl.where(dists == dists, dists, float("inf"))
             local_dist = tl.min(dists, axis=0)
             local_code = tl.min(
                 tl.where(dists == local_dist, candidate_idx, 2147483647),
@@ -727,7 +729,7 @@ def supports_accelerated_cosine_argmin(x: torch.Tensor, codebook: torch.Tensor) 
 
 @torch.no_grad()
 def accelerated_l2_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor | None:
-    """Find L2-nearest codes with an FP16 coarse shortlist and exact FP32 refinement.
+    """Find L2-nearest codes with a BF16 coarse shortlist and exact FP32 refinement.
 
     Returns ``None`` outside the measured CUDA specialization so callers can
     retain an exact portable fallback.
@@ -743,7 +745,7 @@ def accelerated_l2_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tens
     # tile on the production codebooks and the randomized validation corpus.
     # The 32d Product-VQ path keeps four candidates because its independent
     # sub-codebooks create more global near-ties. Wider embeddings keep the
-    # third candidate: 128d near-code stress can need it after FP16 projection.
+    # third candidate: 128d near-code stress can need it after BF16 projection.
     if x.shape[1] == 32:
         top_k = 4
     elif x.shape[1] == 64:
@@ -753,12 +755,12 @@ def accelerated_l2_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tens
     num_candidates = num_tiles * top_k
     x_norm = x.square().sum(dim=1)
     codebook_norm = codebook.square().sum(dim=1)
-    # Coarse Tensor-Core products already round both operands to FP16 inside
+    # Coarse Tensor-Core products already round both operands to BF16 inside
     # the kernel. Materialize that representation once instead of reloading
     # and converting FP32 values for every query/codebook tile. Exact
     # refinement below deliberately retains the original FP32 tensors.
-    coarse_x = x.to(torch.float16)
-    coarse_codebook = codebook.to(torch.float16)
+    coarse_x = x.to(torch.bfloat16)
+    coarse_codebook = codebook.to(torch.bfloat16)
     if x.shape[1] == 64:
         tile_codes = torch.empty(
             (x.shape[0], num_tiles),
@@ -830,7 +832,7 @@ def accelerated_l2_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tens
 
 @torch.no_grad()
 def accelerated_cosine_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor | None:
-    """Find cosine-nearest codes with FP16 coarse top-3 and exact FP32 refinement.
+    """Find cosine-nearest codes with BF16 coarse top-3 and exact FP32 refinement.
 
     Returns ``None`` outside the measured CUDA specialization so callers can
     retain an exact portable fallback.
@@ -848,10 +850,10 @@ def accelerated_cosine_argmin(x: torch.Tensor, codebook: torch.Tensor) -> torch.
         device=x.device,
     )
     tile_distances = torch.empty_like(tile_candidates, dtype=torch.float32)
-    # Match the FP16 coarse arithmetic performed by the kernel while avoiding
+    # Match the BF16 coarse arithmetic performed by the kernel while avoiding
     # a redundant FP32 load/conversion for every query/codebook tile.
-    coarse_x = x.to(torch.float16)
-    coarse_codebook = codebook.to(torch.float16)
+    coarse_x = x.to(torch.bfloat16)
+    coarse_codebook = codebook.to(torch.bfloat16)
     _coarse_cosine_top3_refined_kernel[(triton.cdiv(x.shape[0], block_m), num_tiles)](
         x,
         codebook,

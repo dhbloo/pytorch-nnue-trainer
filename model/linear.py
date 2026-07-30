@@ -3,6 +3,7 @@ import torch.nn as nn
 
 from . import MODELS
 from .layers.linear import LinearBlock
+from .validation import validate_batch_shared_value
 
 
 @MODELS.register("linear")
@@ -19,7 +20,11 @@ class LinearModel(nn.Module):
         self.policy_stm_coef = nn.parameter.Parameter(torch.ones(2), True)
 
     def forward(self, data):
-        assert torch.all(self.pcode_dim == data["sparse_feature_dim"][:, 10:12])
+        validate_batch_shared_value(
+            "pcode_dim",
+            data["sparse_feature_dim"][:, 10:12],
+            self.pcode_dim,
+        )
         pcode_sparse_input = data["sparse_feature_input"][:, [10, 11]].int()  # [B, 2, H, W]
         if self.two_side:
             # add index offset for opponent side
@@ -91,7 +96,11 @@ class LinearThreatModel(LinearModel):
         out = super().forward(data)
         value, policy = out["value"], out["policy"]
 
-        assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
+        validate_batch_shared_value(
+            "p4_dim",
+            data["sparse_feature_dim"][:, 8:10],
+            self.p4_dim,
+        )
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
 
         p4count = torch.zeros(
@@ -159,7 +168,11 @@ class LinearP4CountMLPModel(LinearModel):
         out = super().forward(data)
         value, policy = out["value"], out["policy"]
 
-        assert torch.all(self.p4_dim == data["sparse_feature_dim"][:, 8:10])
+        validate_batch_shared_value(
+            "p4_dim",
+            data["sparse_feature_dim"][:, 8:10],
+            self.p4_dim,
+        )
         p4_sparse_input = data["sparse_feature_input"][:, [8, 9]].int()  # [B, 2, H, W]
 
         p4count = torch.zeros(

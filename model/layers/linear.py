@@ -7,6 +7,15 @@ from .activation import build_activation_layer
 from utils.quant_utils import fake_quant
 
 
+class Linear(nn.Linear):
+    """Project-default linear layer with complete local initialization."""
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_normal_(self.weight, a=0, mode="fan_in")
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
 class LinearBlock(nn.Module):
     """
     Linear layer followed by an activation function, with optional fake quantization.
@@ -39,7 +48,7 @@ class LinearBlock(nn.Module):
         bias_quant_bits=32,
     ):
         super(LinearBlock, self).__init__()
-        self.fc = nn.Linear(in_dim, out_dim, bias)
+        self.fc = Linear(in_dim, out_dim, bias)
         if norm == "bn":
             self.norm = nn.BatchNorm1d(out_dim)
         elif norm == "in":

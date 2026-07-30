@@ -2,18 +2,44 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from collections.abc import Iterable
-except ImportError:
-    from collections import Iterable
+from collections.abc import Iterable
 
 from . import MODELS
 from .input import build_input_plane
 from .layers.convolution import Conv2dBlock
 from .layers.hashing import HashLayer
 from .layers.linear import LinearBlock
-from .vq import VectorQuantize
+from .trace import TraceableModel
+from .vq import VectorQuantize, ddp_preinit_identity, mark_ddp_parameter_use
 from utils.quant_utils import fake_quant
+
+
+class FlatValueModel(TraceableModel):
+    def _forward_value_linears(self, feature, first_min):
+        value = feature
+        for i, layer in enumerate(self.value_linears):
+            value = torch.clamp(value, min=(first_min if i == 0 else 0), max=127 / 128)
+            self._trace(f"value.linear.{i}.input", value)
+            value = layer(value)
+            self._trace(f"value.linear.{i}.output", value)
+        return value
+
+    def _zero_policy(self, feature, height, width):
+        return torch.zeros(
+            (feature.shape[0], height, width),
+            dtype=feature.dtype,
+            device=feature.device,
+        )
+
+    @property
+    def weight_clipping(self):
+        return [
+            {
+                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
+                "min_weight": -128 / 128,
+                "max_weight": 127 / 128,
+            },
+        ]
 
 
 @MODELS.register("flat_nnue_v1")
@@ -78,8 +104,12 @@ class LadderConvLayer(nn.Module):
     def __init__(self, dim_in, dim_out):
         super().__init__()
         self.weight = nn.Parameter(torch.empty((3, dim_out, dim_in)))
-        self.bias = nn.Parameter(torch.zeros((dim_out,)))
+        self.bias = nn.Parameter(torch.empty((dim_out,)))
+        self.reset_parameters()
+
+    def reset_parameters(self):
         nn.init.kaiming_normal_(self.weight)
+        nn.init.zeros_(self.bias)
 
     def forward(self, x):
         w = self.weight
@@ -92,7 +122,7 @@ class LadderConvLayer(nn.Module):
 
 
 @MODELS.register("flat_ladder7x7_nnue_v1")
-class FlatLadder7x7NNUEv1(nn.Module):
+class FlatLadder7x7NNUEv1(FlatValueModel):
     def __init__(
         self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False
     ):
@@ -164,6 +194,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
 
         # get feature sum from chunks
         feature = self.get_feature_sum(data)  # [B, dim_mapping]
+        self._trace("feature.sum", feature)
 
         # policy head
         if dim_policy > 0:
@@ -171,50 +202,13 @@ class FlatLadder7x7NNUEv1(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
+            policy = self._zero_policy(feature, 7, 7)
+        self._trace("policy.output", policy)
 
         # value head
-        value = feature[:, dim_policy:]  # [B, dim_value]
-        for layer in self.value_linears:
-            value = torch.clamp(value, min=0, max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature[:, dim_policy:], first_min=0)
 
         return {"value": value, "policy": policy}
-
-    def forward_debug_print(self, data):
-        _, dim_policy, _ = self.model_size
-
-        # get feature sum from chunks
-        feature = self.get_feature_sum(data)  # [B, dim_mapping]
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # policy head
-        if dim_policy > 0:
-            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
-            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
-            policy = policy.view(-1, 7, 7)  # [B, 7, 7]
-        else:
-            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
-
-        # value head
-        value = feature[:, dim_policy:]  # [B, dim_value]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=0, max=127 / 128)
-            print(f"value input{i+1}: \n{(value * 128).int()}")
-            value = layer(value)
-            print(f"value output{i+1}: \n{(value * 128).int()}")
-
-        return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
-        ]
 
     @property
     def name(self):
@@ -223,7 +217,7 @@ class FlatLadder7x7NNUEv1(nn.Module):
 
 
 @MODELS.register("flat_ladder7x7_nnue_v2")
-class FlatLadder7x7NNUEv2(nn.Module):
+class FlatLadder7x7NNUEv2(FlatValueModel):
     def __init__(
         self, dim_middle=128, dim_policy=16, dim_value=32, input_type="basic-nostm", value_no_draw=False
     ):
@@ -309,6 +303,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
 
         # get feature sum from chunks
         feature = self.get_feature_sum(data)  # [B, dim_mapping]
+        self._trace("feature.sum", feature)
 
         # policy head
         if dim_policy > 0:
@@ -316,50 +311,13 @@ class FlatLadder7x7NNUEv2(nn.Module):
             policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
             policy = policy.view(-1, 7, 7)  # [B, 7, 7]
         else:
-            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
+            policy = self._zero_policy(feature, 7, 7)
+        self._trace("policy.output", policy)
 
         # value head
-        value = feature[:, dim_policy:]  # [B, dim_value]
-        for layer in self.value_linears:
-            value = torch.clamp(value, min=0, max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature[:, dim_policy:], first_min=0)
 
         return {"value": value, "policy": policy}
-
-    def forward_debug_print(self, data):
-        _, dim_policy, _ = self.model_size
-
-        # get feature sum from chunks
-        feature = self.get_feature_sum(data)  # [B, dim_mapping]
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # policy head
-        if dim_policy > 0:
-            policy_key = self.policy_key(feature[:, :dim_policy])  # [B, dim_policy]
-            policy = torch.matmul(policy_key, self.policy_query.t())  # [B, 7*7]
-            policy = policy.view(-1, 7, 7)  # [B, 7, 7]
-        else:
-            policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
-
-        # value head
-        value = feature[:, dim_policy:]  # [B, dim_value]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=0, max=127 / 128)
-            print(f"value input{i+1}: \n{(value * 128).int()}")
-            value = layer(value)
-            print(f"value output{i+1}: \n{(value * 128).int()}")
-
-        return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
-        ]
 
     @property
     def name(self):
@@ -368,7 +326,7 @@ class FlatLadder7x7NNUEv2(nn.Module):
 
 
 @MODELS.register("flat_ladder7x7_nnue_v3")
-class FlatLadder7x7NNUEv3(nn.Module):
+class FlatLadder7x7NNUEv3(FlatValueModel):
     def __init__(
         self,
         dim_middle=128,
@@ -460,14 +418,6 @@ class FlatLadder7x7NNUEv3(nn.Module):
             )
         return conv_list
 
-    def get_phase_plane(self, data):
-        input_plane = self.input_plane(data)  # [B, C, H, W]
-        empty_plane = (input_plane[:, 0] + input_plane[:, 1]) != 0
-        empty_count = torch.sum(empty_plane, dim=(1, 2))  # [B]
-        phase = torch.div(49 - empty_count, 49.0)  # [B]
-        x = phase * 2 - 1  # scale [0,1] to [-1,1]
-        return x[:, None, None, None].expand(-1, -1, 7, 7)  # [B, 1, 7, 7]
-
     def get_feature_sum(self, data):
         input_plane = self.input_plane(data)  # [B, C, H, W]
         features = []
@@ -552,41 +502,14 @@ class FlatLadder7x7NNUEv3(nn.Module):
     def forward(self, data):
         # get feature sum from chunks
         feature = self.get_feature_sum(data)
+        self._trace("feature.sum", feature)
 
         # value head
-        value = feature  # [B, dim_mapping]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, 7, 7)
+        self._trace("policy.output", policy)
         return {"value": value, "policy": policy}
-
-    def forward_debug_print(self, data):
-        # get feature sum from chunks
-        feature = self.get_feature_sum(data)
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # value head
-        value = feature
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=0, max=127 / 128)
-            print(f"value input{i+1}: \n{(value * 128).int()}")
-            value = layer(value)
-            print(f"value output{i+1}: \n{(value * 128).int()}")
-
-        policy = torch.zeros((feature.shape[0], 7, 7), dtype=feature.dtype, device=feature.device)
-        return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
-        ]
 
     @property
     def name(self):
@@ -595,7 +518,7 @@ class FlatLadder7x7NNUEv3(nn.Module):
 
 
 @MODELS.register("flat_posconv3x3_nnue")
-class FlatConv3x3NNUE(nn.Module):
+class FlatConv3x3NNUE(FlatValueModel):
     def __init__(self, dim_middle=128, dim_feature=32, input_type="basic-nostm", value_no_draw=False):
         super().__init__()
         self.model_size = (dim_middle, dim_feature)
@@ -649,23 +572,10 @@ class FlatConv3x3NNUE(nn.Module):
         feature = self.get_feature_sum(input_plane)
 
         # value head
-        value = feature  # [B, dim_mapping]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
         return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
-        ]
 
     @property
     def name(self):
@@ -674,7 +584,7 @@ class FlatConv3x3NNUE(nn.Module):
 
 
 @MODELS.register("flat_posconv3x4_4x3_nnue")
-class FlatConv3x44x3NNUE(nn.Module):
+class FlatConv3x44x3NNUE(FlatValueModel):
     def __init__(
         self,
         dim_middle=128,
@@ -782,23 +692,10 @@ class FlatConv3x44x3NNUE(nn.Module):
         feature = self.get_feature_sum(input_plane)
 
         # value head
-        value = feature  # [B, dim_mapping]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
         return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
-        ]
 
     @property
     def name(self):
@@ -807,7 +704,7 @@ class FlatConv3x44x3NNUE(nn.Module):
 
 
 @MODELS.register("flat_hashconv_nnue")
-class FlatHashConvNNUE(nn.Module):
+class FlatHashConvNNUE(FlatValueModel):
     def __init__(
         self, kernel_size, hash_logsize, dim_feature=32, input_type="basic-nostm", value_no_draw=False
     ):
@@ -859,22 +756,15 @@ class FlatHashConvNNUE(nn.Module):
         feature = self.get_feature_sum(input_plane)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
         return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
         return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
+            *super().weight_clipping,
             {"params": [f"hash_layer.features.weight"], "min_weight": -128 / 128, "max_weight": 127 / 128},
         ]
 
@@ -885,7 +775,7 @@ class FlatHashConvNNUE(nn.Module):
 
 
 @MODELS.register("flat_hash7x7_nnue_v1")
-class FlatHash7x7NNUEv1(nn.Module):
+class FlatHash7x7NNUEv1(FlatValueModel):
     def __init__(
         self,
         hash_logsize,
@@ -919,20 +809,8 @@ class FlatHash7x7NNUEv1(nn.Module):
             ]
         )
 
-    def _make_4x4_mapping(self, dim_middle, dim_mapping):
-        return nn.Sequential(
-            Conv2dBlock(self.input_plane.dim_plane, dim_middle, ks=2, st=1, activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=2, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_middle, ks=1, st=1, norm="bn", activation="mish"),
-            Conv2dBlock(dim_middle, dim_mapping, ks=1, st=1, norm="bn", activation="none"),
-        )
-
     def get_feature_sum(self, input_plane):
         input_plane = input_plane[:, 0] / 2 + input_plane[:, 1]  # map {0,1,2} into [0.0, 1.0]
-        assert torch.all(input_plane <= 1.0)
         features = []
 
         corner_index = [
@@ -959,22 +837,15 @@ class FlatHash7x7NNUEv1(nn.Module):
         feature = self.get_feature_sum(input_plane)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
         return {"value": value, "policy": policy}
 
     @property
     def weight_clipping(self):
         return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            },
+            *super().weight_clipping,
             {
                 "params": ["hash_layer_corner.features.weight"],
                 "min_weight": -128 / 128,
@@ -989,7 +860,7 @@ class FlatHash7x7NNUEv1(nn.Module):
 
 
 @MODELS.register("flat_square7x7_nnue_v1")
-class FlatSquare7x7NNUEv1(nn.Module):
+class FlatSquare7x7NNUEv1(FlatValueModel):
     def __init__(
         self, dim_middle=128, dim_feature=8, quant_int4=False, input_type="basic-nostm", value_no_draw=False
     ):
@@ -1051,23 +922,10 @@ class FlatSquare7x7NNUEv1(nn.Module):
         feature = self.get_feature_sum(input_plane)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
         return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            }
-        ]
 
     @property
     def name(self):
@@ -1076,7 +934,7 @@ class FlatSquare7x7NNUEv1(nn.Module):
 
 
 @MODELS.register("flat_square7x7_nnue_v2")
-class FlatSquare7x7NNUEv2(nn.Module):
+class FlatSquare7x7NNUEv2(FlatValueModel):
     def __init__(
         self, dim_middle=128, dim_feature=32, quant_int4=False, input_type="basic-nostm", value_no_draw=False
     ):
@@ -1163,51 +1021,14 @@ class FlatSquare7x7NNUEv2(nn.Module):
         feature_corner = torch.cat(features_corner, dim=1)
         feature_middle = torch.cat(features_middle, dim=1)
         feature = feature_corner + feature_middle
+        self._trace("feature.sum", feature)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
+        self._trace("policy.output", policy)
         return {"value": value, "policy": policy}
-
-    def forward_debug_print(self, data):
-        input_plane = self.input_plane(data)  # [B, C, H, W]
-        _, _, H, W = input_plane.shape
-
-        # get feature sum from chunks
-        features_corner, features_middle = self.get_features(input_plane)
-        for i, f_corner in enumerate(features_corner):
-            print(f"feature4x4[{i}]: \n{(f_corner * 128).int()}")
-        for i, f_middle in enumerate(features_middle):
-            print(f"feature4x3[{i}]: \n{(f_middle * 128).int()}")
-        feature_corner = torch.cat(features_corner, dim=1)
-        feature_middle = torch.cat(features_middle, dim=1)
-        feature = feature_corner + feature_middle
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            print(f"value input{i+1}: \n{(value * 128).int()}")
-            value = layer(value)
-            print(f"value output{i+1}: \n{(value * 128).int()}")
-
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return {"value": value, "policy": policy}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            }
-        ]
 
     @property
     def name(self):
@@ -1216,7 +1037,7 @@ class FlatSquare7x7NNUEv2(nn.Module):
 
 
 @MODELS.register("flat_square7x7_nnue_v3")
-class FlatSquare7x7NNUEv3(nn.Module):
+class FlatSquare7x7NNUEv3(FlatValueModel):
     def __init__(
         self, dim_middle=128, dim_feature=32, quant_int4=False, input_type="basic-nostm", value_no_draw=False
     ):
@@ -1288,43 +1109,13 @@ class FlatSquare7x7NNUEv3(nn.Module):
         f_corner2 = torch.cat(fs_corner2, dim=1)
         f_middle = torch.cat(fs_middle, dim=1)
         feature = fake_quant((f_corner1 + f_corner2 + 1 / 128) / 2, floor=True) + f_middle
+        self._trace("feature.sum", feature)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-        return {"value": value, "policy": policy}
-
-    def forward_debug_print(self, data):
-        input_plane = self.input_plane(data)  # [B, C, H, W]
-        _, _, H, W = input_plane.shape
-
-        # get feature sum from chunks
-        fs_corner1, fs_corner2, fs_middle = self.get_feature_sum(input_plane)
-        for i, f in enumerate(fs_corner1):
-            print(f"fs_corner1[{i}]: \n{(f * 128).int()}")
-        for i, f in enumerate(fs_corner2):
-            print(f"fs_corner2[{i}]: \n{(f * 128).int()}")
-        for i, f in enumerate(fs_middle):
-            print(f"fs_middle[{i}]: \n{(f * 128).int()}")
-        f_corner1 = torch.cat(fs_corner1, dim=1)
-        f_corner2 = torch.cat(fs_corner2, dim=1)
-        f_middle = torch.cat(fs_middle, dim=1)
-        feature = fake_quant((f_corner1 + f_corner2 + 1 / 128) / 2, floor=True) + f_middle
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            print(f"value input{i+1}: \n{(value * 128).int()}")
-            value = layer(value)
-            print(f"value output{i+1}: \n{(value * 128).int()}")
-
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
+        self._trace("policy.output", policy)
         return {"value": value, "policy": policy}
 
     @property
@@ -1345,7 +1136,7 @@ class FlatSquare7x7NNUEv3(nn.Module):
 
 
 @MODELS.register("flat_square7x7_nnue_v4")
-class FlatSquare7x7NNUEv4(nn.Module):
+class FlatSquare7x7NNUEv4(FlatValueModel):
     def __init__(
         self,
         dim_middle=128,
@@ -1383,7 +1174,7 @@ class FlatSquare7x7NNUEv4(nn.Module):
             Conv2dBlock(dim_mid, dim_map, ks=1, st=1, norm="bn", activation="none"),
         )
 
-    def _do_vector_quantize(self, feature_groups):
+    def _do_vector_quantize(self, feature_groups, real_mask=None):
         return feature_groups, {}, {}  # no vector quantization as default
 
     def get_features(self, input_plane):
@@ -1438,56 +1229,23 @@ class FlatSquare7x7NNUEv4(nn.Module):
         feature_groups = self.get_features(input_plane)
 
         # do vector quantization
-        feature_groups, aux_losses, aux_outputs = self._do_vector_quantize(feature_groups)
+        feature_groups, aux_losses, aux_outputs = self._do_vector_quantize(
+            feature_groups, data.get("is_real")
+        )
+        for i, feature_group in enumerate(feature_groups):
+            self._trace(f"feature.group.{i}", feature_group)
 
         # int8 quant and sum
         feature = torch.sum(fake_quant(torch.cat(feature_groups), scale=128), dim=0)
+        self._trace("feature.sum", feature)
 
         # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
+        value = self._forward_value_linears(feature, first_min=-1)
 
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
+        policy = self._zero_policy(feature, H, W)
+        self._trace("policy.output", policy)
 
         return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
-
-    def forward_debug_print(self, data):
-        input_plane = self.input_plane(data)  # [B, C, H, W]
-        _, _, H, W = input_plane.shape
-
-        # get feature sum from chunks
-        feature_groups = self.get_features(input_plane)
-
-        # do vector quantization
-        feature_groups, aux_losses, aux_outputs = self._do_vector_quantize(feature_groups)
-        for i, f in enumerate(feature_groups):
-            print(f"feature_group{i}: \n{(fake_quant(f, scale=128) * 128).int()}")
-
-        # int8 quant and sum
-        feature = torch.sum(fake_quant(torch.cat(feature_groups), scale=128), dim=0)
-        print(f"feature sum: \n{(feature * 128).int()}")
-
-        # value head
-        value = feature  # [B, dim_feature]
-        for i, layer in enumerate(self.value_linears):
-            value = torch.clamp(value, min=(-1 if i == 0 else 0), max=127 / 128)
-            value = layer(value)
-
-        policy = torch.zeros((feature.shape[0], H, W), dtype=feature.dtype, device=feature.device)
-
-        return {"value": value, "policy": policy, "aux_losses": aux_losses, "aux_outputs": aux_outputs}
-
-    @property
-    def weight_clipping(self):
-        return [
-            {
-                "params": [f"value_linears.{i}.fc.weight" for i in range(len(self.value_linears))],
-                "min_weight": -128 / 128,
-                "max_weight": 127 / 128,
-            }
-        ]
 
     @property
     def name(self):
@@ -1529,18 +1287,36 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
             ]
         )
 
-    def _do_vector_quantize(self, feature_groups):
+    def _do_vector_quantize(self, feature_groups, real_mask=None):
         loss = []
         perplexity = []
         normalized_perplexity = []
         cluster_sizes = []
+        loss_stats = []
 
         for i, feature in enumerate(feature_groups):
             # fix feature if vq layer is not inited
-            if not self.vq_layer[i].inited:
-                feature = feature.detach()
+            if not self.vq_layer[i].is_initialized():
+                feature = ddp_preinit_identity(
+                    feature.detach(),
+                    self.mapping4x4[i].parameters(),
+                )
+            else:
+                mark_ddp_parameter_use(self.mapping4x4[i].parameters())
             # Do vector quantization
-            feature_quantized, info = self.vq_layer[i](feature.view(-1, feature.shape[-1]))
+            if real_mask is None:
+                self.vq_layer[i].set_eval_entry_mask(None)
+            else:
+                if feature.ndim != 3 or feature.shape[1] != len(real_mask):
+                    raise ValueError(
+                        "flat VQ features cannot be mapped to evaluation rows"
+                    )
+                self.vq_layer[i].set_eval_entry_mask(
+                    real_mask.bool().repeat(feature.shape[0])
+                )
+            feature_quantized, info = self.vq_layer[i](
+                feature.view(-1, feature.shape[-1])
+            )
             feature_groups[i] = feature_quantized.view_as(feature)
 
             if info is not None:
@@ -1548,11 +1324,28 @@ class FlatSquare7x7NNUEv4VQ(FlatSquare7x7NNUEv4):
                 perplexity.append(info["perplexity"])
                 normalized_perplexity.append(info["normalized_perplexity"])
                 cluster_sizes.append(self.vq_layer[i].normalized_cluster_size)
+                if info["loss_stats"] is not None:
+                    loss_stats.append(
+                        {
+                            **info["loss_stats"],
+                            "slot_id": f"layer{i:02d}",
+                            "slot_weight": 1.0,
+                        }
+                    )
 
         aux_losses = {}
         if len(loss) > 0:
             loss = torch.stack(loss).sum()
-            aux_losses = {"vq": loss}
+            aux_losses = (
+                {"vq": loss}
+                if self.training
+                else {
+                    "vq": (
+                        "vq_loss",
+                        {"value": loss, "slots": loss_stats},
+                    )
+                }
+            )
 
         aux_outputs = {}
         if len(perplexity) > 0:

@@ -18,7 +18,8 @@ Rules:
   * Future training paradigms define their own keys; loss functions index the
     keys they require (missing keys fail fast with KeyError) and use ``.get()``
     for optional ones.
-  * ``forward_debug_print`` mirrors ``forward``'s return convention.
+  * Trace-enabled models expose a generic ``forward_debug_print`` adapter
+    which observes and returns the real ``forward`` result.
 
 Optional compilation hook:
   * A model may expose an ``inductor_config`` mapping of model-specific
@@ -39,5 +40,8 @@ import_submodules(__name__, recursive=False)
 
 
 def build_model(model_type, **kwargs) -> Module:
-    assert model_type in MODELS, f"Unknown model type: {model_type}"
+    # Keep variadic model constructors strict by forwarding every keyword to
+    # an explicit component signature; forwarding code must never drop extras.
+    if model_type not in MODELS:
+        raise ValueError(f"Unknown model type: {model_type}")
     return MODELS[model_type](**kwargs)

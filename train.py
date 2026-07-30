@@ -33,7 +33,6 @@ def parse_args_and_init():
     parser.add("--optim_args", type=yaml.safe_load, default={}, help="Extra optimizer arguments")
     parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
     parser.add("--lr_scheduler_args", type=yaml.safe_load, default={}, help="Extra LR scheduler arguments")
-    parser.add("--init_cfg", type=yaml.safe_load, default={}, help="Init configuration")
     parser.add("--loss_type", default="KL+KL", help="Loss type")
     parser.add("--loss_args", type=yaml.safe_load, default={}, help="Extra loss arguments")
     parser.add("--iterations", type=int, default=1000000, help="Num iterations")

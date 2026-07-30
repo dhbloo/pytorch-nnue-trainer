@@ -66,9 +66,15 @@ class ChannelWiseLeakyReLU(nn.Module):
     """LeakyReLU with per-channel learnable negative slopes and optional bias."""
     def __init__(self, dim, bias=True, bound=0):
         super().__init__()
-        self.neg_slope = nn.Parameter(torch.ones(dim) * 0.5)
-        self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
+        self.neg_slope = nn.Parameter(torch.empty(dim))
+        self.bias = nn.Parameter(torch.empty(dim)) if bias else None
         self.bound = bound
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.constant_(self.neg_slope, 0.5)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
 
     def forward(self, x):
         assert x.ndim >= 2
@@ -79,6 +85,7 @@ class ChannelWiseLeakyReLU(nn.Module):
         if self.bound != 0:
             slope = torch.tanh(slope / self.bound) * self.bound
 
+        x = x.clone(memory_format=torch.preserve_format)
         x += -torch.relu(-x) * (slope - 1)
         if self.bias is not None:
             x += self.bias.view(shape)
@@ -133,8 +140,14 @@ class SwitchPReLU(nn.Module):
         super().__init__()
         factory_kwargs = {"device": device, "dtype": dtype}
         self.num_parameters = num_parameters
-        self.weight = nn.Parameter(torch.zeros((num_experts, num_parameters), **factory_kwargs))
-        self.weight_fact = nn.Parameter(torch.full((1, num_parameters), init, **factory_kwargs))
+        self._init = init
+        self.weight = nn.Parameter(torch.empty((num_experts, num_parameters), **factory_kwargs))
+        self.weight_fact = nn.Parameter(torch.empty((1, num_parameters), **factory_kwargs))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.weight)
+        nn.init.constant_(self.weight_fact, self._init)
 
     def get_weight(self, route_index: Tensor) -> Tensor:
         return F.embedding(route_index, self.weight) + self.weight_fact

@@ -174,10 +174,6 @@ class MaskNorm(nn.Module):
     Available norm types:
     bnorm - batch norm
     fixup - fixup initialization https://arxiv.org/abs/1901.09321
-    fixscale - fixed scaling initialization. Normalization layers simply multiply a constant scalar according
-        to what batchnorm *would* do if all inputs were unit variance and all linear layers or convolutions
-        preserved variance.
-    fixscaleonenorm - fixed scaling normalization PLUS only have one batch norm layer in the entire net, at the end of the residual trunk.
     """
 
     def __init__(
@@ -196,7 +192,6 @@ class MaskNorm(nn.Module):
         self.epsilon = bnorm_epsilon
         self.running_avg_momentum = bnorm_running_avg_momentum
 
-        self.register_parameter("scale", None)
         if affine:
             self.weight = nn.Parameter(torch.empty(num_features))
             self.bias = nn.Parameter(torch.empty(num_features))
@@ -219,21 +214,12 @@ class MaskNorm(nn.Module):
             self.running_var.fill_(1.0)
 
     def reset_parameters(self):
-        self.scale = None
         if self.affine:
             nn.init.ones_(self.weight)
             nn.init.zeros_(self.bias)
         self.reset_running_stats()
 
-    def set_scale(self, scale: None | float):
-        if scale is not None:
-            self.scale = nn.Parameter(torch.full((), scale), requires_grad=False)
-        else:
-            self.scale = None
-
     def _apply_affine_transform(self, x: Tensor) -> Tensor:
-        if self.scale is not None:
-            x *= self.scale
         if self.affine:
             x = x * self.weight.view(1, self.num_features, 1, 1) + self.bias.view(1, self.num_features, 1, 1)
         return x
@@ -248,7 +234,7 @@ class MaskNorm(nn.Module):
                     mask,
                     self.weight,
                     self.bias,
-                    self.scale,
+                    None,
                     self.epsilon,
                 )
                 with torch.no_grad():
@@ -260,13 +246,7 @@ class MaskNorm(nn.Module):
                 zeromean_x = x - mean.view(1, self.num_features, 1, 1)
 
             if not self.training and torch.onnx.is_in_onnx_export():
-                if self.scale is not None:
-                    if self.affine:
-                        weight = self.scale * self.weight
-                    else:
-                        weight = self.scale.view(1).expand(self.num_features)
-                else:
-                    weight = self.weight if self.affine else None
+                weight = self.weight if self.affine else None
 
                 x = F.batch_norm(
                     input=x,

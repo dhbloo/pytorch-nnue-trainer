@@ -1,7 +1,5 @@
 """Reusable convolution blocks."""
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -39,6 +37,55 @@ def _convnd_out_size(
         )
         for i in range(len(in_size))
     )
+
+
+def pointwise_matmul(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    """Apply a 1x1 convolution as a matmul over a channel-last view of ``x``.
+
+    ``aten.convolution_backward`` is an unconditional Inductor fallback, so a 1x1
+    ``conv2d`` gets a cuDNN data gradient that no Triton epilogue can attach to: every
+    activation backward next to it stays a separate memory-bound pass, and the bias
+    gradient is stuck with the fallback's fixed input strides.  Emitting ``mm`` instead
+    lets Inductor autotune a Triton template and fuse the activation backward into it.
+    Measured on the Mix9s ``Mapping`` trunk at batch 128: 14 of 22 SiLU backwards became
+    template epilogues and total kernel time dropped 15%.
+
+    ``weight`` is the 2D ``[out_channels, in_channels]`` view of a 1x1 conv weight.
+    """
+    n, _, h, w = x.shape
+    flat = x.permute(0, 2, 3, 1).reshape(n * h * w, weight.shape[1])
+    out = F.linear(flat, weight, bias)
+    return out.view(n, h, w, -1).permute(0, 3, 1, 2)
+
+
+class Conv2d(nn.Conv2d):
+    """Project-default convolution with complete local initialization."""
+
+    def __init__(self, *args, weight_scale: float = 1.0, **kwargs):
+        object.__setattr__(self, "weight_scale", weight_scale)
+        super().__init__(*args, **kwargs)
+
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_normal_(self.weight, a=0, mode="fan_in")
+        with torch.no_grad():
+            self.weight.mul_(self.weight_scale)
+        if self.bias is not None:
+            nn.init.zeros_(self.bias)
+
+
+class PointwiseConv2d(Conv2d):
+    """1x1 ``nn.Conv2d`` whose forward is traced as a matmul.
+
+    Parameters, buffers and ``state_dict`` are exactly those of
+    ``nn.Conv2d(in_dim, out_dim, kernel_size=1)``, so checkpoints and the export path
+    are unaffected; only the traced operator changes.  See ``pointwise_matmul``.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, bias: bool = True):
+        super().__init__(in_dim, out_dim, kernel_size=1, bias=bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return pointwise_matmul(x, self.weight.flatten(1), self.bias)
 
 
 class Conv2dBlock(nn.Module):
@@ -90,6 +137,7 @@ class Conv2dBlock(nn.Module):
         weight_quant_bits=8,
         bias_quant_scale=None,
         bias_quant_bits=32,
+        weight_scale=1.0,
     ):
         super(Conv2dBlock, self).__init__()
         assert pad_type in [
@@ -101,7 +149,7 @@ class Conv2dBlock(nn.Module):
         self.activation_first = activation_first
         self.norm = build_norm2d_layer(norm, out_dim)
         self.activation = build_activation_layer(activation)
-        self.conv = nn.Conv2d(
+        self.conv = Conv2d(
             in_channels=in_dim,
             out_channels=out_dim,
             kernel_size=ks,
@@ -111,6 +159,7 @@ class Conv2dBlock(nn.Module):
             groups=groups,
             bias=bias,
             padding_mode=pad_type,
+            weight_scale=weight_scale,
         )
 
         self.quant = quant
@@ -218,243 +267,3 @@ class Conv2dBlock(nn.Module):
             return x, mask
         else:
             return x
-
-
-class Conv1dLine4Block(nn.Module):
-    """Conv2d block with sparse kernel using only diagonal, anti-diagonal, and cross-shaped positions."""
-    def __init__(
-        self,
-        in_dim,
-        out_dim,
-        ks,
-        st,
-        padding=0,
-        norm="none",
-        activation="relu",
-        bias=True,
-        dilation=1,
-        groups=1,
-        activation_first=False,
-        quant=False,
-        input_quant_scale=128,
-        input_quant_bits=8,
-        weight_quant_scale=128,
-        weight_quant_bits=8,
-        bias_quant_scale=None,
-        bias_quant_bits=32,
-    ):
-        super().__init__()
-        assert in_dim % groups == 0, f"in_dim({in_dim}) should be divisible by groups({groups})"
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.kernel_size = ks
-        self.stride = st
-        self.padding = padding  # zeros padding
-        self.dilation = dilation
-        self.groups = groups
-        self.activation_first = activation_first
-        self.norm = build_norm2d_layer(norm, out_dim)
-        self.activation = build_activation_layer(activation)
-        self.weight = nn.Parameter(torch.empty((4 * ks - 3, out_dim, in_dim // groups)))
-        self.bias = nn.Parameter(torch.zeros((out_dim,))) if bias else None
-        nn.init.kaiming_normal_(self.weight)
-
-        self.quant = quant
-        if quant:
-            self.input_quant_scale = input_quant_scale
-            self.input_quant_bits = input_quant_bits
-            self.weight_quant_scale = weight_quant_scale
-            self.weight_quant_bits = weight_quant_bits
-            self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
-            self.bias_quant_bits = bias_quant_bits
-
-    def make_kernel(self):
-        kernel = []
-        weight_index = 0
-        zero = torch.zeros_like(self.weight[0])
-        for i in range(self.kernel_size):
-            for j in range(self.kernel_size):
-                if (
-                    i == j
-                    or i + j == self.kernel_size - 1
-                    or i == self.kernel_size // 2
-                    or j == self.kernel_size // 2
-                ):
-                    kernel.append(self.weight[weight_index])
-                    weight_index += 1
-                else:
-                    kernel.append(zero)
-
-        assert weight_index == self.weight.size(0), f"{weight_index} != {self.weight.size(0)}"
-        kernel = torch.stack(kernel, dim=2)
-        kernel = kernel.reshape(self.out_dim, self.in_dim // self.groups, self.kernel_size, self.kernel_size)
-        return kernel
-
-    def conv(self, x):
-        w = self.make_kernel()
-        b = self.bias
-
-        if self.quant:
-            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
-            w = fake_quant(w, self.weight_quant_scale, num_bits=self.weight_quant_bits)
-            if b is not None:
-                b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
-
-        return F.conv2d(x, w, b, self.stride, self.padding, self.dilation, self.groups)
-
-    def forward(self, x):
-        if self.activation_first:
-            if self.norm:
-                x = self.norm(x)
-            if self.activation:
-                x = self.activation(x)
-        x = self.conv(x)
-        if not self.activation_first:
-            if self.norm:
-                x = self.norm(x)
-            if self.activation:
-                x = self.activation(x)
-        return x
-
-
-class Conv2dSymBlock(nn.Module):
-    """Conv2d block with spatially symmetric kernel weights."""
-    def __init__(
-        self,
-        in_dim: int,
-        out_dim: int,
-        ks: int,
-        st: int,
-        padding=0,
-        norm="none",
-        activation="relu",
-        bias=True,
-        groups=1,
-        activation_first=False,
-        quant=False,
-        input_quant_scale=128,
-        input_quant_bits=8,
-        weight_quant_scale=128,
-        weight_quant_bits=8,
-        bias_quant_scale=None,
-        bias_quant_bits=32,
-    ):
-        super().__init__()
-        self.activation_first = activation_first
-        self.norm = build_norm2d_layer(norm, out_dim)
-        self.activation = build_activation_layer(activation)
-
-        self.in_channels = in_dim
-        self.out_channels = out_dim
-        self.kernel_size = ks
-        self.stride = st
-        self.padding = padding  # zero padding
-        self.groups = groups
-
-        # Compute num_cells = 1 + 2 + ... + ks
-        self.num_cells = ks * (ks + 1) // 2
-        self.weight = nn.Parameter(torch.empty((self.num_cells, out_dim, in_dim // groups)))
-
-        half_ks = (self.kernel_size + 1) // 2
-        self.weight_index = []
-        for y in range(self.kernel_size):
-            for x in range(self.kernel_size):
-                i, j = y, x
-                if i >= half_ks:
-                    i = self.kernel_size - i - 1
-                if j >= half_ks:
-                    j = self.kernel_size - j - 1
-                if i > j:
-                    i, j = j, i
-                self.weight_index.append(i * half_ks + j - i * (i + 1) // 2)
-
-        if bias:
-            self.bias = nn.Parameter(torch.empty(out_dim))
-        else:
-            self.register_parameter("bias", None)
-
-        self.quant = quant
-        if quant:
-            self.input_quant_scale = input_quant_scale
-            self.input_quant_bits = input_quant_bits
-            self.weight_quant_scale = weight_quant_scale
-            self.weight_quant_bits = weight_quant_bits
-            self.bias_quant_scale = bias_quant_scale or (input_quant_scale * weight_quant_scale)
-            self.bias_quant_bits = bias_quant_bits
-
-    def reset_parameters(self):
-        init_weight = torch.empty(
-            (self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size)
-        )
-        nn.init.kaiming_uniform_(init_weight, a=math.sqrt(5))
-
-        # fill the weight tensor with the upper triangular part of the kernel
-        half_ks = (self.kernel_size + 1) // 2
-        for i in range(half_ks):
-            for j in range(i, half_ks):
-                idx = i * half_ks + j - i * (i + 1) // 2
-                self.weight.data[idx, :, :] = init_weight[:, :, i, j]
-
-        if self.bias is not None:
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(init_weight)
-            if fan_in != 0:
-                bound = 1 / math.sqrt(fan_in)
-                nn.init.uniform_(self.bias, -bound, bound)
-
-    def get_kernel_weight(self):
-        kernel = [self.weight[i] for i in self.weight_index]
-        kernel = torch.stack(kernel, dim=2)
-        kernel = kernel.reshape(
-            self.out_channels, self.in_channels // self.groups, self.kernel_size, self.kernel_size
-        )
-        return kernel
-
-    def forward(self, x):
-        if self.activation_first:
-            if self.norm:
-                x = self.norm(x)
-            if self.activation:
-                x = self.activation(x)
-
-        w = self.get_kernel_weight()
-        b = self.bias
-
-        if self.quant:
-            x = fake_quant(x, self.input_quant_scale, num_bits=self.input_quant_bits)
-            w = fake_quant(w, self.weight_quant_scale, num_bits=self.weight_quant_bits)
-            if b is not None:
-                b = fake_quant(b, self.bias_quant_scale, num_bits=self.bias_quant_bits)
-            if (
-                self.quant == "pixel-dwconv" or self.quant == "pixel-dwconv-floor"
-            ):  # pixel-wise quantization in depthwise conv
-                assert self.groups == x.size(1), "must be dwconv in pixel-dwconv quant mode!"
-                batch_size, _, h_in, w_in = x.shape
-                h_out, w_out = _convnd_out_size(
-                    (h_in, w_in),
-                    (self.kernel_size, self.kernel_size),
-                    (self.stride, self.stride),
-                    (self.padding, self.padding),
-                    None,
-                )
-                x = F.unfold(x, self.kernel_size, 1, self.padding, self.stride)
-                x = fake_quant(
-                    x * w.view(-1)[None, :, None],
-                    self.bias_quant_scale,
-                    num_bits=self.bias_quant_bits,
-                    floor=(self.quant == "pixel-dwconv-floor"),
-                )
-                x = x.reshape(batch_size, self.out_channels, -1, h_out * w_out).sum(2)
-                x = F.fold(x, (h_out, w_out), (1, 1))
-                if b is not None:
-                    x = x + b[None, :, None, None]
-            else:
-                x = F.conv2d(x, w, b, self.stride, self.padding, 1, self.groups)
-        else:
-            x = F.conv2d(x, w, b, self.stride, self.padding, 1, self.groups)
-
-        if not self.activation_first:
-            if self.norm:
-                x = self.norm(x)
-            if self.activation:
-                x = self.activation(x)
-        return x

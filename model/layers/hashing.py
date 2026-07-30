@@ -5,6 +5,7 @@ import math
 import torch
 import torch.nn as nn
 
+from .linear import Linear
 from utils.quant_utils import fake_quant
 
 
@@ -37,20 +38,34 @@ class HashLayer(nn.Module):
             self.register_buffer("idx_stride", input_level ** torch.arange(input_size, dtype=torch.int64))
         else:
             n_features = 2**hash_logsize
-            ii32 = torch.iinfo(torch.int32)
             self.hashs = nn.Parameter(
-                torch.randint(ii32.min, ii32.max, size=(input_size, input_level), dtype=torch.int32),
+                torch.empty((input_size, input_level), dtype=torch.int32),
                 requires_grad=False,
             )
 
         n_features = [math.ceil(n_features / sub_divisor**i) for i in range(sub_features)]
         self.offsets = [sum(n_features[:i]) for i in range(sub_features + 1)]
         level_dim = max(dim_feature // sub_features, 1)
-        self.features = nn.Embedding(sum(n_features), level_dim, scale_grad_by_freq=scale_grad_by_freq)
-        if self.quant_int8:
-            nn.init.trunc_normal_(self.features.weight.data, std=0.5, a=-1, b=127 / 128)
+        feature_weight = torch.empty(sum(n_features), level_dim)
+        self.features = nn.Embedding(
+            sum(n_features),
+            level_dim,
+            scale_grad_by_freq=scale_grad_by_freq,
+            _weight=feature_weight,
+        )
+        self.reset_parameters()
         if self.sub_features > 1:
-            self.feature_mapping = nn.Linear(level_dim * sub_features, dim_feature)
+            self.feature_mapping = Linear(level_dim * sub_features, dim_feature)
+
+    def reset_parameters(self):
+        with torch.no_grad():
+            if not self.perfect_hash:
+                ii32 = torch.iinfo(torch.int32)
+                self.hashs.random_(ii32.min, ii32.max)
+            if self.quant_int8:
+                nn.init.trunc_normal_(self.features.weight, std=0.5, a=-1, b=127 / 128)
+            else:
+                nn.init.normal_(self.features.weight)
 
     def forward(self, x, x_long=None):
         """
@@ -63,12 +78,20 @@ class HashLayer(nn.Module):
         """
         # Quantize input to [0, input_level-1] level
         if x_long is None:
-            assert torch.all((x >= 0) & (x <= 1)), f"Input x should be in range [0, 1], but got {x}"
+            invalid = torch.any(~((x >= 0) & (x <= 1)), dim=1)
             x_long = torch.round((self.input_level - 1) * x).long()  # (batch_size, input_size)
+        else:
+            invalid = torch.any(
+                (x_long < 0) | (x_long >= self.input_level), dim=1
+            )
 
         if self.perfect_hash:
             x_indices = torch.sum(x_long * self.idx_stride, dim=1)  # (batch_size,)
+            x_indices = torch.where(invalid, self.offsets[-1], x_indices)
         else:
+            x_long = torch.where(
+                invalid.unsqueeze(1), self.input_level, x_long
+            )
             x_onthot = torch.zeros(
                 (x_long.shape[0], self.input_size, self.input_level), dtype=torch.bool, device=x_long.device
             )
@@ -81,9 +104,6 @@ class HashLayer(nn.Module):
         if self.sub_features > 1:
             x_features = []
             for i in range(self.sub_features):
-                assert torch.all(
-                    x_indices < self.offsets[i + 1] - self.offsets[i]
-                ), f"indices overflow: {i}, {(x_indices.min(), x_indices.max())}, {(self.offsets[i], self.offsets[i+1])}"
                 x_features.append(self.features(x_indices + self.offsets[i]))
                 x_indices = torch.floor_divide(x_indices, self.sub_divisor)
             x_features = torch.cat(x_features, dim=1)  # (batch_size, level_dim * sub_features)

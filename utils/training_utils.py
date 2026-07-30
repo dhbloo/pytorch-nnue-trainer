@@ -1,71 +1,12 @@
-import math
 import random
 import torch
 import torch.nn.functional as F
-import torch.nn.init as init
 import torch.optim as optim
 from torch.utils.data import IterableDataset
 from torch.utils.data.dataloader import DataLoader
 from itertools import chain
 
 from utils.misc_utils import Registry
-
-
-def weights_init(init_cfg: dict):
-    """Generate a init function given a init type"""
-    weight_init_type = init_cfg.get("weight_init_type", "kaiming")
-    if weight_init_type == "kaiming":
-        weight_init_method = init.kaiming_normal_
-        weight_init_args = {"a": 0, "mode": "fan_in"}
-    elif weight_init_type == "xavier":
-        weight_init_method = init.xavier_normal_
-        weight_init_args = {"gain": math.sqrt(2)}
-    elif weight_init_type == "orthogonal":
-        weight_init_method = init.orthogonal_
-        weight_init_args = {"gain": math.sqrt(2)}
-    elif weight_init_type == "normal":
-        weight_init_method = init.normal_
-        weight_init_args = {"mean": 0.0, "std": 0.02}
-    elif weight_init_type == "truncated_normal":
-        weight_init_method = init.trunc_normal_
-        weight_init_args = {"mean": 0.0, "std": 0.02}
-    elif weight_init_type == "constant":
-        weight_init_method = init.constant_
-        weight_init_args = {"val": 0.0}
-    elif weight_init_type == "default":
-        weight_init_method = lambda *args, **kwargs: None
-        weight_init_args = {}
-    else:
-        raise ValueError(f"Unsupported initialization: {weight_init_type}")
-    weight_init_args.update(init_cfg.get("weight_init_args", {}))
-
-    bias_init_type = init_cfg.get("bias_init_type", "constant")
-    if bias_init_type == "constant":
-        bias_init_method = init.constant_
-        bias_init_args = {"val": 0.0}
-    elif bias_init_type == "default":
-        bias_init_method = lambda *args, **kwargs: None
-        bias_init_args = {}
-    else:
-        raise ValueError(f"Unsupported initialization: {bias_init_type}")
-    bias_init_args.update(init_cfg.get("bias_init_args", {}))
-
-    def init_fun(m):
-        """Note that the init function is called in the post order traversal fashion"""
-        classname = m.__class__.__name__
-        # First we check if the layer has custom initialization method.
-        # If so, we just call it without our initialization.
-        if hasattr(m, "initialize"):
-            m.initialize()
-        # Call our unifrom initialization methods for all Conv and Linear layers
-        elif classname.startswith("Conv") or classname.startswith("Linear"):
-            if hasattr(m, "weight") and m.weight is not None:
-                weight_init_method(m.weight.data, **weight_init_args)
-
-            if hasattr(m, "bias") and m.bias is not None:
-                bias_init_method(m.bias.data, **bias_init_args)
-
-    return init_fun
 
 
 OPTIMIZERS = Registry("optimizer")
