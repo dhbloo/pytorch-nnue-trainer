@@ -1,10 +1,152 @@
 import torch
+import torch.nn.functional as F
 import numpy as np
 import io
 from tqdm import tqdm
 from utils.misc_utils import ascii_hist, aligned_write
+from utils.quant_utils import fake_quant
 from . import BaseSerializer, SERIALIZERS
-from ..flatnet import *
+from ..flatnet import (
+    FlatLadder7x7NNUEv1,
+    FlatLadder7x7NNUEv2,
+    FlatSquare7x7NNUEv2,
+    FlatSquare7x7NNUEv3,
+    FlatSquare7x7NNUEv4,
+    FlatSquare7x7NNUEv4VQ,
+)
+
+
+def _index_to_ladder_chunk(index: int) -> list[int]:
+    chunk = []
+    while True:
+        index, remainder = divmod(index, 3)
+        chunk.append(remainder)
+        if index == 0:
+            break
+    chunk = chunk[::-1]
+    for _ in range(10 - len(chunk)):
+        chunk.insert(0, 0)
+    return chunk
+
+
+def _make_ladder_mapping_input(chunk: list[int]) -> torch.Tensor:
+    inputs = torch.zeros(2, 4, 4)
+    lower_triangle_index = [0, 4, 5, 8, 9, 10, 12, 13, 14, 15]
+    for i in range(10):
+        y = lower_triangle_index[i] // 4
+        x = lower_triangle_index[i] % 4
+        if chunk[i] > 0:
+            inputs[chunk[i] - 1][y][x] = 1
+    return inputs
+
+
+def _make_base3_mapping_input(
+    start_idx: int,
+    end_idx: int,
+    height: int,
+    width: int,
+    *,
+    device: torch.device | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    indices = torch.arange(start_idx, end_idx, dtype=torch.int32, device=device)
+    inputs = torch.zeros(
+        (indices.shape[0], 2, height, width),
+        dtype=dtype,
+        device=device,
+    )
+    for i in range(height * width):
+        digit = (indices // 3**i) % 3
+        inputs[:, 0, i // width, i % width] = digit == 1
+        inputs[:, 1, i // width, i % width] = digit == 2
+    return inputs
+
+
+def _export_ladder_value(model, s_weight, s_output):
+    l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
+    l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
+    l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
+    l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
+    l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
+    l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
+    l4_weight = model.value_linears[3].fc.weight.cpu().numpy()
+    l4_bias = model.value_linears[3].fc.bias.cpu().numpy()
+
+    ascii_hist("value: linear1_weight", l1_weight)
+    ascii_hist("value: linear1_bias", l1_bias)
+    ascii_hist("value: linear2_weight", l2_weight)
+    ascii_hist("value: linear2_bias", l2_bias)
+    ascii_hist("value: linear3_weight", l3_weight)
+    ascii_hist("value: linear3_bias", l3_bias)
+    ascii_hist("value: linear4_weight", l4_weight)
+    ascii_hist("value: linear4_bias", l4_bias)
+
+    assert int(l1_weight.min() * s_weight) >= -128
+    assert int(l1_weight.max() * s_weight) <= 127
+    assert int(l2_weight.min() * s_weight) >= -128
+    assert int(l2_weight.max() * s_weight) <= 127
+    assert int(l3_weight.min() * s_weight) >= -128
+    assert int(l3_weight.max() * s_weight) <= 127
+    assert int(l4_weight.min() * s_output) >= -128
+    assert int(l4_weight.max() * s_output) <= 127
+
+    if model.value_no_draw:
+        l4_weight = np.concatenate([l4_weight, np.zeros((3, 32))], axis=0)
+        l4_bias = np.concatenate([l4_bias, np.zeros((3,))], axis=0)
+    else:
+        l4_weight = np.concatenate([l4_weight, np.zeros((1, 32))], axis=0)
+        l4_bias = np.concatenate([l4_bias, np.zeros((1,))], axis=0)
+
+    return (
+        np.clip(np.around(l1_weight * s_weight), -128, 127).astype(np.int8),
+        np.clip(np.around(l1_bias * s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        np.clip(np.around(l2_weight * s_weight), -128, 127).astype(np.int8),
+        np.clip(np.around(l2_bias * s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        np.clip(np.around(l3_weight * s_weight), -128, 127).astype(np.int8),
+        np.clip(np.around(l3_bias * s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        np.clip(np.around(l4_weight * s_output), -128, 127).astype(np.int8),
+        np.clip(np.around(l4_bias * s_output * 128), -(2**31), 2**31 - 1).astype(np.int32),
+    )
+
+
+def _export_square_value(model, s_input, s_weight):
+    l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
+    l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
+    l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
+    l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
+    l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
+    l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
+
+    ascii_hist("value: linear1_weight", l1_weight)
+    ascii_hist("value: linear1_bias", l1_bias)
+    ascii_hist("value: linear2_weight", l2_weight)
+    ascii_hist("value: linear2_bias", l2_bias)
+    ascii_hist("value: linear3_weight", l3_weight)
+    ascii_hist("value: linear3_bias", l3_bias)
+
+    if model.value_no_draw:
+        l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
+        l3_bias = np.concatenate([l3_bias, np.zeros((3,))], axis=0)
+    else:
+        l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
+        l3_bias = np.concatenate([l3_bias, np.zeros((1,))], axis=0)
+
+    # Training clips these weights to [-1, 127/128] but only
+    # [-128/s_input, 127/s_input] is representable at this quantization,
+    # so fail loudly instead of exporting silently saturated weights.
+    l1_weight_quant = np.around(l1_weight * s_input)
+    assert l1_weight_quant.min() >= -128 and l1_weight_quant.max() <= 127, (
+        f"value l1 weight exceeds int8 quantization range at s_input={s_input}: "
+        f"min={l1_weight.min()}, max={l1_weight.max()}"
+    )
+    return (
+        np.clip(np.around(l1_weight * s_input), -128, 127).astype(np.int8),
+        np.clip(np.around(l1_bias * s_input * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        np.clip(np.around(l2_weight * s_weight), -128, 127).astype(np.int8),
+        np.clip(np.around(l2_bias * s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
+        np.clip(np.around(l3_weight * s_weight), -128, 127).astype(np.int8),
+        np.clip(np.around(l3_bias * s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
+    )
 
 
 @SERIALIZERS.register("flat_ladder7x7_nnue_v1")
@@ -46,26 +188,10 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         raise NotImplementedError()
 
     def _index_to_chunk(self, index: int):
-        l = []
-        while True:
-            index, reminder = divmod(index, 3)
-            l.append(reminder)
-            if index == 0:
-                break
-        l = l[::-1]
-        for _ in range(10 - len(l)):
-            l.insert(0, 0)
-        return l
+        return _index_to_ladder_chunk(index)
 
     def _get_mapping_input(self, chunk: list[int]):
-        inputs = torch.zeros(2, 4, 4)
-        lower_triangle_index = [0, 4, 5, 8, 9, 10, 12, 13, 14, 15]
-        for i in range(10):
-            y = lower_triangle_index[i] // 4
-            x = lower_triangle_index[i] % 4
-            if chunk[i] > 0:
-                inputs[chunk[i] - 1][y][x] = 1
-        return inputs
+        return _make_ladder_mapping_input(chunk)
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatLadder7x7NNUEv1, device: torch.device):
@@ -82,50 +208,7 @@ class FlatLadder7x7NNUEv1Serializer(BaseSerializer):
         return feature_map
 
     def _export_value(self, model: FlatLadder7x7NNUEv1):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-        l4_weight = model.value_linears[3].fc.weight.cpu().numpy()
-        l4_bias = model.value_linears[3].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-        ascii_hist("value: linear4_weight", l4_weight)
-        ascii_hist("value: linear4_bias", l4_bias)
-
-        assert int(l1_weight.min() * self.s_weight) >= -128
-        assert int(l1_weight.max() * self.s_weight) <= 127
-        assert int(l2_weight.min() * self.s_weight) >= -128
-        assert int(l2_weight.max() * self.s_weight) <= 127
-        assert int(l3_weight.min() * self.s_weight) >= -128
-        assert int(l3_weight.max() * self.s_weight) <= 127
-        assert int(l4_weight.min() * self.s_output) >= -128
-        assert int(l4_weight.max() * self.s_output) <= 127
-
-        if model.value_no_draw:
-            l4_weight = np.concatenate([l4_weight, np.zeros((3, 32))], axis=0)
-            l4_bias = np.concatenate([l4_bias, np.zeros((3,))], axis=0)
-        else:
-            l4_weight = np.concatenate([l4_weight, np.zeros((1, 32))], axis=0)
-            l4_bias = np.concatenate([l4_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l4_weight * self.s_output), -128, 127).astype(np.int8),
-            np.clip(np.around(l4_bias * self.s_output * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_ladder_value(model, self.s_weight, self.s_output)
 
     def serialize(self, out: io.IOBase, model: FlatLadder7x7NNUEv1, device: torch.device):
         feature_map = self._export_feature_map(model, device)
@@ -205,26 +288,10 @@ class FlatLadder7x7NNUEv2Serializer(BaseSerializer):
         raise NotImplementedError()
 
     def _index_to_chunk(self, index: int):
-        l = []
-        while True:
-            index, reminder = divmod(index, 3)
-            l.append(reminder)
-            if index == 0:
-                break
-        l = l[::-1]
-        for _ in range(10 - len(l)):
-            l.insert(0, 0)
-        return l
+        return _index_to_ladder_chunk(index)
 
     def _get_mapping_input(self, chunk: list[int]):
-        inputs = torch.zeros(2, 4, 4)
-        lower_triangle_index = [0, 4, 5, 8, 9, 10, 12, 13, 14, 15]
-        for i in range(10):
-            y = lower_triangle_index[i] // 4
-            x = lower_triangle_index[i] % 4
-            if chunk[i] > 0:
-                inputs[chunk[i] - 1][y][x] = 1
-        return inputs
+        return _make_ladder_mapping_input(chunk)
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatLadder7x7NNUEv2, device: torch.device):
@@ -246,50 +313,7 @@ class FlatLadder7x7NNUEv2Serializer(BaseSerializer):
         return mapping1, mapping2
 
     def _export_value(self, model: FlatLadder7x7NNUEv2):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-        l4_weight = model.value_linears[3].fc.weight.cpu().numpy()
-        l4_bias = model.value_linears[3].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-        ascii_hist("value: linear4_weight", l4_weight)
-        ascii_hist("value: linear4_bias", l4_bias)
-
-        assert int(l1_weight.min() * self.s_weight) >= -128
-        assert int(l1_weight.max() * self.s_weight) <= 127
-        assert int(l2_weight.min() * self.s_weight) >= -128
-        assert int(l2_weight.max() * self.s_weight) <= 127
-        assert int(l3_weight.min() * self.s_weight) >= -128
-        assert int(l3_weight.max() * self.s_weight) <= 127
-        assert int(l4_weight.min() * self.s_output) >= -128
-        assert int(l4_weight.max() * self.s_output) <= 127
-
-        if model.value_no_draw:
-            l4_weight = np.concatenate([l4_weight, np.zeros((3, 32))], axis=0)
-            l4_bias = np.concatenate([l4_bias, np.zeros((3,))], axis=0)
-        else:
-            l4_weight = np.concatenate([l4_weight, np.zeros((1, 32))], axis=0)
-            l4_bias = np.concatenate([l4_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l4_weight * self.s_output), -128, 127).astype(np.int8),
-            np.clip(np.around(l4_bias * self.s_output * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_ladder_value(model, self.s_weight, self.s_output)
 
     def serialize(self, out: io.IOBase, model: FlatLadder7x7NNUEv2, device: torch.device):
         mapping1, mapping2 = self._export_feature_map(model, device)
@@ -369,22 +393,10 @@ class FlatSquare7x7NNUEv2Serializer(BaseSerializer):
         raise NotImplementedError()
 
     def _get_mapping4x4_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
-        inputs = torch.zeros(indices.shape[0], 2, 4, 4)
-        for i in range(4 * 4):
-            bit = (indices // 3**i) % 3
-            inputs[:, 0, i // 4, i % 4] = bit == 1
-            inputs[:, 1, i // 4, i % 4] = bit == 2
-        return inputs
+        return _make_base3_mapping_input(start_idx, end_idx, 4, 4)
 
     def _get_mapping4x3_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
-        inputs = torch.zeros(indices.shape[0], 2, 4, 3)
-        for i in range(4 * 3):
-            bit = (indices // 3**i) % 3
-            inputs[:, 0, i // 3, i % 3] = bit == 1
-            inputs[:, 1, i // 3, i % 3] = bit == 2
-        return inputs
+        return _make_base3_mapping_input(start_idx, end_idx, 4, 3)
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatSquare7x7NNUEv2, device: torch.device):
@@ -424,35 +436,7 @@ class FlatSquare7x7NNUEv2Serializer(BaseSerializer):
         return mapping4x4, mapping4x3
 
     def _export_value(self, model: FlatSquare7x7NNUEv2):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-
-        if model.value_no_draw:
-            l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((3,))], axis=0)
-        else:
-            l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_input), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_input * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_square_value(model, self.s_input, self.s_weight)
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv2, device: torch.device):
         mapping4x4, mapping4x3 = self._export_feature_map(model, device)
@@ -502,6 +486,9 @@ class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
     The corresponding C-language struct layout:
     struct FlatSquare7x7NNUEv3Weight {
         // mapping features
+        // In the int8 path the two corner tables (mapping3x4[0], mapping3x4[1])
+        // are stored offset-binary as uint8 (value = int8 + 128), while the
+        // middle table (mapping3x4[2]) is plain int8.
         int8_t  mapping3x4[3][531441][FeatureDim];
 
         // nnue layers weights
@@ -531,13 +518,7 @@ class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
         raise NotImplementedError()
 
     def _get_mapping3x4_input(self, start_idx: int, end_idx: int) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32)
-        inputs = torch.zeros(indices.shape[0], 2, 3, 4)
-        for i in range(3 * 4):
-            bit = (indices // 3**i) % 3
-            inputs[:, 0, i // 4, i % 4] = bit == 1
-            inputs[:, 1, i // 4, i % 4] = bit == 2
-        return inputs
+        return _make_base3_mapping_input(start_idx, end_idx, 3, 4)
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatSquare7x7NNUEv3, device: torch.device):
@@ -578,35 +559,7 @@ class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
         return np.stack([mapping3x4_corner1, mapping3x4_corner2, mapping3x4_middle])
 
     def _export_value(self, model: FlatSquare7x7NNUEv3):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-
-        if model.value_no_draw:
-            l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((3,))], axis=0)
-        else:
-            l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_input), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_input * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_square_value(model, self.s_input, self.s_weight)
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv3, device: torch.device):
         mapping3x4 = self._export_feature_map(model, device)
@@ -627,8 +580,10 @@ class FlatSquare7x7NNUEv3Serializer(BaseSerializer):
             o.write(mapping3x4_u8.tobytes())  # (3, 531441, F//2)
         else:
             # int8_t mapping3x4[3][531441][FeatureDim];
-            o.write((mapping3x4[0] + 128).astype("<u1").tobytes())  # (531441, F)
-            o.write((mapping3x4[1] + 128).astype("<u1").tobytes())  # (531441, F)
+            # Widen before the +128 offset: NumPy 2 raises OverflowError when
+            # adding an out-of-range Python int to an int8 array.
+            o.write((mapping3x4[0].astype(np.int16) + 128).astype("<u1").tobytes())  # (531441, F)
+            o.write((mapping3x4[1].astype(np.int16) + 128).astype("<u1").tobytes())  # (531441, F)
             o.write(mapping3x4[2].astype("<i1").tobytes())  # (531441, F)
 
         # float l1_weight[64][FeatureDim * 4];
@@ -687,17 +642,14 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
         raise NotImplementedError()
 
     def _get_mapping4x4_input(self, start_idx: int, end_idx: int, device: torch.device) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32, device=device)
-        inputs = torch.zeros(
-            (indices.shape[0], 2, 4, 4),
+        return _make_base3_mapping_input(
+            start_idx,
+            end_idx,
+            4,
+            4,
             dtype=torch.float16 if self.enable_amp else torch.float32,
             device=device,
         )
-        for i in range(4 * 4):
-            bit = (indices // 3**i) % 3
-            inputs[:, 0, i // 4, i % 4] = bit == 1
-            inputs[:, 1, i // 4, i % 4] = bit == 2
-        return inputs
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatSquare7x7NNUEv4, device: torch.device):
@@ -725,35 +677,7 @@ class FlatSquare7x7NNUEv4Serializer(BaseSerializer):
         return mapping4x4
 
     def _export_value(self, model: FlatSquare7x7NNUEv4):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-
-        if model.value_no_draw:
-            l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((3,))], axis=0)
-        else:
-            l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_input), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_input * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_square_value(model, self.s_input, self.s_weight)
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv4, device: torch.device):
         mapping4x4 = self._export_feature_map(model, device)
@@ -821,17 +745,14 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
         raise NotImplementedError()
 
     def _get_mapping4x4_input(self, start_idx: int, end_idx: int, device: torch.device) -> torch.Tensor:
-        indices = torch.arange(start_idx, end_idx, dtype=torch.int32, device=device)
-        inputs = torch.zeros(
-            (indices.shape[0], 2, 4, 4),
+        return _make_base3_mapping_input(
+            start_idx,
+            end_idx,
+            4,
+            4,
             dtype=torch.float16 if self.enable_amp else torch.float32,
             device=device,
         )
-        for i in range(4 * 4):
-            bit = (indices // 3**i) % 3
-            inputs[:, 0, i // 4, i % 4] = bit == 1
-            inputs[:, 1, i // 4, i % 4] = bit == 2
-        return inputs
 
     @torch.no_grad()
     def _export_feature_map(self, model: FlatSquare7x7NNUEv4VQ, device: torch.device):
@@ -878,35 +799,7 @@ class FlatSquare7x7NNUEv4VQSerializer(BaseSerializer):
         return mapping4x4_indices, mapping4x4_features
 
     def _export_value(self, model: FlatSquare7x7NNUEv4VQ):
-        l1_weight = model.value_linears[0].fc.weight.cpu().numpy()
-        l1_bias = model.value_linears[0].fc.bias.cpu().numpy()
-        l2_weight = model.value_linears[1].fc.weight.cpu().numpy()
-        l2_bias = model.value_linears[1].fc.bias.cpu().numpy()
-        l3_weight = model.value_linears[2].fc.weight.cpu().numpy()
-        l3_bias = model.value_linears[2].fc.bias.cpu().numpy()
-
-        ascii_hist("value: linear1_weight", l1_weight)
-        ascii_hist("value: linear1_bias", l1_bias)
-        ascii_hist("value: linear2_weight", l2_weight)
-        ascii_hist("value: linear2_bias", l2_bias)
-        ascii_hist("value: linear3_weight", l3_weight)
-        ascii_hist("value: linear3_bias", l3_bias)
-
-        if model.value_no_draw:
-            l3_weight = np.concatenate([l3_weight, np.zeros((3, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((3,))], axis=0)
-        else:
-            l3_weight = np.concatenate([l3_weight, np.zeros((1, 32))], axis=0)
-            l3_bias = np.concatenate([l3_bias, np.zeros((1,))], axis=0)
-
-        return (
-            np.clip(np.around(l1_weight * self.s_input), -128, 127).astype(np.int8),
-            np.clip(np.around(l1_bias * self.s_input * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l2_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l2_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-            np.clip(np.around(l3_weight * self.s_weight), -128, 127).astype(np.int8),
-            np.clip(np.around(l3_bias * self.s_weight * 128), -(2**31), 2**31 - 1).astype(np.int32),
-        )
+        return _export_square_value(model, self.s_input, self.s_weight)
 
     def serialize(self, out: io.IOBase, model: FlatSquare7x7NNUEv4VQ, device: torch.device):
         mapping4x4_indices, mapping4x4_features = self._export_feature_map(model, device)
