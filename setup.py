@@ -16,6 +16,10 @@ setup(
                 "dataset/pipeline/forbidden_point_cpp/board.cpp",
             ],
         ),
+        Pybind11Extension(
+            "dataset_planner_cpp",
+            sources=["dataset/planner_cpp/packed_shuffle.cpp"],
+        ),
     ],
     cmdclass={"build_ext": build_ext},
 )
