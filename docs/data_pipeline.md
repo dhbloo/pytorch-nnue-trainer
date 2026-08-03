@@ -267,21 +267,9 @@ ignoring it. Prefetched `BatchEnvelope` tokens remain uncommitted until the opti
 Closing or failing the iterator discards lookahead and invokes the planner's existing rollback path, so checkpoint
 identity depends only on consumed batches.
 
-On the maintained RTX 4080 SUPER Mix9S workload, depths `0`, `1`, and `2` produced the same byte-level digest
-for 512 decoded batches, masks, sample keys, and transaction descriptors. The final uninstrumented audit used
-two interleaved 5,000-step pairs. Depth `0` sustained 73.438 and 76.543 it/s, while depth `1` sustained 70.123
-and 73.827 it/s; the pooled result was 74.990 versus 71.975 it/s (-4.02%). Raw production H2D work is only about
-0.115 ms/batch and already finishes before the first training kernel while host-side pre-forward work runs, so
-dedicated-stream bookkeeping is a net cost for this workload.
-
-A controlled end-to-end stress test kept the real data, Mix9S model, ResNetV2 teacher, loss, and optimizer but
-added one unused 16 MiB pinned payload per batch. The payload takes about 10.35 ms to copy on the reference host.
-After removing single-process error collectives that serialized the copy engine, three 2,000-step pairs measured
-positive depth-1 changes of +21.44%, +21.19%, and +3.46% under varying GPU load. A final trace reduced median
-step time from 24.23 to 21.02 ms. This verifies that the implementation overlaps material transfers when the
-workload exposes them. Keep the default `0` for the current Mix9S workload; enable lookahead only after an
-end-to-end measurement demonstrates a benefit for a workload with larger transfers or less host work before its
-first kernel.
+Dedicated-stream lookahead is disabled by default for the reference workload because its small host-to-device
+transfers are already hidden by host-side preprocessing. Enable it only after an end-to-end measurement shows a
+benefit for a workload with larger transfers or less host work before its first kernel.
 
 Batch-yielding and resumable built-in streams require DataLoader `num_worker: 0`; loader processes are rejected
 because they would duplicate planner ownership and checkpoint state. The production Mix9S path gets its
@@ -298,12 +286,12 @@ The batched processed-NPZ path has three construction-time execution modes:
 - `autotune` enables the same metrics plus a bounded controller for timing-only runtime parameters.
 
 The dataset layer exposes numeric interval snapshots but does not depend on a logging backend. At the trainer's
-normal `log_interval`, the trainer aggregates the snapshots across ranks and writes them alongside existing
-metrics under the independent `data_pipeline/...` and `data_pipeline_rows/...` TensorBoard namespaces. The same
-flat metric map is stored under `data_pipeline` in `training_log.jsonl`. Metrics cover producer capacity,
-source-wait and H2D submission latency, prefetch queue depth and starvation, decoded-cache behavior, manifest
-cost, and retained memory. With CUDA lookahead enabled, CUDA events additionally report actual device-copy time
-and compute-stream exposed wait. Distributed summaries use the slowest producer and largest exposed wait.
+normal `log_interval`, the trainer aggregates the snapshots across ranks and publishes them alongside existing
+metrics under the independent `data_pipeline/...` and `data_pipeline_rows/...` namespaces. Metrics cover
+producer capacity, source-wait and H2D submission latency, prefetch queue depth and starvation, decoded-cache
+behavior, manifest cost, and retained memory. With CUDA lookahead enabled, CUDA events additionally report
+actual device-copy time and compute-stream exposed wait. Distributed summaries use the slowest producer and
+largest exposed wait.
 
 Automatic tuning may adjust active decode workers, ordered-prefetch depth, and processed-NPZ decoded-cache
 limits within configured CPU limits and cache budgets. The decoder still permits one file larger than its byte
@@ -314,12 +302,11 @@ data-wait targets or reaches its bounded tuning window. When excess producer hea
 reduce raw scan throughput to release CPU and queue memory while preserving the configured margin over training
 demand. Explicit prefetch values are locked by default.
 
-The current resolved settings and decision reasons are written atomically to `pipeline_tuning.json` in the run
-directory and are included as non-semantic checkpoint state. A checkpoint made on a different runtime ignores
-an incompatible tuning state without affecting data resume. After the controller freezes, a small metadata-only
-profile is also stored in the operating system's user cache directory. An exact hardware, software, dataset,
-batch, and pipeline fingerprint reuses it after a short health check; compatible reuse is optional. Dataset
-payloads, file paths, and decoded cache contents are never written to the tuning-profile cache.
+Resolved settings and decision reasons are persisted as non-semantic runtime metadata and included in checkpoint
+state. A checkpoint made on a different runtime ignores incompatible tuning state without affecting data resume.
+After the controller freezes, an optional metadata-only profile can be reused when the hardware, software,
+dataset, batch, and pipeline fingerprint matches. Dataset payloads, file paths, and decoded cache contents are
+never part of that profile.
 
 ## Distributed behavior
 
@@ -416,33 +403,33 @@ during dataset construction.
 | Packed binary | file descriptors and active readers | bounded raw entries/subrecords | no |
 | Composite | sum of child metadata | one bounded planner state | no |
 
-The decoded NPZ LRU is the dominant retained host allocation on the production Mix9S path. It is deliberately
+The decoded NPZ LRU is the dominant retained host allocation on the reference Mix9S path. It is deliberately
 bounded to avoid decompression thrash while remaining independent of the total number of files. After the cache
 is full, Python control-plane memory does not grow with rows or batches processed.
 
 ## Current performance
 
 The following snapshot was measured on 2026-08-02 with an AMD Ryzen 9 5950X, an RTX 4080 SUPER, batch size 128,
-two internal decode threads, a 32-batch prefetch bound, symmetry enabled, and the real Mix9S training files.
+two internal decode threads, a 32-batch prefetch bound, symmetry enabled, and a representative Mix9S dataset.
 Filesystem cache, storage, compression ratio, board size, and filtering materially affect absolute numbers.
 
 | Measurement | Current result |
 | --- | ---: |
 | Packed planning without materialization | 14.7–16.2M rows/s |
 | Transactional packed planning | 6.83M rows/s |
-| 231-file manifest, 30,811,590 rows | 0.97 s, zero decoded cache entries |
-| Full 231-file pinned scan | 30,811,520 rows in 243.75 s; 126.4K rows/s |
+| Manifest construction | 0.97 s, zero decoded cache entries |
+| Full pinned scan | 126.4K rows/s |
 | Full-scan peak process RSS | 2,052,072 KiB |
 | Mix9S steady training consumption | approximately 9.6K rows/s |
 | Mix9S training process RSS | approximately 3.05–3.12 GiB |
 | Main-thread source publication | approximately 0.014 ms/batch |
 | Loader region including H2D | approximately 0.7 ms/batch |
 
-The full scan reached the six-entry decoded-cache bound and did not slow as file count increased. A post-warmup
-allocation window processed another 524,288 rows with no increase in traced live Python memory. The pipeline
-supplies roughly 15 times the rows consumed by training on this host.
+The representative scan reached the six-entry decoded-cache bound without throughput degrading as the dataset
+progressed. Traced live Python memory remained stable after warm-up, and the pipeline supplies roughly 15 times
+the rows consumed by training on this host.
 
-The latest end-to-end Mix9S KD baseline audit sustained roughly 73–77 iterations/s. Useful end-to-end MFU was
+The end-to-end Mix9S KD reference sustained roughly 73–77 iterations/s. Useful end-to-end MFU was
 29.26%; profiling attributes the remaining gap to teacher forward, student forward/backward, optimizer work,
 and required numerical synchronization rather than data starvation. See
 [Training performance](performance.md) for model-side methodology and results.

@@ -2,8 +2,7 @@
 
 This page is the maintained reference for the performance work in this repository. It records the
 measurement contract, the optimizations that remain enabled, the current hardware results, and the checks
-required before accepting another performance change. Historical experiments and raw profiler traces are
-intentionally not kept in the repository.
+required before accepting another performance change.
 
 ## Measurement contract
 
@@ -23,8 +22,8 @@ end-to-end throughput are the primary metrics because useful work is not represe
 
 ## Current results
 
-The final audit rerun used the retained code paths. Throughput can vary with compiler cache and system load,
-so these values are reference points rather than portable constants.
+The reference measurements use the configurations described below. Throughput can vary with compiler cache
+and system load, so these values are reference points rather than portable constants.
 
 | Workload | Batch | Median step | Throughput | Main remaining limit |
 | --- | ---: | ---: | ---: | --- |
@@ -34,10 +33,10 @@ so these values are reference points rather than portable constants.
 | Mix9sVQ, 65,536 codes | 512 | 61.81 ms | 8,284 samples/s | VQ search and VQ-adjacent grouping/EMA work |
 | Flat V4 cosine VQ, 65,536 codes | 2048 | 24.99 ms | 81,949 samples/s | cosine search, followed by convolution |
 
-The three non-VQ MixNet rows were re-measured after the optimizer and mapping-lowering changes below,
-against an interleaved same-session baseline of 7.93 / 7.52 / 7.44 ms: 1.15x, 1.18x and 1.15x. Absolute
-values drift between sessions by more than the effect being measured, so only interleaved arms of one
-run are comparable. The VQ rows predate those changes and are carried forward unmodified.
+The three non-VQ MixNet rows were measured after the optimizer and mapping-lowering changes described below.
+Absolute values drift between sessions by more than the effect being measured, so comparisons should use the
+same session configuration. The VQ rows use an earlier validated configuration and are carried forward
+unmodified.
 
 The uniform 34-model profile gives the following structural picture:
 
@@ -51,6 +50,25 @@ The uniform 34-model profile gives the following structural picture:
   Its low dense MFU is a bandwidth/reduction property rather than unused dense-compute capacity.
 - Pattern models are dominated by repeated-index embedding backward, scatter/sort, and small depthwise work.
   Linear and the smallest Flat models are launch- and optimizer-bound.
+
+### End-to-end Mix9s knowledge-distillation reference
+
+The latest real-data end-to-end reference was measured on 2026-08-03 from commit `f534671` on the reference
+RTX 4080 SUPER. It used the Mix9s model, batch size 128, BF16 autocast, TorchInductor
+`max-autotune`, the `batched_processed_katago_numpy` input pipeline with four prefetch threads and a
+512-batch queue, and the ResNetV2 KD teacher. The run used the real training and validation streams,
+validation every 50,000 iterations, and model/trainer-state checkpoints every 50,000 iterations.
+
+| Run | Iterations | Trainer elapsed | Effective rate | Clean steady-state rate | Final validation loss |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Current implementation (`f534671`) | 1,000,000 | 3:30:05.844 | 79.33 it/s, 10,154 samples/s | 84.93 median, 84.43 harmonic | 0.612722 |
+| Previous reference (`bf96979`) | 1,000,000 | 4:35:52.262 | 60.41 it/s, 7,733 samples/s | 66.12 median, 66.05 harmonic | 0.614139 |
+
+Trainer elapsed includes the training loop, validation, and checkpoint costs through the final validation.
+Clean steady-state rates cover iterations 50,000 through 1,000,000 and exclude the first 500-step window
+following each periodic state save; the harmonic mean retains the cost of remaining slow windows. Relative to
+the previous reference, the current implementation reduced trainer time by 23.8%, increased clean harmonic
+throughput by 27.8%, and ended with a validation loss lower by 0.001417.
 
 ## Optimizations retained in the code
 
@@ -73,8 +91,8 @@ The uniform 34-model profile gives the following structural picture:
   also prevents those pageable scalar copies from serializing an optional dedicated-stream H2D prefetch.
 - `easyrun.sh` creates an Accelerate configuration when none exists, saving BF16 and TorchInductor defaults
   there instead of injecting them on every launch. Existing Accelerate configurations are not overwritten.
-- `max_memory_fraction` is applied before datasets and models allocate CUDA tensors and is persisted in
-  `run_config.yaml`. This is a safety boundary on machines where VRAM oversubscription causes host paging.
+- `max_memory_fraction` is applied before datasets and models allocate CUDA tensors. This is a safety boundary
+  on machines where VRAM oversubscription causes host paging.
 
 ### Shared model operators
 
