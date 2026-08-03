@@ -28,11 +28,16 @@ so these values are reference points rather than portable constants.
 
 | Workload | Batch | Median step | Throughput | Main remaining limit |
 | --- | ---: | ---: | ---: | --- |
-| Mix9 | 128 | 8.12 ms | 15,761 samples/s | balanced convolution, quantization/reduction, and GEMM |
-| Mix9s | 128 | 7.96 ms | 16,075 samples/s | balanced convolution, quantization/reduction, and GEMM |
-| Mix10 | 128 | 8.32 ms | 15,392 samples/s | balanced convolution, quantization/reduction, and GEMM |
+| Mix9 | 128 | 6.39 ms | 20,018 samples/s | balanced convolution, quantization/reduction, and GEMM |
+| Mix9s | 128 | 6.89 ms | 18,576 samples/s | balanced convolution, quantization/reduction, and GEMM |
+| Mix10 | 128 | 6.49 ms | 19,728 samples/s | balanced convolution, quantization/reduction, and GEMM |
 | Mix9sVQ, 65,536 codes | 512 | 61.81 ms | 8,284 samples/s | VQ search and VQ-adjacent grouping/EMA work |
 | Flat V4 cosine VQ, 65,536 codes | 2048 | 24.99 ms | 81,949 samples/s | cosine search, followed by convolution |
+
+The three non-VQ MixNet rows were re-measured after the optimizer and mapping-lowering changes below,
+against an interleaved same-session baseline of 7.93 / 7.52 / 7.44 ms: 1.15x, 1.18x and 1.15x. Absolute
+values drift between sessions by more than the effect being measured, so only interleaved arms of one
+run are comparable. The VQ rows predate those changes and are carried forward unmodified.
 
 The uniform 34-model profile gives the following structural picture:
 
@@ -53,10 +58,19 @@ The uniform 34-model profile gives the following structural picture:
 
 - The trainer compiles the forward-and-loss region while keeping unsupported control flow outside the graph.
   Model-scoped Inductor options can refine lowering without changing unrelated models.
-- CUDA training selects fused AdamW where supported. Muon accepts non-contiguous convolution gradients,
-  batches same-shape updates, and updates persistent momentum buffers in place.
+- CUDA AdamW runs as one Triton launch over each parameter group (`utils/fused_adamw.py`). PyTorch's
+  `fused=True` kernel passes its hyperparameters as `double` and recomputes `pow(beta, step)` in double
+  precision per thread; sm_89 runs FP64 at 1/64 rate, and its 36-tensor launch cap means every small bias
+  tensor pays that cost too, so the optimizer was a fixed 0.479 ms on every model here regardless of size.
+  Evaluating the bias correction once on the host removes all FP64 from the GPU: 512.5 -> 12.0 us of
+  CUDA-graph replay time over the Mix9s parameter set. State stays per-parameter, so `state_dict` remains
+  interchangeable with `torch.optim.AdamW` in both directions. Muon accepts non-contiguous convolution
+  gradients, batches same-shape updates, and updates persistent momentum buffers in place.
 - KataGo input can be decoded and collated as complete batches, with bounded producer concurrency and
   asynchronous device preparation. The loader explicitly marks batch ownership to avoid double batching.
+- Single-process training handles rank-local phase errors on the CPU and performs one combined CUDA finite-value
+  check after backward. It does not construct and synchronously copy six success flags to CUDA every step. This
+  also prevents those pageable scalar copies from serializing an optional dedicated-stream H2D prefetch.
 - `easyrun.sh` creates an Accelerate configuration when none exists, saving BF16 and TorchInductor defaults
   there instead of injecting them on every launch. Existing Accelerate configurations are not overwritten.
 - `max_memory_fraction` is applied before datasets and models allocate CUDA tensors and is persisted in
@@ -71,13 +85,19 @@ The uniform 34-model profile gives the following structural picture:
 - MixNet reuses batched directional operations, GEMM-based diagonal three-tap mappings, optimized mixed-dtype
   pixelwise depthwise gradients, and model-scoped 1x1-to-GEMM lowering for Mix9, Mix9s, and Mix10. The VQ
   subclass intentionally keeps normal convolution lowering because the GEMM hint regressed its full graph.
+- The mapping trunk's pointwise stages are expressed as matmuls rather than 1x1 convolutions. Their previous
+  lowering to `aten.convolution_backward` was an Inductor fallback with `constrain_to_fx_strides`, which
+  denied the backward a Triton epilogue and pinned its neighbours' strides. As matmuls, 14 of the 22 SiLU
+  backwards fuse into the dgrad template and the bias gradient becomes a freely scheduled sum
+  (258.4 -> 71.8 us). SiLU was already at the memory roofline, so removing the round trip was the only
+  available lever. Parameter shapes, `state_dict` keys and the exported layout are unchanged.
 - Small, heavily reused pattern tables keep native grouped embedding backward opaque to Inductor. PatNet v2
   retains channels-last embedding output for its depthwise stages. Large embedding tables do not use this
   boundary.
 
 ### Vector quantization
 
-- Supported L2 and cosine searches use FP16 Tensor Core coarse candidates followed by FP32 refinement and
+- Supported L2 and cosine searches use BF16 Tensor Core coarse candidates followed by FP32 refinement and
   deterministic tie handling. Specialized 32/64/96/128-dimensional paths cover measured 16,384- and
   65,536-code workloads; unsupported devices, layouts, shapes, or sizes fall back to KeOps.
 - Single-rank EMA updates avoid a codebook-sized temporary. Cosine EMA normalization, perplexity reduction,
@@ -127,6 +147,8 @@ python -m tools.profile_model \
 Capture and replay behavior around a change:
 
 ```bash
+python -m tools.check_optimizer_equivalence
+
 python -m tools.check_model_equivalence snapshot /tmp/mix9s-reference.pt \
   --model-type mix9s --batch-size 2 --board-size 15
 python -m tools.check_model_equivalence compare /tmp/mix9s-reference.pt
