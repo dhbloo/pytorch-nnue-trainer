@@ -1,3 +1,4 @@
+import torch
 from torch import Tensor
 from torch.optim import Optimizer
 from torch.optim.optimizer import ParamsT
@@ -46,13 +47,17 @@ class ChainedOptimizer(Optimizer):
             indices = param_group["optimizer_and_param_group_indices"] = set()
             for param in params:
                 assert isinstance(param, Tensor), f"Expected a Tensor, got {type(param)}"
+                found_optimizer = False
                 for index, spec in enumerate(optimizer_specs):
                     if spec.param_filter is None or spec.param_filter(param):
                         if self.optimizer_selection_callback is not None:
                             self.optimizer_selection_callback(param, index)
                         params_for_optimizers[index].append(param)
                         indices.add((index, 0))
+                        found_optimizer = True
                         break
+                if not found_optimizer:
+                    raise ValueError("No valid optimizer found for the given parameter group")
 
         # Initialize the optimizers
         for spec, selected_params in zip(optimizer_specs, params_for_optimizers):
@@ -69,6 +74,7 @@ class ChainedOptimizer(Optimizer):
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
+        state_dict = dict(state_dict)  # do not mutate the caller's dict
         optimizers = state_dict.pop("optimizers")
         super().load_state_dict(state_dict)
         for i in range(len(self.optimizers)):
@@ -84,10 +90,18 @@ class ChainedOptimizer(Optimizer):
             for optimizer_idx, param_group_idx in indices:
                 self.optimizers[optimizer_idx].param_groups[param_group_idx]["lr"] = param_group["lr"]
 
-    def step(self, closure=None) -> None:
+    def step(self, closure=None) -> Tensor | None:
+        # Evaluate the closure once: forwarding it to every sub-optimizer would
+        # re-run forward/backward per optimizer, accumulating fresh gradients
+        # onto ones earlier optimizers already consumed.
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
         self._copy_lr_to_optimizers()
         for opt in self.optimizers:
-            opt.step(closure)
+            opt.step()
+        return loss
 
     def add_param_group(self, param_group: dict[str, Any]) -> None:
         super().add_param_group(param_group)

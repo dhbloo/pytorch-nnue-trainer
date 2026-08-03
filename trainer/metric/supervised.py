@@ -6,7 +6,11 @@ at the end of evaluation (in ``BaseTrainer.test``) to avoid per-batch GPU syncs.
 
 import torch
 
-from trainer.loss.supervised import compute_supervised_losses
+from dataset.core import Maximum, SumCount
+from trainer.loss.supervised import (
+    compute_supervised_losses,
+    compute_supervised_loss_statistics,
+)
 from trainer.loss.utils import convert_value_target, prepare_policy
 
 
@@ -84,11 +88,69 @@ def compute_supervised_metrics(data, results, do_cross_eval=False):
     Returns a dict of 0-dim tensors with CE losses, bestmove/top-k accuracy,
     value accuracy/MSE, draw metrics, and optional cross-eval errors.
     """
+    if "is_real" in data:
+        mask = data["is_real"].bool()
+        if mask.ndim != 1:
+            raise ValueError(f"is_real must have shape (B,), got {tuple(mask.shape)}")
+        if not torch.any(mask):
+            if len(mask) == 0:
+                raise ValueError("masked evaluation batch must contain padded rows")
+
+            def first_row(value):
+                if (
+                    isinstance(value, torch.Tensor)
+                    and value.ndim > 0
+                    and value.shape[0] == len(mask)
+                ):
+                    return value[:1]
+                if isinstance(value, dict):
+                    return {key: first_row(item) for key, item in value.items()}
+                if isinstance(value, tuple):
+                    return tuple(first_row(item) for item in value)
+                if isinstance(value, list):
+                    return [first_row(item) for item in value]
+                return value
+
+            probe_data = {
+                key: first_row(value)
+                for key, value in data.items()
+                if key != "is_real"
+            }
+            probe_metrics = compute_supervised_metrics(
+                probe_data,
+                first_row(results),
+                do_cross_eval=do_cross_eval,
+            )
+            zero = results["value"].sum() * 0
+            return {name: zero.to(value.dtype) for name, value in probe_metrics.items()}
+        batch_size = len(mask)
+        data = {
+            key: (
+                value[mask]
+                if isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] == batch_size
+                else value
+            )
+            for key, value in data.items()
+            if key != "is_real"
+        }
+        results = {
+            key: (
+                value[mask]
+                if isinstance(value, torch.Tensor)
+                and value.ndim > 0
+                and value.shape[0] == batch_size
+                else value
+            )
+            for key, value in results.items()
+        }
+
     value, policy = results["value"], results["policy"]
     value_target = data["value_target"]
     policy_target = data["policy_target"]
 
-    policy, policy_target = prepare_policy(policy, policy_target)
+    policy, policy_target = prepare_policy(policy, policy_target, mask=results.get("board_mask"))
     value, value_target = convert_value_target(value, value_target)
 
     metrics = _ce_loss_metrics(data, results)
@@ -100,4 +162,134 @@ def compute_supervised_metrics(data, results, do_cross_eval=False):
     if do_cross_eval:
         metrics.update(_cross_eval_metrics(value, value_target))
 
+    return metrics
+
+
+def compute_supervised_metric_statistics(data, results, do_cross_eval=False):
+    """Compute exact typed test statistics without guessing scalar denominators."""
+    value = results["value"]
+    if "is_real" in data:
+        mask = data["is_real"].to(device=value.device, dtype=torch.bool)
+        if mask.ndim != 1 or len(mask) != len(value):
+            raise ValueError("is_real must contain one flag per evaluation row")
+    else:
+        mask = torch.ones(len(value), dtype=torch.bool, device=value.device)
+    batch_size = len(mask)
+
+    def select(item):
+        if (
+            isinstance(item, torch.Tensor)
+            and item.ndim > 0
+            and item.shape[0] == batch_size
+        ):
+            return item[mask]
+        return item
+
+    selected_data = {
+        key: select(item) for key, item in data.items() if key != "is_real"
+    }
+    selected_results = {
+        key: select(item)
+        for key, item in results.items()
+        if key not in {"aux_losses", "aux_outputs"}
+    }
+    value = selected_results["value"]
+    policy = selected_results["policy"]
+    value_target = selected_data["value_target"]
+    policy_target = selected_data["policy_target"]
+    policy, policy_target = prepare_policy(
+        policy, policy_target, mask=selected_results.get("board_mask")
+    )
+    value, value_target = convert_value_target(value, value_target)
+
+    ce_stats, _ = compute_supervised_loss_statistics("CE+CE", data, results)
+    metrics = {f"lossCE_{key}": stat for key, stat in ce_stats.items()}
+
+    bestmove_eq = torch.argmax(policy, dim=1) == torch.argmax(
+        policy_target, dim=1
+    )
+    metrics["bestmove_acc"] = SumCount(
+        "global_batch", bestmove_eq.float().sum(), int(len(bestmove_eq))
+    )
+    for k in (2, 3):
+        _, predicted = torch.topk(policy, dim=1, k=k, sorted=False)
+        _, target = torch.topk(policy_target, dim=1, k=k, sorted=False)
+        overlap = (
+            (predicted.unsqueeze(2) == target.unsqueeze(1))
+            .any(dim=2)
+            .sum()
+        )
+        metrics[f"top{k}move_acc"] = SumCount(
+            "global_batch", overlap.float(), int(k * len(policy))
+        )
+
+    if value.ndim == 1:
+        probability = torch.sigmoid(value)
+        winrate_correct = (
+            (probability - 0.5) * (value_target - 0.5) >= 0
+        )
+        winrate_error = (probability - value_target).square()
+    else:
+        probability = torch.softmax(value, dim=1)
+        winrate_correct = (probability[:, 0] >= probability[:, 1]) == (
+            value_target[:, 0] >= value_target[:, 1]
+        )
+        winrate = (probability[:, 0] - probability[:, 1] + 1) / 2
+        target_winrate = (
+            value_target[:, 0] - value_target[:, 1] + 1
+        ) / 2
+        winrate_error = (winrate - target_winrate).square()
+        drawrate_correct = torch.argmax(probability, dim=1) == 2
+        drawrate_correct_target = torch.argmax(value_target, dim=1) == 2
+        drawrate_error = (
+            probability[:, 2] - value_target[:, 2]
+        ).square()
+        metrics["drawrate_acc"] = SumCount(
+            "global_batch",
+            (drawrate_correct == drawrate_correct_target).float().sum(),
+            int(len(probability)),
+        )
+        metrics["drawrate_mse"] = SumCount(
+            "global_batch", drawrate_error.sum(), int(len(probability))
+        )
+    metrics["winrate_acc"] = SumCount(
+        "global_batch", winrate_correct.float().sum(), int(len(probability))
+    )
+    metrics["winrate_mse"] = SumCount(
+        "global_batch", winrate_error.sum(), int(len(probability))
+    )
+
+    if do_cross_eval:
+        abs_error = torch.abs(probability - value_target)
+        relative_error = abs_error / (torch.abs(probability) + 1e-4)
+        metrics.update(
+            {
+                "value_abserr_mean": SumCount(
+                    "global_batch", abs_error.sum(), int(abs_error.numel())
+                ),
+                "value_abserr_max": Maximum(
+                    "evaluation",
+                    (
+                        abs_error.max()
+                        if abs_error.numel()
+                        else probability.new_tensor(-torch.inf)
+                    ),
+                    int(abs_error.numel()),
+                ),
+                "value_relerr_mean": SumCount(
+                    "global_batch",
+                    relative_error.sum(),
+                    int(relative_error.numel()),
+                ),
+                "value_relerr_max": Maximum(
+                    "evaluation",
+                    (
+                        relative_error.max()
+                        if relative_error.numel()
+                        else probability.new_tensor(-torch.inf)
+                    ),
+                    int(relative_error.numel()),
+                ),
+            }
+        )
     return metrics

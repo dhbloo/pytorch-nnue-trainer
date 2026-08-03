@@ -1,10 +1,39 @@
 from accelerate import PartialState
+from importlib.metadata import version
 import configargparse
 import yaml
 import os
+import subprocess
+import torch
 
 from utils.file_utils import make_dir
+from utils.config_utils import parse_run_provenance
 from trainer import build_trainer
+
+
+def collect_run_provenance():
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        repo_root, git_commit = result.stdout.splitlines()
+        if os.path.realpath(repo_root) != os.path.realpath(
+            os.path.dirname(os.path.abspath(__file__))
+        ):
+            git_commit = None
+    except (OSError, subprocess.CalledProcessError, ValueError):
+        git_commit = None
+
+    return {
+        "git_commit": git_commit,
+        "torch_version": str(torch.__version__),
+        "cuda_version": torch.version.cuda,
+        "accelerate_version": version("accelerate"),
+    }
 
 
 def parse_args_and_init():
@@ -12,6 +41,12 @@ def parse_args_and_init():
         description="Trainer", config_file_parser_class=configargparse.YAMLConfigFileParser
     )
     parser.add("-c", "--config", is_config_file=True, help="Config file path")
+    parser.add(
+        "--_provenance",
+        type=parse_run_provenance,
+        default=None,
+        help=configargparse.SUPPRESS,
+    )
     parser.add("-d", "--train_datas", nargs="+", help="Training dataset file or directory paths")
     parser.add("-v", "--val_datas", nargs="+", help="Validation dataset file or directory paths")
     parser.add("-r", "--rundir", required=True, help="Run directory")
@@ -26,7 +61,13 @@ def parse_args_and_init():
     )
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
-    parser.add("--num_worker", type=int, default=4, help="Num of dataloader workers")
+    parser.add("--num_worker", type=int, default=0, help="Num of dataloader workers")
+    parser.add(
+        "--cuda_prefetch_batches",
+        type=int,
+        default=0,
+        help="CUDA batches to prefetch on a dedicated stream (0 disables, max 4)",
+    )
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
     parser.add("--optim_type", default="adamw", help="Optimizer type")
@@ -111,9 +152,8 @@ def parse_args_and_init():
     parser.add("--profile_active_iters", type=int, default=30, help="Num iterations to profile")
     parser.add("--profile_warmup_iters", type=int, default=10, help="Warmup iterations before profiling")
     parser.add("--profile_memory", action="store_true", help="Enable memory profiling")
-    parser.add("--profile_finish_exit", action="store_true", help="Exit after profiling is finished")
 
-    args, _ = parser.parse_known_args()  # parse args
+    args = parser.parse_args()
 
     if PartialState(cpu=args.use_cpu).is_main_process:
         parser.print_values()  # print argument values
@@ -121,19 +161,26 @@ def parse_args_and_init():
         # write run config
         run_cfg_filename = os.path.join(args.rundir, "run_config.yaml")
         if args.config is None or os.path.abspath(args.config) != os.path.abspath(run_cfg_filename):
+            args._provenance = collect_run_provenance()
             parser.write_config_file(args, [run_cfg_filename])
+            with open(run_cfg_filename, encoding="utf-8") as f:
+                run_config = yaml.safe_load(f)
+            run_config["_provenance"] = args._provenance
+            with open(run_cfg_filename, "w", encoding="utf-8") as f:
+                yaml.safe_dump(run_config, f, sort_keys=False)
         print("-" * 60)
 
     return args
 
 
 def train(**kwargs):
+    kwargs.pop("config", None)
+    kwargs.pop("_provenance", None)
     # Pop profile-related keys before constructing trainer
     do_profile = kwargs.pop("profile", False)
     profile_active_iters = kwargs.pop("profile_active_iters", 30)
     profile_warmup_iters = kwargs.pop("profile_warmup_iters", 10)
     profile_memory = kwargs.pop("profile_memory", False)
-    kwargs.pop("profile_finish_exit", None)
 
     trainer_type = kwargs.pop("trainer_type", "supervised")
     trainer = build_trainer(trainer_type, **kwargs)

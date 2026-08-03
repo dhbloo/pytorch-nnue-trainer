@@ -12,7 +12,7 @@ def seed_everything(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
 
 
 def set_performance_level(level: int):
@@ -63,11 +63,11 @@ def deep_update_dict(base_dict: dict, new_dict: dict):
     """
     def recursive_update(dict1: dict, dict2: dict, key_prefix: str = ""):
         for key, value in dict2.items():
-            if isinstance(value, dict) and key in base_dict:
+            if isinstance(value, dict) and key in dict1:
                 full_key = key_prefix + "." + key if key_prefix else key
-                if not isinstance(base_dict[key], dict):
+                if not isinstance(dict1[key], dict):
                     raise TypeError(f"Key {full_key} in base_dict is not a dict.")
-                dict1[key] = recursive_update(base_dict[key], value, full_key)
+                recursive_update(dict1[key], value, full_key)
             else:
                 dict1[key] = value
 

@@ -6,8 +6,10 @@ rundir: run_dirs/mix9/basicns128m64f32p64v32d-f15_20
 
 # Dataset configs
 
-# We will use "multi" dataset type to load multiple datasets (possibly with different sub-dataset types)
-dataset_type: multi
+# We will use "iterative_multi" dataset type to load multiple datasets (possibly with
+# different sub-dataset types). All sub-datasets must be iterative (IterableDataset)
+# types; "multi" is the map-style counterpart and accepts random-access sub-datasets only.
+dataset_type: iterative_multi
 
 dataset_args:
   # The dataset_dict is a list of configs for sub-datasets, each item's key is the 
@@ -16,7 +18,7 @@ dataset_args:
   # and a processed katago dataset for freestyle 20 in data/f20, you can write:
   dataset_dict:
     f15:
-      dataset_type: katago_numpy
+      dataset_type: iterative_katago_numpy
       data_paths:
       - data/gomoku/f15
       sample_rate: 1.0

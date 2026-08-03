@@ -8,8 +8,11 @@ from model import build_model
 from utils.file_utils import load_torch_ckpt
 from utils.misc_utils import deep_update_dict
 from trainer.base import BaseTrainer
-from trainer.loss.supervised import compute_supervised_losses
-from trainer.metric.supervised import compute_supervised_metrics
+from trainer.loss.supervised import (
+    compute_supervised_losses,
+    compute_supervised_loss_statistics,
+)
+from trainer.metric.supervised import compute_supervised_metric_statistics
 
 
 class SupervisedTrainer(BaseTrainer):
@@ -157,7 +160,7 @@ class SupervisedTrainer(BaseTrainer):
                 kd_results = self.kd_model(data)
         with self.accelerator.autocast():
             results = self.model(data)
-            _, loss_dict, aux_dict = compute_supervised_losses(
+            loss_dict, aux_dict = compute_supervised_loss_statistics(
                 self.loss_type, data, results, kd_results, **self._loss_kwargs
             )
         return loss_dict, aux_dict
@@ -166,4 +169,4 @@ class SupervisedTrainer(BaseTrainer):
         """Compute supervised metrics for one test batch."""
         with self.accelerator.autocast():
             results = self.model(data)
-        return compute_supervised_metrics(data, results, **kwargs)
+        return compute_supervised_metric_statistics(data, results, **kwargs)

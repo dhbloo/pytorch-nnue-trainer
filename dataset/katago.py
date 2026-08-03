@@ -1,8 +1,69 @@
 import numpy as np
 import torch
-from torch.utils.data.dataset import Dataset, IterableDataset
+import hashlib
+import time
+from concurrent.futures import ThreadPoolExecutor
+from torch.utils.data.dataset import Dataset
+from torch.utils.data import get_worker_info
 from utils.data_utils import *
 from . import DATASETS
+from .decoder import NpzRowRecordDecoder, ProcessedNpzDecoder
+from .core import PipelineStateComposer, uniform_below
+from .npz_source import DenseNpzSource, IndexedNpzSource
+from .planner import DatasetPlanner, PlannerConfig
+from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .stream import (
+    MapRecordRef,
+    reject_duplicate_physical_files,
+)
+
+
+def _dataset_content_digest(file_list):
+    digest = hashlib.sha256()
+    digest.update(b"NNUE-map-dataset-v1\0")
+    for filename in file_list:
+        file_digest = hashlib.sha256()
+        with open(filename, "rb") as stream:
+            while True:
+                chunk = stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_digest.update(chunk)
+        digest.update(file_digest.digest())
+    return digest.digest()
+
+
+def _map_symmetry_index(dataset, index, board_size):
+    if not dataset.apply_symmetry:
+        return None
+    symmetry_type = (
+        "default" if dataset.apply_symmetry is True else dataset.apply_symmetry
+    )
+    symmetries = Symmetry.available_symmetries(board_size, symmetry_type)
+    context = getattr(dataset, "runtime_context", None)
+    worker = get_worker_info()
+    rank = 0 if context is None else context.rank_local_identity.rank
+    worker_id = 0 if worker is None else worker.id
+    root_seed = 0 if context is None else context.seed
+    sample_key = (
+        "map-row",
+        dataset._sample_root_digest,
+        type(dataset).__name__,
+        (int(index),),
+    )
+    picked, _ = uniform_below(
+        len(symmetries),
+        root_seed,
+        "map_symmetry",
+        (
+            int(getattr(dataset, "_active_epoch", 0)),
+            sample_key,
+            rank,
+            worker_id,
+            0,
+        ),
+    )
+    return picked
 
 
 @DATASETS.register("katago_numpy")
@@ -13,6 +74,7 @@ class KatagoNumpyDataset(Dataset):
         self,
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
         fixed_side_input: bool = False,
         fixed_board_size: None | tuple[int, int] = None,
         has_pass_move: bool = False,
@@ -20,10 +82,7 @@ class KatagoNumpyDataset(Dataset):
         filter_stm: int | None = None,
         filter_condition: str | None = None,
         shuffle: bool = False,
-        sample_rate: float = 1.0,
-        max_partition_per_file: int = 2,
         value_td_level: int = 0,
-        **kwargs,
     ):
         super().__init__()
         self.file_list = file_list
@@ -33,23 +92,20 @@ class KatagoNumpyDataset(Dataset):
         self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
         self.shuffle = shuffle
-        self.sample_rate = sample_rate
-        self.max_partition_per_file = max_partition_per_file
         self.filter_stm = filter_stm
         self.filter_condition = filter_condition
         self.value_td_level = value_td_level
-        assert filter_stm is None or isinstance(
-            filter_stm, int
-        ), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
+        self._sample_root_digest = _dataset_content_digest(self.file_list)
+        self._active_epoch = 0
+        if filter_stm is not None and not isinstance(filter_stm, int):
+            raise TypeError("filter_stm must be an integer")
 
         self.data_dict = {}
 
         # Load data tensors from npz files
-        length_list = []
         for filename in self.file_list:
             data = np.load(filename)
             data_dict, length = self._unpack_data(data)
-            length_list.append(length)
 
             selected_indices = []
             for i in range(length):
@@ -72,10 +128,13 @@ class KatagoNumpyDataset(Dataset):
             else:
                 self.data_dict[k] = self.data_dict[k][0]
 
-        # Get length of dataset and assert length are equal for all keys
+        # Validate row counts after board-size filtering.
+        length_list = [len(array) for array in self.data_dict.values()]
         self.length = length_list[0]
-        assert self.length > 0, f"No valid data entry in dataset: {self.file_list}"
-        assert length_list.count(self.length) == len(length_list), "Unequal length of data in npz file"
+        if self.length <= 0:
+            raise ValueError(f"no valid data entry in {self.file_list}")
+        if length_list.count(self.length) != len(length_list):
+            raise ValueError("NPZ fields have unequal row counts")
 
     @property
     def is_fixed_side_input(self):
@@ -113,7 +172,8 @@ class KatagoNumpyDataset(Dataset):
     def _unpack_policy_target(self, packed_data):
         length, n_features, n_cells = packed_data.shape
         bsize = int(np.sqrt(n_cells - 1))
-        assert bsize * bsize + 1 == n_cells
+        if bsize * bsize + 1 != n_cells:
+            raise ValueError("packed policy target has an invalid cell count")
 
         # Channel 0: policy target this turn
         policy_target_stm = packed_data[:, 0, : bsize * bsize + (1 if self.has_pass_move else 0)]
@@ -132,10 +192,17 @@ class KatagoNumpyDataset(Dataset):
         }
         if self.filter_stm is not None:
             if raw_data_dict["globalInputNC"].shape[1] == 1:
-                cond = f"globalInputNC[:, 0] == {self.filter_stm}"
+                condition = raw_data_dict["globalInputNC"][:, 0] == self.filter_stm
             else:
-                cond = f"globalInputNC[:, 5] > 0" if self.filter_stm == 1 else f"globalInputNC[:, 5] < 0"
-            filter_data_by_condition(cond, raw_data_dict)
+                condition = (
+                    raw_data_dict["globalInputNC"][:, 5] > 0
+                    if self.filter_stm == 1
+                    else raw_data_dict["globalInputNC"][:, 5] < 0
+                )
+            selected_indices = np.nonzero(condition)[0]
+            raw_data_dict = {
+                key: value[selected_indices, ...] for key, value in raw_data_dict.items()
+            }
         if self.filter_condition is not None:
             filter_data_by_condition(self.filter_condition, raw_data_dict)
 
@@ -163,71 +230,161 @@ class KatagoNumpyDataset(Dataset):
 
     def __getitem__(self, index):
         data = {k: self.data_dict[k][index] for k in self.data_dict}
-        return post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
+        return post_process_data(
+            data,
+            self.fixed_side_input,
+            self.fixed_board_size,
+            self.apply_symmetry,
+            symmetry_index=_map_symmetry_index(
+                self, index, tuple(int(value) for value in data["board_size"])
+            ),
+        )
+
+    def map_record_ref(self, index):
+        board_size = tuple(
+            int(value) for value in self.data_dict["board_size"][index]
+        )
+        output_shape = self.fixed_board_size or board_size
+        return MapRecordRef(
+            type(self).__name__,
+            int(index),
+            (
+                "map-row",
+                self._sample_root_digest,
+                type(self).__name__,
+                (int(index),),
+            ),
+            tuple(output_shape),
+        )
 
 
 @DATASETS.register("iterative_katago_numpy")
-class IterativeKatagoNumpyDataset(IterableDataset):
+class IterativeKatagoNumpyDataset(PlannedBatchDataset):
     """
     Similar to KatagoNumpyDataset but with iterative loading.
     This is useful when the dataset is too large to fit into memory.
     """
 
     FILE_EXTS = [".npz"]
-
     def __init__(
         self,
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
+        has_pass_move: bool = False,
+        apply_symmetry: bool | str = False,
+        filter_stm: int | None = None,
+        filter_condition: str | None = None,
+        value_td_level: int = 0,
         shuffle: bool = False,
         sample_rate: float = 1.0,
-        max_partition_per_file: int = 2,
-        **kwargs,
+        batch_size: int | None = None,
+        batch_pipelines=(),
+        shuffle_window_size: int = 32768,
+        shuffle_buffer_bytes: int | None = None,
+        steps_per_epoch: int | None = None,
     ):
+        super().__init__()
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.shuffle = shuffle
         self.sample_rate = sample_rate
-        self.max_partition_per_file = max_partition_per_file
-        self.extra_kwargs = kwargs
+        self.batch_pipelines = tuple(batch_pipelines)
+        self.extra_kwargs = {
+            "fixed_board_size": fixed_board_size,
+            "has_pass_move": has_pass_move,
+            "apply_symmetry": apply_symmetry,
+            "filter_stm": filter_stm,
+            "filter_condition": filter_condition,
+            "value_td_level": value_td_level,
+            "batch_size": batch_size,
+            "batch_pipelines": self.batch_pipelines,
+            "shuffle_window_size": shuffle_window_size,
+            "shuffle_buffer_bytes": shuffle_buffer_bytes,
+            "steps_per_epoch": steps_per_epoch,
+        }
 
-    @property
-    def is_fixed_side_input(self):
-        return self.fixed_side_input
+    def _build_partitioned_stream(self):
+        runtime_context = getattr(self, "runtime_context", None)
+        if runtime_context is None:
+            raise RuntimeError("iterative_katago_numpy requires a DatasetRuntimeContext")
+        options = dict(self.extra_kwargs)
+        options.pop("batch_size", None)
+        options.pop("batch_pipelines", None)
+        options.pop("rules", None)
+        options.pop("shuffle_window_size", None)
+        shuffle_buffer_bytes = options.pop("shuffle_buffer_bytes", None)
+        steps_per_epoch = options.pop("steps_per_epoch", None)
+        symmetry = options.pop("apply_symmetry", False)
 
-    @property
-    def is_internal_shuffleable(self):
-        return True
-
-    def __iter__(self):
-        partition_num, partition_idx = get_partition_num_and_idx()
-        partition_per_file = min(partition_num, self.max_partition_per_file)
-        assert partition_num % partition_per_file == 0, \
-            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
-
-        for file_index in make_subset_range(
-            len(self.file_list),
-            partition_num=partition_num // partition_per_file,
-            partition_idx=partition_idx // partition_per_file,
-            shuffle=self.shuffle,
-        ):
-            filename = self.file_list[file_index]
+        def load(path):
             dataset = KatagoNumpyDataset(
-                file_list=[filename],
+                file_list=[path],
                 boardsizes=self.boardsizes,
                 fixed_side_input=self.fixed_side_input,
-                **self.extra_kwargs,
+                apply_symmetry=False,
+                **options,
             )
-            for index in make_subset_range(
-                len(dataset),
-                partition_num=partition_per_file,
-                partition_idx=partition_idx % partition_per_file,
+            return dataset, len(dataset)
+
+        decoder = NpzRowRecordDecoder(
+            "raw-katago-npz",
+            runtime_context,
+            load,
+            lambda dataset, index: dataset[index],
+            apply_symmetry=symmetry,
+            catalog_rows=lambda dataset, length: (
+                None,
+                (
+                    options["fixed_board_size"]
+                    if options.get("fixed_board_size") is not None
+                    else dataset.data_dict["board_size"]
+                ),
+            ),
+            semantic_state={
+                "boardsizes": sorted(self.boardsizes),
+                "fixed_side_input": self.fixed_side_input,
+                **options,
+            },
+        )
+        paths = reject_duplicate_physical_files(self.file_list)
+        catalogs = [
+            decoder.inspect_compact(path, ordinal)
+            for ordinal, path in enumerate(paths)
+        ]
+        self._record_source = IndexedNpzSource(
+            catalogs,
+            decoder,
+            seed=runtime_context.seed,
+            shuffle=self.shuffle,
+            sample_rate=self.sample_rate,
+        )
+        composer = (
+            PipelineStateComposer(self.batch_pipelines)
+            if self.batch_pipelines
+            else None
+        )
+        self._partitioned_stream = DatasetPlanner(
+            self._record_source,
+            runtime_context,
+            PlannerConfig(
                 shuffle=self.shuffle,
-                sample_rate=self.sample_rate,
-            ):
-                yield dataset[index]
+                shuffle_buffer_size=self.extra_kwargs.get(
+                    "shuffle_window_size", 32768
+                ),
+                shuffle_buffer_bytes=shuffle_buffer_bytes,
+                steps_per_epoch=steps_per_epoch,
+            ),
+            pipeline_composer=composer,
+        )
+        self._planned_decoder = SourceBatchDataset(
+            self._partitioned_stream,
+            self._record_source,
+        )
+        return self._partitioned_stream
 
 
 @DATASETS.register("processed_katago_numpy")
@@ -247,6 +404,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self,
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
         fixed_side_input: bool = False,
         fixed_board_size: None | tuple[int, int] = None,
         has_pass_move: bool = False,
@@ -256,7 +414,7 @@ class ProcessedKatagoNumpyDataset(Dataset):
         board_input_channels: list[int] | None = None,
         stm_input_channel: int | None = None,
         value_target_channels: list[int] | None = None,
-        **kwargs,
+        shuffle: bool = False,
     ):
         super().__init__()
         self.file_list = file_list
@@ -265,6 +423,8 @@ class ProcessedKatagoNumpyDataset(Dataset):
         self.fixed_board_size = fixed_board_size
         self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
+        self._sample_root_digest = _dataset_content_digest(self.file_list)
+        self._active_epoch = 0
 
         self.data_dict = {
             "bf": [],
@@ -283,7 +443,8 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
             for k in self.data_dict:
                 if k in data:
-                    assert len(data[k]) > 0, f"Empty tensor {k} in file {filename}"
+                    if len(data[k]) <= 0:
+                        raise ValueError(f"empty tensor {k} in file {filename}")
                     self.data_dict[k].append(data[k])
 
         # Concatenate tensors across files
@@ -299,21 +460,28 @@ class ProcessedKatagoNumpyDataset(Dataset):
             length_list.append(len(concated_data_dict[k]))
         self.data_dict = concated_data_dict
 
-        # Get length of dataset and assert length are equal for all keys
+        # Validate processed NPZ row counts.
         self.length = length_list[0]
-        assert self.length > 0, f"No valid data entry in dataset: {self.file_list}"
-        assert length_list.count(self.length) == len(length_list), "Unequal length of data in npz file"
+        if self.length <= 0:
+            raise ValueError(f"no valid data entry in {self.file_list}")
+        if length_list.count(self.length) != len(length_list):
+            raise ValueError("processed NPZ fields have unequal row counts")
 
         # Get board size
         self.boardsize = self.data_dict["bf"].shape[2:]
-        assert len(self.boardsize) == 2
+        if len(self.boardsize) != 2:
+            raise ValueError("processed board feature must have two spatial axes")
 
         if filter_stm is not None:
-            assert isinstance(
-                filter_stm, int
-            ), "filter_stm should be an integer, eg. (-1 for black and 1 for white)"
-            assert "gf" in self.data_dict, "gf tensor is required for filtering stm"
-            self.length = filter_data_by_condition(f"gf[:, 0] == {filter_stm}", self.data_dict)
+            if not isinstance(filter_stm, int):
+                raise TypeError("filter_stm must be an integer")
+            if "gf" not in self.data_dict:
+                raise ValueError("gf tensor is required for filtering stm")
+            selected_indices = np.nonzero(self.data_dict["gf"][:, 0] == filter_stm)[0]
+            self.data_dict = {
+                key: value[selected_indices, ...] for key, value in self.data_dict.items()
+            }
+            self.length = len(selected_indices)
         if filter_condition is not None:
             self.length = filter_data_by_condition(filter_condition, self.data_dict)
 
@@ -321,8 +489,11 @@ class ProcessedKatagoNumpyDataset(Dataset):
         if board_input_channels is not None:
             self.data_dict["bf"] = self.data_dict["bf"][:, board_input_channels]
         if stm_input_channel is not None:
-            assert "gf" in self.data_dict, "Specified stm_input_channel but no gf in data dict!"
-            self.data_dict["gf"] = self.data_dict["gf"][:, stm_input_channel]
+            if "gf" not in self.data_dict:
+                raise ValueError(
+                    "stm_input_channel requires a gf tensor"
+                )
+            self.data_dict["gf"] = self.data_dict["gf"][:, [stm_input_channel]]
         if value_target_channels is not None:
             self.data_dict["vt"] = self.data_dict["vt"][:, value_target_channels]
 
@@ -366,11 +537,33 @@ class ProcessedKatagoNumpyDataset(Dataset):
 
     def __getitem__(self, index):
         data = self._prepare_data(index)
-        return post_process_data(data, self.fixed_side_input, self.fixed_board_size, self.apply_symmetry)
+        return post_process_data(
+            data,
+            self.fixed_side_input,
+            self.fixed_board_size,
+            self.apply_symmetry,
+            symmetry_index=_map_symmetry_index(
+                self, index, tuple(int(value) for value in data["board_size"])
+            ),
+        )
+
+    def map_record_ref(self, index):
+        output_shape = self.fixed_board_size or self.boardsize
+        return MapRecordRef(
+            type(self).__name__,
+            int(index),
+            (
+                "map-row",
+                self._sample_root_digest,
+                type(self).__name__,
+                (int(index),),
+            ),
+            tuple(int(value) for value in output_shape),
+        )
 
 
 @DATASETS.register("iterative_processed_katago_numpy")
-class IterativeProcessedKatagoNumpyDataset(IterableDataset):
+class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
     """
     Similar to ProcessedKatagoNumpyDataset but with iterative loading.
     This is useful when the dataset is too large to fit into memory.
@@ -382,11 +575,23 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
         self,
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
         fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
+        has_pass_move: bool = False,
+        apply_symmetry: bool | str = False,
+        filter_stm: int | None = None,
+        filter_condition: str | None = None,
+        board_input_channels: list[int] | None = None,
+        stm_input_channel: int | None = None,
+        value_target_channels: list[int] | None = None,
         shuffle: bool = False,
         sample_rate: float = 1.0,
-        max_partition_per_file: int = 2,
-        **kwargs,
+        batch_size: int | None = None,
+        batch_pipelines=(),
+        shuffle_window_size: int = 32768,
+        shuffle_buffer_bytes: int | None = None,
+        steps_per_epoch: int | None = None,
     ):
         super().__init__()
         self.file_list = file_list
@@ -394,261 +599,397 @@ class IterativeProcessedKatagoNumpyDataset(IterableDataset):
         self.fixed_side_input = fixed_side_input
         self.shuffle = shuffle
         self.sample_rate = sample_rate
-        self.max_partition_per_file = max_partition_per_file
-        self.extra_kwargs = kwargs
+        self.batch_pipelines = tuple(batch_pipelines)
+        self.extra_kwargs = {
+            "fixed_board_size": fixed_board_size,
+            "has_pass_move": has_pass_move,
+            "apply_symmetry": apply_symmetry,
+            "filter_stm": filter_stm,
+            "filter_condition": filter_condition,
+            "board_input_channels": board_input_channels,
+            "stm_input_channel": stm_input_channel,
+            "value_target_channels": value_target_channels,
+            "batch_size": batch_size,
+            "batch_pipelines": self.batch_pipelines,
+            "shuffle_window_size": shuffle_window_size,
+            "shuffle_buffer_bytes": shuffle_buffer_bytes,
+            "steps_per_epoch": steps_per_epoch,
+        }
 
-    @property
-    def is_fixed_side_input(self):
-        return self.fixed_side_input
-
-    @property
-    def is_internal_shuffleable(self):
-        return True
-
-    def __iter__(self):
-        partition_num, partition_idx = get_partition_num_and_idx()
-        partition_per_file = min(partition_num, self.max_partition_per_file)
-        assert partition_num % partition_per_file == 0, \
-            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
-
-        for file_index in make_subset_range(
-            len(self.file_list),
-            partition_num=partition_num // partition_per_file,
-            partition_idx=partition_idx // partition_per_file,
+    def _processed_stream_options(self):
+        decoder_kwargs = dict(self.extra_kwargs)
+        shuffle_window_size = decoder_kwargs.pop("shuffle_window_size", 32768)
+        shuffle_buffer_bytes = decoder_kwargs.pop("shuffle_buffer_bytes", None)
+        steps_per_epoch = decoder_kwargs.pop("steps_per_epoch", None)
+        for option in ("rules", "batch_size", "batch_pipelines"):
+            decoder_kwargs.pop(option, None)
+        symmetry = decoder_kwargs.pop("apply_symmetry", False)
+        planner_config = PlannerConfig(
             shuffle=self.shuffle,
-        ):
-            filename = self.file_list[file_index]
-            dataset = ProcessedKatagoNumpyDataset(
-                file_list=[filename],
-                boardsizes=self.boardsizes,
-                fixed_side_input=self.fixed_side_input,
-                **self.extra_kwargs,
+            shuffle_buffer_size=shuffle_window_size,
+            shuffle_buffer_bytes=shuffle_buffer_bytes,
+            steps_per_epoch=steps_per_epoch,
+        )
+        return decoder_kwargs, symmetry, planner_config
+
+    @staticmethod
+    def _inspect_processed_manifests(decoder, paths, workers=1):
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                return list(executor.map(decoder.inspect, paths, range(len(paths))))
+        return [decoder.inspect(path, ordinal) for ordinal, path in enumerate(paths)]
+
+    def _install_processed_planner(
+        self,
+        runtime_context,
+        decoder,
+        manifests,
+        planner_config,
+    ):
+        self._record_source = DenseNpzSource(
+            manifests,
+            decoder,
+            seed=runtime_context.seed,
+            shuffle=self.shuffle,
+            sample_rate=self.sample_rate,
+        )
+        composer = (
+            PipelineStateComposer(self.batch_pipelines)
+            if self.batch_pipelines
+            else None
+        )
+        self._partitioned_stream = DatasetPlanner(
+            self._record_source,
+            runtime_context,
+            planner_config,
+            pipeline_composer=composer,
+        )
+        return self._partitioned_stream
+
+    def _build_partitioned_stream(self):
+        runtime_context = getattr(self, "runtime_context", None)
+        if runtime_context is None:
+            raise RuntimeError(
+                "iterative_processed_katago_numpy requires a DatasetRuntimeContext"
             )
-            for index in make_subset_range(
-                len(dataset),
-                partition_num=partition_per_file,
-                partition_idx=partition_idx % partition_per_file,
-                shuffle=self.shuffle,
-                sample_rate=self.sample_rate,
-            ):
-                yield dataset[index]
+        decoder_kwargs, symmetry, planner_config = self._processed_stream_options()
+        decoder = ProcessedNpzDecoder(
+            boardsizes=self.boardsizes,
+            runtime_context=runtime_context,
+            fixed_side_input=self.fixed_side_input,
+            apply_symmetry=symmetry,
+            **decoder_kwargs,
+        )
+        paths = reject_duplicate_physical_files(self.file_list)
+        manifests = self._inspect_processed_manifests(decoder, paths)
+        self._install_processed_planner(
+            runtime_context,
+            decoder,
+            manifests,
+            planner_config,
+        )
+        self._planned_decoder = SourceBatchDataset(
+            self._partitioned_stream,
+            self._record_source,
+        )
+        return self._partitioned_stream
 
 
 @DATASETS.register("batched_processed_katago_numpy")
 class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
     """
-    Batch-level variant of IterativeProcessedKatagoNumpyDataset: yields whole
-    collated batches (dicts of numpy arrays) instead of single samples, with
-    all per-sample work (dtype conversion, side flip, random symmetry)
-    vectorized over the batch.
+    Planned batch-level variant of IterativeProcessedKatagoNumpyDataset.
 
-    Runs in-process with background loader threads instead of DataLoader
-    worker processes: worker->main IPC costs milliseconds per batch, far more
-    than vectorized batch assembly itself, so ``build_data_loader`` wraps this
-    dataset with ``DataLoader(batch_size=None, num_workers=0)`` and file
-    loading + batch assembly overlap the training loop via *prefetch_threads*
-    daemon threads filling a bounded batch queue.
-
-    Batches never cross worker-partition boundaries; a remainder smaller than
-    ``batch_size`` is carried over to the next file of the same loader thread
-    and only per-thread stream tails are dropped (like ``drop_last=True``).
-    Multi-process (DDP) training is not supported yet: per-rank tail dropping
-    can produce unequal batch counts across ranks.
+    One deterministic global stream plans shape-homogeneous batches across
+    file boundaries, then each DDP rank decodes its disjoint local slice.
+    Training drops only incomplete global shape tails; evaluation pads them
+    with an ``is_real`` mask. The main thread owns planning, ordered
+    finalization, pipeline state, and transactional tokens. Optional worker
+    threads only decode numbered batches into a bounded ordered prefetch
+    queue, so thread timing cannot change the yielded order.
 
     Args (in addition to IterativeProcessedKatagoNumpyDataset):
         batch_size: Number of samples per yielded batch.
         apply_symmetry: Randomly transform each sample by a board symmetry
-            (vectorized; samples are grouped by drawn symmetry, so the batch
-            is reordered, which is neutral for training).
-        prefetch_threads: Background producer threads (0 = load and assemble
-            synchronously in the consumer thread).  With more than one thread
-            the batch order depends on thread timing; use 0 or 1 for a
-            deterministic, seed-reproducible stream.
-        prefetch_batches: Bounded batch-queue capacity across all threads.
+            using its epoch and stable sample key. Rows are transformed in
+            one vectorized indexed gather without reordering the batch.
+        prefetch_threads: Ordered decode workers (0 decodes synchronously).
+        prefetch_batches: Bound on submitted but not yet yielded batches.
         pin_memory: Yield batches as pinned torch tensors for fast async H2D
-            copies, with the pinning cost paid in the producer threads instead
-            of the consumer.  Default: auto (pinned iff CUDA is available).
+            copies. Default: auto (pinned iff CUDA is available).
     """
-
-    YIELDS_BATCHES = True
 
     def __init__(
         self,
-        *args,
-        batch_size: int,
+        file_list: list[str],
+        boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
+        fixed_side_input: bool = False,
+        fixed_board_size: None | tuple[int, int] = None,
+        has_pass_move: bool = False,
+        filter_stm: int | None = None,
+        filter_condition: str | None = None,
+        board_input_channels: list[int] | None = None,
+        stm_input_channel: int | None = None,
+        value_target_channels: list[int] | None = None,
+        shuffle: bool = False,
+        sample_rate: float = 1.0,
+        batch_size: int = 1,
         apply_symmetry=False,
         batch_pipelines=(),
         prefetch_threads: int = 2,
-        prefetch_batches: int = 64,
+        prefetch_batches: int = 32,
         pin_memory: bool | None = None,
-        **kwargs,
+        observability=False,
+        autotune=False,
+        shuffle_window_size: int = 32768,
+        shuffle_buffer_bytes: int | None = None,
+        steps_per_epoch: int | None = None,
     ):
-        super().__init__(*args, **kwargs)
+        super().__init__(
+            file_list=file_list,
+            boardsizes=boardsizes,
+            rules=rules,
+            fixed_side_input=fixed_side_input,
+            fixed_board_size=fixed_board_size,
+            has_pass_move=has_pass_move,
+            apply_symmetry=apply_symmetry,
+            filter_stm=filter_stm,
+            filter_condition=filter_condition,
+            board_input_channels=board_input_channels,
+            stm_input_channel=stm_input_channel,
+            value_target_channels=value_target_channels,
+            shuffle=shuffle,
+            sample_rate=sample_rate,
+            batch_size=batch_size,
+            batch_pipelines=batch_pipelines,
+            shuffle_window_size=shuffle_window_size,
+            shuffle_buffer_bytes=shuffle_buffer_bytes,
+            steps_per_epoch=steps_per_epoch,
+        )
         self.batch_size = batch_size
         self.apply_symmetry = apply_symmetry
         self.batch_pipelines = tuple(batch_pipelines)
         self.prefetch_threads = prefetch_threads
         self.prefetch_batches = prefetch_batches
         self.pin_memory = torch.cuda.is_available() if pin_memory is None else pin_memory
+        self.observability = observability
+        self.autotune = autotune
         self.has_pass_move = self.extra_kwargs.get("has_pass_move", False)
-        assert self.extra_kwargs.get("fixed_board_size") is None, \
-            "fixed_board_size is not supported by the batched dataset"
+        self._record_decoder = None
 
-    def _assemble_batch(self, parts, boardsize):
-        """Gather rows from raw file arrays and post-process as one batch.
-
-        *parts* is a list of ``(raw_dict, indices)`` pairs (more than one when a
-        carried remainder is completed from the next file).
-        """
-        h, w = boardsize
-
-        def gather(key, default_shape=None):
-            arrs = []
-            for raw, indices in parts:
-                if key in raw:
-                    arr = raw[key][indices]
-                    if key == "pt" and not self.has_pass_move and arr.ndim == 2:
-                        # flat (M, H*W+1) target: drop pass column, like the per-sample path
-                        arr = arr[:, : h * w].reshape(-1, h, w)
-                    arrs.append(arr)
-                else:
-                    assert default_shape is not None, f"missing required key {key} in npz data"
-                    arrs.append(np.zeros((len(indices),) + default_shape, dtype=np.float32))
-            return np.concatenate(arrs, axis=0) if len(arrs) > 1 else arrs[0]
-
-        data = {
-            "board_size": np.tile(np.array(boardsize, dtype=np.int8), (self.batch_size, 1)),
-            "board_input": gather("bf").astype(np.int8, copy=False),
-            "stm_input": gather("gf", default_shape=(1,)).astype(np.float32, copy=False),
-            "value_target": gather("vt").astype(np.float32, copy=False),
-            "policy_target": gather(
-                "pt", default_shape=(h * w + 1,) if self.has_pass_move else (h, w)
-            ).astype(np.float32, copy=False),
-        }
-        data = post_process_batch(data, self.fixed_side_input, self.apply_symmetry)
-        for pipeline in self.batch_pipelines:
-            data = pipeline.process_batch(data)
+    def _finalize_planned_batch(self, data):
         if self.pin_memory:
-            # np.flip in post-processing can leave negative strides that
-            # from_numpy rejects; ascontiguousarray is a no-op otherwise
-            data = {
-                k: torch.from_numpy(np.ascontiguousarray(v)).pin_memory()
-                for k, v in data.items()
+            return {
+                key: torch.from_numpy(np.ascontiguousarray(value)).pin_memory()
+                for key, value in data.items()
             }
         return data
 
-    def _produce(self, file_indices, partition_per_file, partition_idx):
-        """Yield batches from *file_indices*, carrying remainders across files."""
-        batch_size = self.batch_size
-        leftover = []  # list of (raw_dict, boardsize, indices), < batch_size rows in total
-        leftover_count = 0
-
-        for file_index in file_indices:
-            filename = self.file_list[file_index]
-            dataset = ProcessedKatagoNumpyDataset(
-                file_list=[filename],
-                boardsizes=self.boardsizes,
-                fixed_side_input=self.fixed_side_input,
-                **self.extra_kwargs,
+    def _build_partitioned_stream(self):
+        runtime_context = getattr(self, "runtime_context", None)
+        if runtime_context is None:
+            raise RuntimeError(
+                "batched_processed_katago_numpy requires a DatasetRuntimeContext"
             )
-            indices = np.fromiter(
-                make_subset_range(
-                    len(dataset),
-                    partition_num=partition_per_file,
-                    partition_idx=partition_idx % partition_per_file,
-                    shuffle=self.shuffle,
-                    sample_rate=self.sample_rate,
-                ),
-                dtype=np.int64,
+        paths = reject_duplicate_physical_files(self.file_list)
+        telemetry_enabled = any(
+            value is not None and value is not False
+            for value in (self.observability, self.autotune)
+        )
+        stats = None
+        observability_config = None
+        autotune_config = None
+        if telemetry_enabled:
+            from .telemetry import (
+                PipelineAutotuneConfig,
+                PipelineObservabilityConfig,
+                PipelineStats,
             )
-            raw, boardsize = dataset.data_dict, dataset.boardsize
 
-            pos = 0
-            if leftover_count:
-                if any(b != boardsize for _, b, _ in leftover):
-                    # batches cannot mix board sizes: drop the carried
-                    # remainder at a size boundary (like drop_last)
-                    leftover, leftover_count = [], 0
-                else:
-                    # complete the carried remainder with the head of this file
-                    pos = min(batch_size - leftover_count, len(indices))
-                    leftover.append((raw, boardsize, indices[:pos]))
-                    leftover_count += pos
-                    if leftover_count < batch_size:
-                        continue
-                    yield self._assemble_batch([(r, idx) for r, _, idx in leftover], boardsize)
-                    leftover, leftover_count = [], 0
+            observability_config = PipelineObservabilityConfig.parse(
+                self.observability
+            )
+            autotune_config = PipelineAutotuneConfig.parse(self.autotune)
+            telemetry_enabled = observability_config.enabled or autotune_config.enabled
+            if telemetry_enabled:
+                stats = PipelineStats()
+            if autotune_config.enabled:
+                if self.prefetch_threads <= 0:
+                    raise ValueError(
+                        "pipeline autotuning requires prefetch_threads to be positive"
+                    )
+                if self.batch_pipelines:
+                    raise ValueError(
+                        "pipeline autotuning does not support stateful batch pipelines"
+                    )
+                if (
+                    autotune_config.respect_explicit
+                    and getattr(self, "_explicit_prefetch_threads", False)
+                    and self.prefetch_threads > autotune_config.max_prefetch_threads
+                ):
+                    raise ValueError(
+                        "explicit prefetch_threads exceeds autotune.max_prefetch_threads"
+                    )
+                if (
+                    autotune_config.respect_explicit
+                    and getattr(self, "_explicit_prefetch_batches", False)
+                    and self.prefetch_batches > autotune_config.max_prefetch_batches
+                ):
+                    raise ValueError(
+                        "explicit prefetch_batches exceeds autotune.max_prefetch_batches"
+                    )
+        decoder_kwargs, symmetry, planner_config = self._processed_stream_options()
+        decoder_cls = ProcessedNpzDecoder
+        if telemetry_enabled:
+            from .telemetry import ObservedProcessedNpzDecoder
 
-            while pos + batch_size <= len(indices):
-                yield self._assemble_batch([(raw, indices[pos : pos + batch_size])], boardsize)
-                pos += batch_size
+            decoder_cls = ObservedProcessedNpzDecoder
+            decoder_kwargs["pipeline_stats"] = stats
+        self._record_decoder = decoder_cls(
+            boardsizes=self.boardsizes,
+            runtime_context=runtime_context,
+            fixed_side_input=self.fixed_side_input,
+            apply_symmetry=symmetry,
+            **decoder_kwargs,
+        )
+        # On one process, two workers overlap NPZ loading, filtering, and file
+        # identity hashing. Keep distributed startup serialized per rank to
+        # avoid multiplying storage I/O.
+        manifest_workers = min(
+            2 if runtime_context.world_size == 1 else 1,
+            self.prefetch_threads,
+            len(paths),
+        )
+        manifest_start = time.perf_counter_ns() if telemetry_enabled else None
+        manifests = self._inspect_processed_manifests(
+            self._record_decoder,
+            paths,
+            manifest_workers,
+        )
+        if telemetry_enabled:
+            stats.record_manifest(
+                time.perf_counter_ns() - manifest_start,
+                len(manifests),
+                sum(int(manifest["logical_row_count"]) for manifest in manifests),
+            )
+        self._install_processed_planner(
+            runtime_context,
+            self._record_decoder,
+            manifests,
+            planner_config,
+        )
+        adapter_cls = SourceBatchDataset
+        adapter_kwargs = {}
+        if telemetry_enabled:
+            from .telemetry import ObservedSourceBatchDataset
 
-            if pos < len(indices):
-                leftover.append((raw, boardsize, indices[pos:]))
-                leftover_count += len(indices) - pos
-        # final leftover (< batch_size) is dropped, matching drop_last=True
+            adapter_cls = ObservedSourceBatchDataset
+            adapter_kwargs["pipeline_stats"] = stats
+        if autotune_config is not None and autotune_config.enabled:
+            from .telemetry import PipelineAutotuner, build_tuning_keys
 
-    def __iter__(self):
-        partition_num, partition_idx = get_partition_num_and_idx()
-        partition_per_file = min(partition_num, self.max_partition_per_file)
-        assert partition_num % partition_per_file == 0, \
-            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
+            pipeline_signatures = [
+                pipeline.signature_state() for pipeline in self.batch_pipelines
+            ]
+            exact_key, compatible_key = build_tuning_keys(
+                source_manifest=self._record_source.manifest_state(),
+                batch_size=runtime_context.local_batch_size,
+                world_size=runtime_context.world_size,
+                pin_memory=self.pin_memory,
+                pipeline_signatures=pipeline_signatures,
+                cache_budget_bytes=autotune_config.host_cache_budget_bytes,
+                tuning_contract={
+                    "initial_prefetch_threads": self.prefetch_threads,
+                    "initial_prefetch_batches": self.prefetch_batches,
+                    "max_prefetch_threads": autotune_config.max_prefetch_threads,
+                    "max_prefetch_batches": autotune_config.max_prefetch_batches,
+                    "cuda_prefetch_batches": int(
+                        getattr(self, "_cuda_prefetch_batches", 0)
+                    ),
+                    "respect_explicit": autotune_config.respect_explicit,
+                    "explicit_prefetch_threads": getattr(
+                        self, "_explicit_prefetch_threads", False
+                    ),
+                    "explicit_prefetch_batches": getattr(
+                        self, "_explicit_prefetch_batches", False
+                    ),
+                },
+            )
+            locked = set()
+            if autotune_config.respect_explicit:
+                if getattr(self, "_explicit_prefetch_threads", False):
+                    locked.add("prefetch_threads")
+                if getattr(self, "_explicit_prefetch_batches", False):
+                    locked.add("prefetch_batches")
+            controller = PipelineAutotuner(
+                autotune_config,
+                initial_workers=max(1, self.prefetch_threads),
+                initial_prefetch_batches=self.prefetch_batches,
+                initial_cache_entries=self._record_decoder._array_cache_capacity,
+                initial_cache_bytes=self._record_decoder._array_cache_byte_capacity,
+                exact_key=exact_key,
+                compatible_key=compatible_key,
+                locked_options=locked,
+            )
+            self._record_decoder.configure_cache(
+                entries=controller.settings["cache_entries"],
+                byte_capacity=controller.settings["cache_bytes"],
+            )
+            adapter_kwargs.update(
+                {
+                    "autotuner": controller,
+                    "maximum_prefetch_workers": autotune_config.max_prefetch_threads,
+                }
+            )
+            effective_workers = controller.settings["prefetch_threads"]
+            effective_batches = controller.settings["prefetch_batches"]
+        else:
+            effective_workers = self.prefetch_threads
+            effective_batches = self.prefetch_batches
+        self._planned_decoder = adapter_cls(
+            self._partitioned_stream,
+            self._record_source,
+            finalize_batch=self._finalize_planned_batch,
+            prefetch_workers=effective_workers,
+            prefetch_batches=effective_batches,
+            finalize_in_prefetch=True,
+            **adapter_kwargs,
+        )
+        if telemetry_enabled:
+            self.pipeline_stats = stats
+        return self._partitioned_stream
 
-        file_indices = list(make_subset_range(
-            len(self.file_list),
-            partition_num=partition_num // partition_per_file,
-            partition_idx=partition_idx // partition_per_file,
-            shuffle=self.shuffle,
-        ))
+    def pipeline_metrics_snapshot(self):
+        if not hasattr(self._planned_decoder, "pipeline_metrics_snapshot"):
+            return None
+        return self._planned_decoder.pipeline_metrics_snapshot()
 
-        num_threads = min(self.prefetch_threads, len(file_indices))
-        if num_threads <= 0:
-            yield from self._produce(file_indices, partition_per_file, partition_idx)
+    def attach_pipeline_run_dir(self, rundir):
+        if hasattr(self._planned_decoder, "attach_pipeline_run_dir"):
+            self._planned_decoder.attach_pipeline_run_dir(rundir)
+
+    def pipeline_tuning_update(self, metrics, iteration):
+        if not hasattr(self._planned_decoder, "pipeline_tuning_update"):
+            return None
+        return self._planned_decoder.pipeline_tuning_update(metrics, iteration)
+
+    def pipeline_tuning_state_dict(self):
+        if not hasattr(self._planned_decoder, "pipeline_tuning_state_dict"):
+            return None
+        return self._planned_decoder.pipeline_tuning_state_dict()
+
+    def load_pipeline_tuning_state_dict(self, state):
+        if not hasattr(self._planned_decoder, "load_pipeline_tuning_state_dict"):
+            if state is not None:
+                raise ValueError("pipeline autotuning is disabled")
             return
+        self._planned_decoder.load_pipeline_tuning_state_dict(state)
 
-        import queue as queue_mod
-        import threading
-
-        out_q = queue_mod.Queue(maxsize=self.prefetch_batches)
-        stop = threading.Event()
-
-        def put_stoppable(item):
-            """Blocking put that gives up once the consumer has stopped."""
-            while not stop.is_set():
-                try:
-                    out_q.put(item, timeout=0.1)
-                    return True
-                except queue_mod.Full:
-                    continue
-            return False
-
-        def producer(files):
-            try:
-                for batch in self._produce(files, partition_per_file, partition_idx):
-                    if not put_stoppable(("batch", batch)):
-                        return
-                put_stoppable(("done", None))
-            except BaseException as e:  # propagate errors to the consumer
-                put_stoppable(("error", e))
-
-        threads = [
-            # round-robin static split keeps per-thread file order deterministic
-            threading.Thread(target=producer, args=(file_indices[i::num_threads],), daemon=True)
-            for i in range(num_threads)
-        ]
-        for t in threads:
-            t.start()
-
-        remaining = len(threads)
-        try:
-            while remaining:
-                kind, payload = out_q.get()
-                if kind == "batch":
-                    yield payload
-                elif kind == "done":
-                    remaining -= 1
-                else:
-                    raise payload
-        finally:
-            # unblock producers if the consumer stops early (epoch break, error)
-            stop.set()
+    def restore_pipeline_tuning_state_dict(self, state):
+        restore = getattr(
+            self._planned_decoder,
+            "restore_pipeline_tuning_state_dict",
+            None,
+        )
+        return False if restore is None else restore(state)

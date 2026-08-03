@@ -6,6 +6,7 @@ import configargparse
 import yaml
 import os
 from dataset import build_dataset
+from dataset.core import single_process_dataset_context
 from utils.file_utils import make_dir
 from utils.misc_utils import seed_everything
 from utils.training_utils import build_data_loader
@@ -178,6 +179,9 @@ def visualize_dataset(dataset, dataloader, max_entries=0, save_fig_dir=None):
         get_save_fig_path = lambda i: os.path.join(save_fig_dir, f"{i}.png")
     index = 0
     for batch_data in dataloader:
+        from dataset.stream import BatchEnvelope
+        if isinstance(batch_data, BatchEnvelope):
+            batch_data = batch_data.data
         for batch_idx in range(len(batch_data["board_size"])):
             data = {
                 k: v[batch_idx].numpy() if isinstance(v[batch_idx], torch.Tensor) else v[batch_idx]
@@ -231,6 +235,9 @@ if __name__ == "__main__":
     dataset = build_dataset(
         args.dataset_type,
         args.data_paths,
+        runtime_context=single_process_dataset_context(
+            args.batch_size, seed=0, mode="visualize"
+        ),
         shuffle=args.shuffle,
         pipeline_args=args.data_pipelines,
         **args.dataset_args,

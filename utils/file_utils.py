@@ -34,7 +34,8 @@ def make_file_list(paths: list[str], exts: list[str] | None = None) -> list[str]
             file_lists.append(path)
         elif os.path.isdir(path):
             for root, dirs, files in os.walk(path):
-                for file in files:
+                dirs.sort()
+                for file in sorted(files):
                     ext = os.path.splitext(file)[1]
                     if exts is None or ext in exts:
                         file_lists.append(os.path.join(root, file))
@@ -146,7 +147,14 @@ def find_latest_ckpt(
     if not ckpt_list:
         return None
 
-    ckpt_list.sort()
+    # Sort numerically by the iteration embedded in the filename: a plain
+    # string sort ranks 'state_9999999' above 'state_10000000' once the
+    # zero-padding overflows. Files without a parsable iteration sort first.
+    def sort_key(filepath):
+        iteration = get_iteration_from_ckpt_filename(filepath)
+        return (iteration is not None, iteration if iteration is not None else 0, filepath)
+
+    ckpt_list.sort(key=sort_key)
     return ckpt_list[-1]
 
 

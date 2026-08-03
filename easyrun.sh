@@ -10,20 +10,9 @@ shift 1
 install_packages() {
     echo "First make sure you have installed a Pytorch environment and CUDA toolkit!"
     echo "Installing required packages..."
-    pip install accelerate configargparse tqdm tensorboard matplotlib pybind11 lz4 pykeops
-}
-
-install_dataset_pipeline_modules() {
-    echo "Installing dataset pipeline modules..."
-
-    modules=(
-        dataset/pipeline/line_encoding_cpp
-        dataset/pipeline/forbidden_point_cpp
-    )
-
-    for module in "${modules[@]}"; do
-        pip install "$module"
-    done
+    # Installs the dependencies from pyproject.toml and builds the dataset
+    # pipeline extensions via the root setup.py.
+    pip install . || exit 1
 }
 
 prompt_confirm() {
@@ -109,9 +98,6 @@ PY
 
 if prompt_confirm "Is this your first time running?"; then
     install_packages
-    if prompt_confirm "Do you want to install the dataset pipeline modules?"; then
-        install_dataset_pipeline_modules
-    fi
 fi
 
 ACCELERATE_CONFIG_FILE="$(get_accelerate_config_file)" || exit 1

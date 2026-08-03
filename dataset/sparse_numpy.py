@@ -1,28 +1,37 @@
 import numpy as np
-import torch.utils.data
-from torch.utils.data.dataset import IterableDataset
 from utils.data_utils import *
 from . import DATASETS
+from .decoder import NpzRowRecordDecoder
+from .core import PipelineStateComposer
+from .npz_source import IndexedNpzSource
+from .planner import DatasetPlanner, PlannerConfig
+from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .stream import reject_duplicate_physical_files
 
 
 @DATASETS.register("iterative_sparse_numpy")
-class IterativeSparseNumpyDataset(IterableDataset):
+class IterativeSparseNumpyDataset(PlannedBatchDataset):
     FILE_EXTS = [".npz"]
 
     def __init__(
         self,
         file_list: list[str],
         boardsizes: set[tuple[int, int]],
+        rules: set[str] | None = None,
         fixed_side_input: bool = False,
         fixed_board_size: None | tuple[int, int] = None,
         apply_symmetry: bool = False,
         drop_extra: bool = False,
         shuffle: bool = False,
         sample_rate: float = 1.0,
-        max_partition_per_file: int = 2,
-        **kwargs
+        batch_size: int | None = None,
+        batch_pipelines=(),
+        shuffle_window_size: int = 32768,
+        shuffle_buffer_bytes: int | None = None,
+        steps_per_epoch: int | None = None,
     ):
         super().__init__()
+        self.batch_pipelines = tuple(batch_pipelines)
         self.file_list = file_list
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
@@ -31,15 +40,90 @@ class IterativeSparseNumpyDataset(IterableDataset):
         self.drop_extra = drop_extra
         self.shuffle = shuffle
         self.sample_rate = sample_rate
-        self.max_partition_per_file = max_partition_per_file
+        self.shuffle_window_size = shuffle_window_size
+        self.shuffle_buffer_bytes = shuffle_buffer_bytes
+        self.steps_per_epoch = steps_per_epoch
+    def _build_partitioned_stream(self):
+        runtime_context = getattr(self, "runtime_context", None)
+        if runtime_context is None:
+            raise RuntimeError("iterative_sparse_numpy requires a DatasetRuntimeContext")
 
-    @property
-    def is_fixed_side_input(self):
-        return self.fixed_side_input
+        reader = IterativeSparseNumpyDataset(
+            file_list=[],
+            boardsizes=self.boardsizes,
+            fixed_side_input=self.fixed_side_input,
+            fixed_board_size=self.fixed_board_size,
+            apply_symmetry=False,
+            drop_extra=self.drop_extra,
+            shuffle=False,
+            sample_rate=1.0,
+        )
 
-    @property
-    def is_internal_shuffleable(self):
-        return True
+        def load(path):
+            with np.load(path, allow_pickle=False) as source:
+                return reader._unpack_data(
+                    **{key: np.array(source[key], copy=True) for key in source.files}
+                )
+
+        decoder = NpzRowRecordDecoder(
+            "sparse-katago-npz",
+            runtime_context,
+            load,
+            reader._prepare_entry_data,
+            apply_symmetry=self.apply_symmetry,
+            catalog_rows=lambda data, length: (
+                (
+                    None
+                    if tuple(data["board_input"].shape[-2:]) in self.boardsizes
+                    else np.empty(0, dtype=np.int64)
+                ),
+                (
+                    self.fixed_board_size
+                    or tuple(data["board_input"].shape[-2:])
+                    if tuple(data["board_input"].shape[-2:]) in self.boardsizes
+                    else np.empty((0, 2), dtype=np.int64)
+                ),
+            ),
+            semantic_state={
+                "boardsizes": sorted(self.boardsizes),
+                "fixed_side_input": self.fixed_side_input,
+                "fixed_board_size": self.fixed_board_size,
+                "drop_extra": self.drop_extra,
+            },
+        )
+        paths = reject_duplicate_physical_files(self.file_list)
+        catalogs = [
+            decoder.inspect_compact(path, ordinal)
+            for ordinal, path in enumerate(paths)
+        ]
+        self._record_source = IndexedNpzSource(
+            catalogs,
+            decoder,
+            seed=runtime_context.seed,
+            shuffle=self.shuffle,
+            sample_rate=self.sample_rate,
+        )
+        composer = (
+            PipelineStateComposer(self.batch_pipelines)
+            if self.batch_pipelines
+            else None
+        )
+        self._partitioned_stream = DatasetPlanner(
+            self._record_source,
+            runtime_context,
+            PlannerConfig(
+                shuffle=self.shuffle,
+                shuffle_buffer_size=self.shuffle_window_size,
+                shuffle_buffer_bytes=self.shuffle_buffer_bytes,
+                steps_per_epoch=self.steps_per_epoch,
+            ),
+            pipeline_composer=composer,
+        )
+        self._planned_decoder = SourceBatchDataset(
+            self._partitioned_stream,
+            self._record_source,
+        )
+        return self._partitioned_stream
 
     def _unpack_global_feature(self, packed_data):
         # Channel 0: side to move (black = -1.0, white = 1.0)
@@ -67,7 +151,8 @@ class IterativeSparseNumpyDataset(IterableDataset):
     def _unpack_policy_target(self, packed_data):
         length, n_features, n_cells = packed_data.shape
         bsize = int(np.sqrt(n_cells))
-        assert bsize * bsize == n_cells
+        if bsize * bsize != n_cells:
+            raise ValueError("packed sparse board mask has an invalid cell count")
 
         # Channel 0: policy target this turn
         policy_target_stm = packed_data[:, 0, :].reshape(-1, bsize, bsize)
@@ -80,9 +165,10 @@ class IterativeSparseNumpyDataset(IterableDataset):
         length_u16, n_feature_u16, n_cells_u16 = data_u16.shape
         bsize = int(np.sqrt(n_cells_u8))
         n_feature = n_feature_u8 + n_feature_u16
-        assert bsize * bsize == n_cells_u8
-        assert length_u8 == length_u16
-        assert n_cells_u8 == n_cells_u16
+        if bsize * bsize != n_cells_u8:
+            raise ValueError("packed sparse feature has an invalid cell count")
+        if length_u8 != length_u16 or n_cells_u8 != n_cells_u16:
+            raise ValueError("u8/u16 sparse feature tensors have incompatible shapes")
 
         feature_input_stm = np.concatenate((data_u8.astype(np.uint16), data_u16), axis=1)
         feature_input_stm = feature_input_stm.reshape(length_u8, n_feature, bsize, bsize)
@@ -104,8 +190,10 @@ class IterativeSparseNumpyDataset(IterableDataset):
         value_target = self._unpack_global_target(globalTargetsNC)
         policy_target = self._unpack_policy_target(policyTargetsNCHW)
         feature_input_stm = self._unpack_feature_input(sparseInputNCHWU8, sparseInputNCHWU16)
-        assert sparseInputDim.ndim == 1
-        assert sparseInputDim.shape[0] == feature_input_stm.shape[1]
+        if sparseInputDim.ndim != 1:
+            raise ValueError("sparseInputDim must be one-dimensional")
+        if sparseInputDim.shape[0] != feature_input_stm.shape[1]:
+            raise ValueError("sparseInputDim does not match feature channels")
 
         return {
             "board_input": board_input_stm,
@@ -136,44 +224,10 @@ class IterativeSparseNumpyDataset(IterableDataset):
             symmetry_type=self.apply_symmetry,
             drop_extra=self.drop_extra,
         )
-        # Flip side when stm is white
-        if self.fixed_side_input and data["stm_input"] > 0:
-            data["sparse_feature_input"] = np.take(
-                data["sparse_feature_input"],
-                indices=[4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10],
-                axis=0,
-            )
-
-        # convert uint16 to int16, uint32 to int32 due to pytorch requirement
-        # assert data['sparse_feature_input'].max() <= np.iinfo(np.int16).max
-        assert data["sparse_feature_dim"].max() <= np.iinfo(np.int32).max
+        # Convert unsigned feature storage to PyTorch-compatible signed types.
+        if data["sparse_feature_dim"].max() > np.iinfo(np.int32).max:
+            raise ValueError("sparse feature dimension exceeds int32")
         data["sparse_feature_input"] = data["sparse_feature_input"].astype(np.int32)
         data["sparse_feature_dim"] = data["sparse_feature_dim"].astype(np.int32)
 
         return data
-
-    def __iter__(self):
-        partition_num, partition_idx = get_partition_num_and_idx()
-        partition_per_file = min(partition_num, self.max_partition_per_file)
-        assert partition_num % partition_per_file == 0, \
-            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
-
-        for file_index in make_subset_range(
-            len(self.file_list),
-            partition_num=partition_num // partition_per_file,
-            partition_idx=partition_idx // partition_per_file,
-            shuffle=self.shuffle,
-        ):
-            filename = self.file_list[file_index]
-            data_dict, length = self._unpack_data(**np.load(filename))
-
-            for index in make_subset_range(
-                length,
-                partition_num=partition_per_file,
-                partition_idx=partition_idx % partition_per_file,
-                shuffle=self.shuffle,
-                sample_rate=self.sample_rate,
-            ):
-                data = self._prepare_entry_data(data_dict, index)
-                if data is not None:
-                    yield data

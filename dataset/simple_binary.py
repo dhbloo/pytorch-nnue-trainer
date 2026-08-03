@@ -1,12 +1,14 @@
 import numpy as np
 import lz4.frame
 import ctypes
-import random
-import torch.utils.data
+import copy
 import io
-from torch.utils.data.dataset import IterableDataset
 from utils.data_utils import *
 from . import DATASETS
+from .core import PipelineStateComposer, uniform_below
+from .planner import DatasetPlanner, PlannerConfig
+from .sequential_source import InterleavedSequentialSource
+from .source_dataset import PlannedBatchDataset, SourceBatchDataset
 
 
 class Entry(ctypes.Structure):
@@ -50,9 +52,17 @@ def write_entry(
     f.write(bytearray(entry)[: 4 + 2 * len(position)])
 
 
+def _readinto_exact(f: io.RawIOBase, buf) -> None:
+    """Fill *buf* completely from *f*, raising EOFError on a short read."""
+    size = ctypes.sizeof(buf)
+    read = f.readinto(buf)
+    if read != size:
+        raise EOFError(f"expected {size} bytes, got {read}")
+
+
 def read_entry(f: io.RawIOBase) -> tuple[Result, int, int, Rule, Move, list[Move]]:
     ehead = EntryHead()
-    f.readinto(ehead)
+    _readinto_exact(f, ehead)
 
     result = Result(ehead.result)
     ply = int(ehead.ply)
@@ -61,14 +71,50 @@ def read_entry(f: io.RawIOBase) -> tuple[Result, int, int, Rule, Move, list[Move
     move = Move((ehead.move >> 5) & 31, ehead.move & 31)
 
     pos_array = (ctypes.c_uint16 * ehead.ply)()
-    f.readinto(pos_array)
+    _readinto_exact(f, pos_array)
     position = [Move((m >> 5) & 31, m & 31) for m in pos_array]
 
     return result, ply, boardsize, rule, move, position
 
 
+def read_raw_entry(f: io.RawIOBase) -> bytes:
+    """Read one entry without constructing its move list during admission."""
+    header_size = ctypes.sizeof(EntryHead)
+    header = f.read(header_size)
+    if len(header) != header_size:
+        raise EOFError(f"expected {header_size} bytes, got {len(header)}")
+    entry_head = EntryHead.from_buffer_copy(header)
+    payload_size = 2 * int(entry_head.ply)
+    parts = []
+    remaining = payload_size
+    while remaining:
+        part = f.read(remaining)
+        if not part:
+            break
+        parts.append(part)
+        remaining -= len(part)
+    if remaining:
+        raise EOFError(f"expected {payload_size} bytes, got {payload_size - remaining}")
+    return header + b"".join(parts)
+
+
+def decode_raw_entry(raw_entry: bytes):
+    stream = io.BytesIO(raw_entry)
+    entry = read_entry(stream)
+    if stream.tell() != len(raw_entry):
+        raise RuntimeError("simple-binary payload contains trailing entry bytes")
+    return entry
+
+
+def raw_entry_shape(raw_entry: bytes):
+    if len(raw_entry) < ctypes.sizeof(EntryHead):
+        raise RuntimeError("simple-binary payload is missing its header")
+    entry_head = EntryHead.from_buffer_copy(raw_entry)
+    return int(entry_head.boardsize), str(Rule(entry_head.rule))
+
+
 @DATASETS.register("simple_binary")
-class SimpleBinaryDataset(IterableDataset):
+class SimpleBinaryDataset(PlannedBatchDataset):
     FILE_EXTS = [".lz4", ".bin"]
 
     def __init__(
@@ -82,10 +128,16 @@ class SimpleBinaryDataset(IterableDataset):
         drop_extra: bool = False,
         shuffle: bool = False,
         sample_rate: float = 1.0,
-        max_partition_per_file: int = 1,
-        **kwargs
+        batch_size: int | None = None,
+        batch_pipelines=(),
+        shuffle_window_size: int = 32768,
+        shuffle_buffer_bytes: int | None = 256 * 1024 * 1024,
+        sequential_active_streams: int = 2,
+        sequential_read_quantum: int = 256,
+        steps_per_epoch: int | None = None,
     ):
         super().__init__()
+        self.batch_pipelines = tuple(batch_pipelines)
         self.file_list = file_list
         self.rules = rules
         self.boardsizes = boardsizes
@@ -95,15 +147,112 @@ class SimpleBinaryDataset(IterableDataset):
         self.drop_extra = drop_extra
         self.shuffle = shuffle
         self.sample_rate = sample_rate
-        self.max_partition_per_file = max_partition_per_file
-
+        self.shuffle_window_size = shuffle_window_size
+        self.shuffle_buffer_bytes = shuffle_buffer_bytes
+        self.sequential_active_streams = sequential_active_streams
+        self.sequential_read_quantum = sequential_read_quantum
+        self.steps_per_epoch = steps_per_epoch
     @property
-    def is_fixed_side_input(self):
-        return self.fixed_side_input
+    def capabilities(self):
+        from .core import DatasetCapabilities
 
-    @property
-    def is_internal_shuffleable(self):
-        return False
+        return DatasetCapabilities(
+            True,
+            not any(path.lower().endswith(".lz4") for path in self.file_list),
+            True,
+            True,
+        )
+
+    def _build_partitioned_stream(self):
+        runtime_context = getattr(self, "runtime_context", None)
+        if runtime_context is None:
+            raise RuntimeError("simple_binary requires a DatasetRuntimeContext")
+
+        reader = SimpleBinaryDataset(
+            file_list=[],
+            rules=self.rules,
+            boardsizes=self.boardsizes,
+            fixed_side_input=self.fixed_side_input,
+            fixed_board_size=self.fixed_board_size,
+            apply_symmetry=False,
+            drop_extra=self.drop_extra,
+            shuffle=False,
+            sample_rate=1.0,
+        )
+        semantic_state = {
+            "rules": sorted(self.rules),
+            "boardsizes": sorted(self.boardsizes),
+            "fixed_side_input": self.fixed_side_input,
+            "fixed_board_size": self.fixed_board_size,
+            "drop_extra": self.drop_extra,
+            "apply_symmetry": self.apply_symmetry,
+        }
+
+        def shape_of(raw_entry):
+            boardsize_value, rule = raw_entry_shape(raw_entry)
+            boardsize = (boardsize_value, boardsize_value)
+            if rule not in self.rules or boardsize not in self.boardsizes:
+                return None
+            return self.fixed_board_size or boardsize
+
+        def materialize_entry(entry, record_key, epoch):
+            data = reader._prepare_data_from_entry(*entry)
+            if data is None or not self.apply_symmetry:
+                return data
+            from utils.data_utils import Symmetry
+
+            board_size = tuple(int(value) for value in np.asarray(data["board_size"]))
+            kind = "default" if self.apply_symmetry is True else self.apply_symmetry
+            choices = Symmetry.available_symmetries(board_size, kind)
+            symmetry_index, _ = uniform_below(
+                len(choices),
+                runtime_context.seed,
+                "symmetry",
+                (epoch, record_key, 0),
+            )
+            return post_process_data(
+                copy.deepcopy(data),
+                symmetry_type=self.apply_symmetry,
+                symmetry_index=symmetry_index,
+            )
+
+        self._record_source = InterleavedSequentialSource(
+            self.file_list,
+            format_id="simple-binary",
+            schema_version=2,
+            seed=runtime_context.seed,
+            shuffle=self.shuffle,
+            sample_rate=self.sample_rate,
+            active_streams=self.sequential_active_streams,
+            read_quantum=self.sequential_read_quantum,
+            output_shapes={self.fixed_board_size} if self.fixed_board_size else self.boardsizes,
+            open_file=reader._open_binary_file,
+            read_entry=read_entry,
+            read_raw_entry=read_raw_entry,
+            decode_raw_entry=decode_raw_entry,
+            shape_of=shape_of,
+            materialize_entry=materialize_entry,
+            semantic_state=semantic_state,
+        )
+        self._partitioned_stream = DatasetPlanner(
+            self._record_source,
+            runtime_context,
+            PlannerConfig(
+                shuffle=self.shuffle,
+                shuffle_buffer_size=self.shuffle_window_size,
+                shuffle_buffer_bytes=self.shuffle_buffer_bytes,
+                steps_per_epoch=self.steps_per_epoch,
+            ),
+            pipeline_composer=(
+                PipelineStateComposer(self.batch_pipelines)
+                if self.batch_pipelines
+                else None
+            ),
+        )
+        self._planned_decoder = SourceBatchDataset(
+            self._partitioned_stream, self._record_source
+        )
+        return self._partitioned_stream
 
     def _open_binary_file(self, filename: str):
         if filename.endswith("lz4"):
@@ -162,27 +311,3 @@ class SimpleBinaryDataset(IterableDataset):
             drop_extra=self.drop_extra,
         )
         return data
-
-    def __iter__(self):
-        partition_num, partition_idx = get_partition_num_and_idx()
-        partition_per_file = min(partition_num, self.max_partition_per_file)
-        assert partition_num % partition_per_file == 0, \
-            f"partition_num {partition_num} should be divisible by partition_per_file {partition_per_file}"
-
-        for file_index in make_subset_range(
-            len(self.file_list),
-            partition_num=partition_num // partition_per_file,
-            partition_idx=partition_idx // partition_per_file,
-            shuffle=self.shuffle,
-        ):
-            filename = self.file_list[file_index]
-            with self._open_binary_file(filename) as f:
-                while f.peek() != b"":
-                    data = self._prepare_data_from_entry(*read_entry(f))
-
-                    # random skip data according to sample rate
-                    if random.random() >= self.sample_rate:
-                        continue
-
-                    if data is not None:
-                        yield data

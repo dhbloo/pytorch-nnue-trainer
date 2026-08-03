@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-import torch.distributed as dist
+import hashlib
 from enum import Enum
 
 
@@ -78,9 +78,9 @@ class Symmetry(Enum):
 
     @staticmethod
     def available_symmetries(boardsize: tuple[int, int], symmetry_type="default") -> list["Symmetry"]:
-        sx, sy = boardsize
+        height, width = (int(v) for v in boardsize)
         if symmetry_type == "default":
-            if sx == sy:
+            if height == width:
                 return [
                     Symmetry.IDENTITY,
                     Symmetry.ROTATE_90,
@@ -94,10 +94,23 @@ class Symmetry(Enum):
             else:
                 return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_X, Symmetry.FLIP_Y]
         elif symmetry_type == "rotate":
+            if height != width:
+                raise ValueError(
+                    f"rotate symmetry changes shape for non-square board {(height, width)}"
+                )
             return [Symmetry.IDENTITY, Symmetry.ROTATE_90, Symmetry.ROTATE_180, Symmetry.ROTATE_270]
         elif symmetry_type == "flip":
+            if height != width:
+                raise ValueError(
+                    f"flip symmetry includes diagonal transforms for non-square board "
+                    f"{(height, width)}"
+                )
             return [Symmetry.IDENTITY, Symmetry.FLIP_X, Symmetry.FLIP_Y, Symmetry.FLIP_XY, Symmetry.FLIP_YX]
         elif symmetry_type == "flip_diag_rotate180":
+            if height != width:
+                raise ValueError(
+                    f"diagonal symmetry changes shape for non-square board {(height, width)}"
+                )
             return [Symmetry.IDENTITY, Symmetry.ROTATE_180, Symmetry.FLIP_XY, Symmetry.FLIP_YX]
         else:
             raise ValueError(f"unsupported symmetry_type: {symmetry_type}")
@@ -106,18 +119,23 @@ class Symmetry(Enum):
         """Apply symmetry transformation to a move (x, y)"""
         if move.is_pass:
             return move
-        assert self in Symmetry.available_symmetries(boardsize)
-        sx, sy = boardsize
-        sx, sy = sx - 1, sy - 1
+        allowed = Symmetry.available_symmetries(boardsize)
+        if self not in allowed:
+            raise ValueError(
+                f"symmetry {self.name} changes shape for non-square board {tuple(boardsize)}"
+            )
+        height, width = (int(v) for v in boardsize)
+        if not (0 <= move.x < width and 0 <= move.y < height):
+            raise ValueError(f"move {move} is outside board {(height, width)}")
         mapping_list = [
             lambda x, y: (x, y),
-            lambda x, y: (y, sy - x),
-            lambda x, y: (sx - x, sy - y),
-            lambda x, y: (sx - y, x),
-            lambda x, y: (x, sy - y),
-            lambda x, y: (sx - x, y),
+            lambda x, y: (y, width - 1 - x),
+            lambda x, y: (width - 1 - x, height - 1 - y),
+            lambda x, y: (height - 1 - y, x),
+            lambda x, y: (x, height - 1 - y),
+            lambda x, y: (width - 1 - x, y),
             lambda x, y: (y, x),
-            lambda x, y: (sx - y, sy - x),
+            lambda x, y: (height - 1 - y, width - 1 - x),
         ]
         new_x, new_y = mapping_list[self.value](move.x, move.y)
         return Move(x=new_x, y=new_y)
@@ -144,73 +162,258 @@ class Symmetry(Enum):
         return array.copy()
 
 
-def even_select_range(N, M):
-    """
-    Selects M elements from N elements evenly.
 
-    Returns:
-        A range of N booleans indicating whether to select one element.
-    """
-    assert 0 < M < N
+class SamplePostProcessor:
+    """Own all field-aware sample and batch transformations."""
 
-    if M > N / 2:
-        q, r = divmod(N, N - M)
-        j = 0
-        for i in range(N):
-            if q * j + min(j, r) == i:
-                j = min(j + 1, N - M - 1)
-                yield False
+    def process_sample(
+        self,
+        data: dict,
+        fixed_side_input=False,
+        fixed_board_size=None,
+        symmetry_type=None,
+        symmetry_index=None,
+        drop_extra=False,
+    ) -> dict:
+        """
+        Apply post processing to the data dict that contains some numpy arrays.
+        Keys to be processed:
+            board_input: int8 ndarray of shape (C, H, W).
+            value_target: float ndarray of shape (3), win-loss-draw probability.
+            policy_target: int8 ndarray of shape (H, W) or (H*W+1) with pass move.
+            position: a list of Move objects. (optional)
+        Other keys are kept as they are, and some may be used to help processing:
+            board_size: int8 ndarray of shape (2), height and width.
+            stm_input: float ndarray of shape (1), -1.0 for black and 1.0 for white.
+
+        Args:
+            data: A dict containing numpy arrays.
+            fixed_side_input: Whether to fix the side of the input, so that the
+                first channel is always black and the second channel is always white.
+            fixed_board_size: The fixed board size to use. If None, the size of input plane
+                will be the same as the board size. Otherwise, the input plane will be padded
+                to the fixed board size.
+            symmetry_type: The type of symmetry to apply to the data. False for no symmetry.
+            symmetry_index: The index of the symmetry to apply to the data. None for random.
+            drop_extra: Drop extra data except for the core ndarray.
+        """
+        from dataset.core import validate_field_dict
+
+        data = dict(data)
+        validate_field_dict(data, batched=False)
+
+        if fixed_side_input and data["stm_input"] > 0:
+            # Flip side when stm is white. Both arrays may be views into a dataset's
+            # storage, so take copies: never mutate the stored win/loss values, and
+            # keep board_input contiguous for default_collate (np.flip returns a
+            # negative-stride view that torch.as_tensor rejects).
+            data["board_input"] = np.ascontiguousarray(np.flip(data["board_input"], axis=0))
+            value_target = data["value_target"]
+            perm = np.arange(len(value_target))
+            perm[[0, 1]] = [1, 0]  # swap win/loss, keep any further channels
+            data["value_target"] = value_target[perm]
+            if "sparse_feature_input" in data:
+                data["sparse_feature_input"] = np.take(
+                    data["sparse_feature_input"],
+                    indices=[4, 5, 6, 7, 0, 1, 2, 3, 9, 8, 11, 10],
+                    axis=0,
+                )
+
+        if symmetry_type:
+            if symmetry_type == True:
+                symmetry_type = "default"  # Default symmetry type
+            symmetries = Symmetry.available_symmetries(data["board_size"], symmetry_type)
+            if symmetry_index is None:
+                from dataset.core import uniform_below
+
+                digest = hashlib.sha256()
+                digest.update(b"NNUE-sample-transform-fallback-v1\0")
+                for key in (
+                    "board_size",
+                    "board_input",
+                    "stm_input",
+                    "value_target",
+                    "policy_target",
+                ):
+                    value = np.ascontiguousarray(np.asarray(data[key]))
+                    digest.update(key.encode("ascii") + b"\0")
+                    digest.update(value.dtype.str.encode("ascii") + b"\0")
+                    digest.update(repr(value.shape).encode("ascii") + b"\0")
+                    digest.update(value.tobytes())
+                symmetry_index, _ = uniform_below(
+                    len(symmetries),
+                    0,
+                    "sample_symmetry_fallback",
+                    (digest.digest(),),
+                )
+            picked_symmetry = symmetries[symmetry_index]
+
+            # Apply symmetry to the board_input, policy_target
+            data["board_input"] = picked_symmetry.apply_to_array(data["board_input"])
+            if "sparse_feature_input" in data:
+                data["sparse_feature_input"] = picked_symmetry.apply_to_array(
+                    data["sparse_feature_input"]
+                )
+            if data["policy_target"].ndim == 1:
+                if (
+                    data["policy_target"].shape[0]
+                    != np.prod(data["board_size"]) + 1
+                ):
+                    raise ValueError(
+                        "flattened policy target does not match board_size"
+                    )
+                policy_target_sym = data["policy_target"][:-1].reshape(tuple(data["board_size"]))
+                policy_target_sym = picked_symmetry.apply_to_array(policy_target_sym)
+                data["policy_target"] = np.concatenate(
+                    [policy_target_sym.reshape(-1), data["policy_target"][-1:]]
+                )
             else:
-                yield True
-    else:
-        q, r = divmod(N, M)
-        j = 0
-        for i in range(N):
-            if q * j + min(j, r) == i:
-                j = min(j + 1, M - 1)
-                yield True
+                data["policy_target"] = picked_symmetry.apply_to_array(data["policy_target"])
+
+            # Apply symmetry to the optional position
+            if "position" in data:
+                data["position"] = [
+                    picked_symmetry.apply_to_move(m, data["board_size"]) for m in data["position"]
+                ]
+
+        if fixed_board_size is not None:
+            padded_h, padded_w = fixed_board_size
+            board_channels, board_h, board_w = data["board_input"].shape
+            data["board_input"] = np.pad(
+                data["board_input"],
+                ((0, 0), (0, padded_h - board_h), (0, padded_w - board_w)),
+                mode="constant",
+                constant_values=0,
+            )
+            if "sparse_feature_input" in data:
+                sparse = data["sparse_feature_input"]
+                data["sparse_feature_input"] = np.pad(
+                    sparse,
+                    ((0, 0), (0, padded_h - sparse.shape[-2]), (0, padded_w - sparse.shape[-1])),
+                    mode="constant",
+                    constant_values=0,
+                )
+
+            if data["policy_target"].ndim == 1:
+                if (
+                    data["policy_target"].shape[0]
+                    != np.prod(data["board_size"]) + 1
+                ):
+                    raise ValueError(
+                        "flattened policy target does not match board_size"
+                    )
+                policy_target_board = data["policy_target"][:-1].reshape((board_h, board_w))
+                policy_target_board = np.pad(
+                    policy_target_board,
+                    ((0, padded_h - board_h), (0, padded_w - board_w)),
+                    mode="constant",
+                    constant_values=0,
+                )
+                data["policy_target"] = np.concatenate(
+                    [policy_target_board.reshape(-1), data["policy_target"][-1:]]
+                )
             else:
-                yield False
+                data["policy_target"] = np.pad(
+                    data["policy_target"],
+                    ((0, padded_h - board_h), (0, padded_w - board_w)),
+                    mode="constant",
+                    constant_values=0,
+                )
+
+            if data["board_input"].shape != (
+                board_channels,
+                padded_h,
+                padded_w,
+            ):
+                raise RuntimeError("board padding produced an invalid shape")
+            if data["policy_target"].shape not in {
+                (padded_h, padded_w),
+                (padded_h * padded_w + 1,),
+            }:
+                raise RuntimeError("policy padding produced an invalid shape")
+
+        if drop_extra:
+            keys_to_preserve = ["board_size", "board_input", "stm_input", "value_target", "policy_target"]
+            data = {k: data[k] for k in keys_to_preserve}
+
+        if "position" in data:
+            transformed_position = data.pop("position")
+            data["position_string"] = "".join([str(m) for m in transformed_position])
+            data["last_move"] = (
+                transformed_position[-1].pos
+                if transformed_position
+                else np.array([-1, -1], dtype=np.int64)
+            )
+
+        return data
+    def process_batch(
+        self,
+        data,
+        fixed_side_input=False,
+        symmetry_type=None,
+        symmetry_indices=None,
+    ):
+        from dataset.core import FIELD_SPECS, validate_field_dict
+
+        validate_field_dict(data, batched=True)
+        if not fixed_side_input and not symmetry_type:
+            return data
+
+        batch_size = len(data["board_input"])
+        if symmetry_indices is not None and len(symmetry_indices) != batch_size:
+            raise ValueError(
+                "symmetry_indices must contain one entry per batch row"
+            )
+        samples = []
+        for index in range(batch_size):
+            sample = {}
+            for key, value in data.items():
+                spec = FIELD_SPECS.get(key)
+                sample[key] = (
+                    value
+                    if spec.scope == "batch_shared"
+                    else value[index]
+                )
+            samples.append(
+                self.process_sample(
+                    sample,
+                    fixed_side_input=fixed_side_input,
+                    symmetry_type=symmetry_type,
+                    symmetry_index=(
+                        None
+                        if symmetry_indices is None
+                        else int(symmetry_indices[index])
+                    ),
+                )
+            )
+        result = {}
+        for key in samples[0]:
+            spec = FIELD_SPECS[key]
+            values = [sample[key] for sample in samples]
+            if spec.scope == "batch_shared":
+                result[key] = values[0]
+            elif all(isinstance(value, torch.Tensor) for value in values):
+                result[key] = torch.stack(values, dim=0)
+            elif all(
+                isinstance(
+                    value,
+                    (np.ndarray, np.number, int, float, bool),
+                )
+                for value in values
+            ):
+                result[key] = np.stack(
+                    [
+                        np.ascontiguousarray(np.asarray(value))
+                        for value in values
+                    ],
+                    axis=0,
+                )
+            else:
+                result[key] = values
+        return result
 
 
-def get_partition_num_and_idx():
-    worker_info = torch.utils.data.get_worker_info()
-    worker_num = worker_info.num_workers if worker_info else 1
-    worker_id = worker_info.id if worker_info else 0
-    
-    if dist.is_available() and dist.is_initialized():
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-    else:
-        rank = 0
-        world_size = 1
-
-    # Combine worker id and rank to get a global unique partition index
-    partition_num = worker_num * world_size
-    partition_idx = rank * worker_num + worker_id
-    return partition_num, partition_idx
-
-
-def make_subset_range(length, partition_num, partition_idx, shuffle=False, sample_rate=1.0):
-    """Make a subset range from a partition of randomly (shuffled) sampled range(length)."""
-    # divide indices according to worker id and worker num
-    assert 0 <= partition_idx < partition_num
-    indices = np.arange(partition_idx, length, partition_num)
-    length = len(indices)
-
-    # randomly shuffle indices
-    if shuffle:
-        np.random.shuffle(indices)
-
-    # select a subset of indices according to sample rate
-    assert 0.0 <= sample_rate <= 1.0
-    if sample_rate == 1.0:
-        for index in indices:
-            yield index
-    elif sample_rate > 0:
-        for index in indices:
-            if np.random.random() < sample_rate:
-                yield index
+SAMPLE_POST_PROCESSOR = SamplePostProcessor()
 
 
 def post_process_data(
@@ -221,181 +424,28 @@ def post_process_data(
     symmetry_index=None,
     drop_extra=False,
 ) -> dict:
-    """
-    Apply post processing to the data dict that contains some numpy arrays.
-    Keys to be processed:
-        board_input: int8 ndarray of shape (C, H, W).
-        value_target: float ndarray of shape (3), win-loss-draw probability.
-        policy_target: int8 ndarray of shape (H, W) or (H*W+1) with pass move.
-        position: a list of Move objects. (optional)
-    Other keys are kept as they are, and some may be used to help processing:
-        board_size: int8 ndarray of shape (2), height and width.
-        stm_input: float ndarray of shape (1), -1.0 for black and 1.0 for white.
-
-    Args:
-        data: A dict containing numpy arrays.
-        fixed_side_input: Whether to fix the side of the input, so that the
-            first channel is always black and the second channel is always white.
-        fixed_board_size: The fixed board size to use. If None, the size of input plane
-            will be the same as the board size. Otherwise, the input plane will be padded
-            to the fixed board size.
-        symmetry_type: The type of symmetry to apply to the data. False for no symmetry.
-        symmetry_index: The index of the symmetry to apply to the data. None for random.
-        drop_extra: Drop extra data except for the core ndarray.
-    """
-    if fixed_side_input and data["stm_input"] > 0:
-        # Flip side when stm is white
-        data["board_input"] = np.flip(data["board_input"], axis=0)
-        value_target = data["value_target"]
-        value_target[0], value_target[1] = value_target[1], value_target[0]
-
-    if symmetry_type:
-        if symmetry_type == True:
-            symmetry_type = "default"  # Default symmetry type
-        symmetries = Symmetry.available_symmetries(data["board_size"], symmetry_type)
-        if symmetry_index is None:
-            symmetry_index = np.random.randint(len(symmetries))
-        picked_symmetry = symmetries[symmetry_index]
-
-        # Apply symmetry to the board_input, policy_target
-        data["board_input"] = picked_symmetry.apply_to_array(data["board_input"])
-        if data["policy_target"].ndim == 1:
-            assert (
-                data["policy_target"].shape[0] == np.prod(data["board_size"]) + 1
-            ), f"Invalid policy target shape ({data['policy_target'].shape}) for symmetry, must be (H*W+1)"
-            policy_target_sym = data["policy_target"][:-1].reshape((-1, *data["board_size"]))
-            policy_target_sym = picked_symmetry.apply_to_array(policy_target_sym)
-            policy_target_sym = policy_target_sym.reshape((policy_target_sym.shape[0], -1))
-            data["policy_target"] = np.concatenate([policy_target_sym, data["policy_target"][-1:]])
-        else:
-            data["policy_target"] = picked_symmetry.apply_to_array(data["policy_target"])
-
-        # Apply symmetry to the optional position
-        if "position" in data:
-            data["position"] = [
-                picked_symmetry.apply_to_move(m, data["board_size"]) for m in data["position"]
-            ]
-
-    if fixed_board_size is not None:
-        padded_h, padded_w = fixed_board_size
-        board_channels, board_h, board_w = data["board_input"].shape
-        data["board_input"] = np.pad(
-            data["board_input"],
-            ((0, 0), (0, padded_h - board_h), (0, padded_w - board_w)),
-            mode="constant",
-            constant_values=0,
-        )
-
-        if data["policy_target"].ndim == 1:
-            assert (
-                data["policy_target"].shape[0] == np.prod(data["board_size"]) + 1
-            ), f"Invalid policy target shape ({data['policy_target'].shape}) for symmetry, must be (H*W+1)"
-            policy_target_board = data["policy_target"][:-1].reshape((-1, *data["board_size"]))
-            policy_target_board = np.pad(
-                policy_target_board,
-                ((0, padded_h - board_h), (0, padded_w - board_w)),
-                mode="constant",
-                constant_values=0,
-            )
-            policy_target_board = policy_target_board.reshape((policy_target_board.shape[0], -1))
-            data["policy_target"] = np.concatenate([policy_target_board, data["policy_target"][-1:]])
-        else:
-            data["policy_target"] = np.pad(
-                data["policy_target"],
-                ((0, padded_h - board_h), (0, padded_w - board_w)),
-                mode="constant",
-                constant_values=0,
-            )
-
-        assert data["board_input"].shape == (board_channels, padded_h, padded_w)
-        assert data["policy_target"].shape == (padded_h, padded_w) or data["policy_target"].shape == (
-            padded_h * padded_w + 1,
-        )
-
-    if drop_extra:
-        keys_to_preserve = ["board_size", "board_input", "stm_input", "value_target", "policy_target"]
-        data = {k: data[k] for k in keys_to_preserve}
-
-    if "position" in data:
-        transformed_position = data.pop("position")
-        data["position_string"] = "".join([str(m) for m in transformed_position])
-        data["last_move"] = transformed_position[-1].pos
-
-    return data
+    return SAMPLE_POST_PROCESSOR.process_sample(
+        data,
+        fixed_side_input=fixed_side_input,
+        fixed_board_size=fixed_board_size,
+        symmetry_type=symmetry_type,
+        symmetry_index=symmetry_index,
+        drop_extra=drop_extra,
+    )
 
 
-def post_process_batch(data: dict, fixed_side_input=False, symmetry_type=None) -> dict:
-    """Vectorized :func:`post_process_data` for a whole batch of samples.
-
-    Keys to be processed (leading dim is the batch dim N):
-        board_size: int8 ndarray of shape (N, 2), all rows equal.
-        board_input: int8 ndarray of shape (N, C, H, W).
-        stm_input: float ndarray of shape (N, 1).
-        value_target: float ndarray of shape (N, 3).
-        policy_target: float ndarray of shape (N, H, W) or (N, H*W+1) with pass move.
-
-    Per-sample random symmetry is preserved: each sample independently draws a
-    symmetry, then samples are grouped by symmetry index and each group is
-    transformed with one array op.  The batch is reordered (grouped) in the
-    process, which is statistically neutral for training batches.
-
-    All arrays must own their storage (they are mutated / reassembled in place).
-    ``fixed_board_size`` and ``position`` handling of the per-sample path are
-    not supported here.
-    """
-    if fixed_side_input:
-        stm = data["stm_input"]
-        white = (stm[:, 0] if stm.ndim > 1 else stm) > 0
-        if white.any():
-            data["board_input"][white] = data["board_input"][white, ::-1]
-            vt = data["value_target"]
-            # swap win/loss (channels 0/1), keep any further channels
-            perm = np.arange(vt.shape[1])
-            perm[[0, 1]] = [1, 0]
-            vt[white] = vt[white][:, perm]
-
-    if symmetry_type:
-        if symmetry_type == True:
-            symmetry_type = "default"
-        board_size = tuple(int(s) for s in data["board_size"][0])
-        symmetries = Symmetry.available_symmetries(board_size, symmetry_type)
-        n = len(data["board_input"])
-        picked = np.random.randint(len(symmetries), size=n)
-        order = np.argsort(picked, kind="stable")
-        counts = np.bincount(picked, minlength=len(symmetries))
-
-        policy = data["policy_target"]
-        policy_is_flat = policy.ndim == 2
-        if policy_is_flat:
-            assert policy.shape[1] == board_size[0] * board_size[1] + 1, (
-                f"Invalid policy target shape ({policy.shape}) for symmetry, must be (N, H*W+1)"
-            )
-
-        board_groups, policy_groups = [], []
-        start = 0
-        for sym, count in zip(symmetries, counts):
-            if count == 0:
-                continue
-            sel = order[start : start + count]
-            start += count
-            board_groups.append(sym.apply_to_array(data["board_input"][sel]))
-            pol = policy[sel]
-            if policy_is_flat:
-                pol_board = pol[:, :-1].reshape(count, *board_size)
-                pol_board = sym.apply_to_array(pol_board).reshape(count, -1)
-                pol = np.concatenate([pol_board, pol[:, -1:]], axis=1)
-            else:
-                pol = sym.apply_to_array(pol)
-            policy_groups.append(pol)
-
-        data["board_input"] = np.concatenate(board_groups, axis=0)
-        data["policy_target"] = np.concatenate(policy_groups, axis=0)
-        # reorder the remaining keys to keep all arrays aligned
-        for k in data:
-            if k not in ("board_input", "policy_target"):
-                data[k] = data[k][order]
-
-    return data
+def post_process_batch(
+    data: dict,
+    fixed_side_input=False,
+    symmetry_type=None,
+    symmetry_indices=None,
+) -> dict:
+    return SAMPLE_POST_PROCESSOR.process_batch(
+        data,
+        fixed_side_input=fixed_side_input,
+        symmetry_type=symmetry_type,
+        symmetry_indices=symmetry_indices,
+    )
 
 
 def filter_data_by_condition(condition: str, data_dict: dict) -> int:
@@ -404,10 +454,9 @@ def filter_data_by_condition(condition: str, data_dict: dict) -> int:
     Assume the data dict contains numpy arrays with the same length at the first dim.
     Returns: The filtered length of the data dict.
     """
-    try:
-        condition = eval(condition, {"np": np, **data_dict})
-    except Exception as e:
-        raise ValueError(f"Invalid custom condition: {condition}, error: {e}")
+    from dataset.filter import evaluate_filter_condition
+
+    condition = evaluate_filter_condition(condition, data_dict)
 
     selected_indices = np.nonzero(condition)[0]
     for k in data_dict.keys():
