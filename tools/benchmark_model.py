@@ -11,17 +11,13 @@ import torch
 from tools.model_perf import (
     autocast_context,
     benchmark_loss,
-    build_initialized_model,
-    configure_cuda_memory_limit,
-    configure_model_compilation,
-    configure_torch_performance,
-    make_synthetic_data,
+    make_training_step,
     make_flop_counter,
-    move_data,
-    parse_model_args,
+    percentile,
+    prepare_model_workload,
     torch_performance_metadata,
+    validate_vq_initialization,
 )
-from utils.file_utils import load_torch_ckpt
 from utils.compile_utils import model_inductor_config
 
 
@@ -47,15 +43,6 @@ def estimate_training_flops(model, data, device, precision) -> int | None:
         model.train()
 
 
-def percentile(values: list[float], quantile: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
-
-
 def timing_summary(values: list[float]) -> dict[str, float]:
     return {
         "mean_ms": sum(values) / len(values),
@@ -65,36 +52,24 @@ def timing_summary(values: list[float]) -> dict[str, float]:
     }
 
 
-def vq_initialization(model) -> dict[str, bool]:
-    return {
-        name: bool(buffer.item())
-        for name, buffer in model.named_buffers()
-        if name == "inited" or name.endswith(".inited")
-    }
-
-
 def run(args) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("This benchmark requires a CUDA device")
     if args.warmup_steps < 1 or args.steps < 1:
         raise ValueError("--warmup-steps and --steps must both be positive")
 
-    configure_torch_performance(args.performance_level, args.allow_tf32)
-    device = torch.device(args.device)
-    allocator_limit_bytes = configure_cuda_memory_limit(device, args.max_memory_fraction)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-
-    model_args = parse_model_args(args.model_args)
-    model = build_initialized_model(args.model_type, model_args, args.seed)
-    if args.checkpoint:
-        state_dict, _, _ = load_torch_ckpt(args.checkpoint)
-        model.load_state_dict(state_dict)
-    model = model.to(device).train()
-    data = make_synthetic_data(
-        args.model_type, model, args.batch_size, args.board_size, args.seed + 1
+    device, allocator_limit_bytes, model_args, model, data = prepare_model_workload(
+        model_type=args.model_type,
+        encoded_model_args=args.model_args,
+        checkpoint=args.checkpoint,
+        batch_size=args.batch_size,
+        board_size=args.board_size,
+        seed=args.seed,
+        device_name=args.device,
+        performance_level=args.performance_level,
+        allow_tf32=args.allow_tf32,
+        max_memory_fraction=args.max_memory_fraction,
     )
-    data = move_data(data, device)
 
     if args.training_gflops_per_sample is not None:
         training_flops_per_sample = int(args.training_gflops_per_sample * 1e9)
@@ -106,35 +81,20 @@ def run(args) -> None:
         training_flops_per_sample = None
         flop_source = None
 
-    compile_fn = configure_model_compilation(
+    step, optimizer_metadata = make_training_step(
         model,
-        enabled=args.compile,
+        data,
+        device,
+        precision=args.precision,
+        compile_enabled=args.compile,
         backend=args.backend,
         mode=args.mode,
         fullgraph=args.fullgraph,
         dynamic=args.dynamic,
+        optimizer_enabled=args.optimizer,
+        optimizer_type=args.optimizer_type,
+        encoded_optimizer_args=args.optimizer_args,
     )
-
-    def forward_loss(batch):
-        return benchmark_loss(model(batch))
-
-    forward_loss = compile_fn(forward_loss)
-    optimizer = None
-    if args.optimizer:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, fused=True)
-    scaler = torch.amp.GradScaler("cuda", enabled=args.precision == "fp16")
-
-    def step():
-        torch.compiler.cudagraph_mark_step_begin()
-        model.zero_grad(set_to_none=True)
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, args.precision):
-            loss = forward_loss(data)
-        scaler.scale(loss).backward()
-        if optimizer is not None:
-            scaler.step(optimizer)
-            scaler.update()
 
     warmup_started = time.perf_counter()
     for _ in range(args.warmup_steps):
@@ -142,36 +102,12 @@ def run(args) -> None:
     torch.cuda.synchronize(device)
     warmup_seconds = time.perf_counter() - warmup_started
 
-    vq_initialized = vq_initialization(model)
-    if vq_initialized and not all(vq_initialized.values()):
-        raise RuntimeError(
-            "VQ codebooks are not initialized after warmup; pass an initialized checkpoint "
-            "or benchmark with kmeans_init: false"
-        )
+    vq_initialized = validate_vq_initialization(model, action="benchmark")
 
     torch.cuda.reset_peak_memory_stats(device)
     recorded = []
     for _ in range(args.steps):
-        start = torch.cuda.Event(enable_timing=True)
-        forward_end = torch.cuda.Event(enable_timing=True)
-        backward_end = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-
-        torch.compiler.cudagraph_mark_step_begin()
-        start.record()
-        model.zero_grad(set_to_none=True)
-        if optimizer is not None:
-            optimizer.zero_grad(set_to_none=True)
-        with autocast_context(device, args.precision):
-            loss = forward_loss(data)
-        forward_end.record()
-        scaler.scale(loss).backward()
-        backward_end.record()
-        if optimizer is not None:
-            scaler.step(optimizer)
-            scaler.update()
-        end.record()
-        recorded.append((start, forward_end, backward_end, end))
+        recorded.append(step.record_phases())
 
     torch.cuda.synchronize(device)
     forward_ms = [start.elapsed_time(fwd) for start, fwd, _, _ in recorded]
@@ -201,7 +137,7 @@ def run(args) -> None:
             "batch_size": args.batch_size,
             "board_size": args.board_size,
             "precision": args.precision,
-            "optimizer": "fused_adamw" if optimizer is not None else None,
+            "optimizer": optimizer_metadata,
             "warmup_steps": args.warmup_steps,
             "measured_steps": args.steps,
             "seed": args.seed,
@@ -272,6 +208,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fullgraph", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--dynamic", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--optimizer", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--optimizer-type", default="adamw")
+    parser.add_argument("--optimizer-args")
     parser.add_argument("--estimate-flops", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--training-gflops-per-sample", type=float)
     parser.add_argument("--peak-tflops", type=float)

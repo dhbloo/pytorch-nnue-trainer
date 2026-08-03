@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 import os
 import yaml
 import torch
@@ -9,13 +11,139 @@ from accelerate.utils import send_to_device
 from model import build_model
 from dataset.pipeline import build_data_pipeline
 from utils.file_utils import load_torch_ckpt
+from utils.config_utils import RUN_PROVENANCE_KEY, parse_run_provenance
 from utils.misc_utils import deep_update_dict
+
+
+_TRAIN_CONFIG_KEYS = frozenset(
+    {
+        "_provenance",
+        "config",
+        "train_datas",
+        "val_datas",
+        "rundir",
+        "trainer_type",
+        "load_from",
+        "use_cpu",
+        "dataset_type",
+        "dataset_args",
+        "val_dataset_type",
+        "val_dataset_args",
+        "dataloader_args",
+        "data_pipelines",
+        "num_worker",
+        "model_type",
+        "model_args",
+        "optim_type",
+        "optim_args",
+        "lr_scheduler_type",
+        "lr_scheduler_args",
+        "loss_type",
+        "loss_args",
+        "iterations",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "eval_bs_multipler",
+        "learning_rate",
+        "weight_decay",
+        "clip_grad_norm",
+        "clip_grad_value",
+        "no_shuffle",
+        "log_interval",
+        "show_interval",
+        "save_interval",
+        "val_interval",
+        "temp_save_interval",
+        "state_save_interval",
+        "num_keep_states",
+        "kd_model_type",
+        "kd_model_args",
+        "kd_checkpoint",
+        "kd_T",
+        "kd_alpha",
+        "kd_use_train_mode",
+        "kd_disable_amp",
+        "find_unused_parameters",
+        "random_seed",
+        "performance_level",
+        "max_memory_fraction",
+        "profiler_args",
+        "profile",
+        "profile_active_iters",
+        "profile_warmup_iters",
+        "profile_memory",
+    }
+)
+
+_EVAL_CONFIG_KEYS = frozenset(
+    {
+        "config",
+        "checkpoint",
+        "debug",
+        "use_cpu",
+        "model_type",
+        "model_args",
+        "test_model_args",
+        "board_width",
+        "board_height",
+        "dataset_args",
+        "data_pipelines",
+    }
+)
+
+_ALLOWED_CONFIG_KEYS = _TRAIN_CONFIG_KEYS | _EVAL_CONFIG_KEYS
+
+
+def _canonicalize_config_key(key):
+    if not isinstance(key, str):
+        raise configargparse.ConfigFileParserException(f"Unknown config key: {key}")
+    if key in _ALLOWED_CONFIG_KEYS:
+        return key
+    if key.startswith("--") and key[2:] in _ALLOWED_CONFIG_KEYS:
+        return key[2:]
+    raise configargparse.ConfigFileParserException(f"Unknown config key: {key}")
+
+
+class _StrictYAMLConfigFileParser(configargparse.YAMLConfigFileParser):
+    def parse(self, stream):
+        yaml_module, SafeLoader, _ = self._load_yaml()
+        try:
+            parsed_obj = yaml_module.load(stream, Loader=SafeLoader)
+        except Exception as e:
+            raise configargparse.ConfigFileParserException(
+                f"Couldn't parse config file: {e}"
+            )
+
+        if not isinstance(parsed_obj, dict):
+            raise configargparse.ConfigFileParserException(
+                "The config file doesn't appear to contain 'key: value' pairs "
+                "(aka. a YAML mapping). "
+                "yaml.load('%s') returned type '%s' instead of 'dict'."
+                % (getattr(stream, "name", "stream"), type(parsed_obj).__name__)
+            )
+
+        config_items = OrderedDict()
+        for key, value in parsed_obj.items():
+            if key in {RUN_PROVENANCE_KEY, f"--{RUN_PROVENANCE_KEY}"}:
+                try:
+                    parse_run_provenance(value)
+                except ValueError as e:
+                    raise configargparse.ConfigFileParserException(str(e))
+                continue
+            key = _canonicalize_config_key(key)
+            if isinstance(value, list):
+                config_items[key] = value
+            elif value is not None:
+                config_items[key] = str(value)
+        return config_items
 
 
 def parse_args_and_init():
     parser = configargparse.ArgParser(
         description="Test Play (and Debug)",
-        config_file_parser_class=configargparse.YAMLConfigFileParser,
+        config_file_parser_class=_StrictYAMLConfigFileParser,
+        ignore_unknown_config_file_keys=True,
+        allow_abbrev=False,
     )
     parser.add("-c", "--config", is_config_file=True, help="Config file path")
     parser.add("-p", "--checkpoint", required=True, help="Model checkpoint file to test")
@@ -29,7 +157,7 @@ def parse_args_and_init():
     parser.add("--dataset_args", type=yaml.safe_load, default={}, help="Extra dataset arguments")
     parser.add("--data_pipelines", type=yaml.safe_load, default={}, help="Data-pipeline arguments")
 
-    args, _ = parser.parse_known_args()  # parse args
+    args = parser.parse_args()
 
     if PartialState(cpu=args.use_cpu).is_local_main_process:
         parser.print_values()
@@ -91,7 +219,7 @@ class Board:
 
         data = {
             "board_input": board_input,
-            "board_size": np.array(self.board.shape, dtype=np.int8),
+            "board_size": np.array(self.board.shape[1:], dtype=np.int8),
             "stm_input": np.array([-1 if self.side_to_move == 0 else 1], dtype=np.float32),
         }
 
@@ -99,7 +227,7 @@ class Board:
             data = pipeline(data)
 
         data = {
-            k: torch.from_numpy(v) if isinstance(v, torch.Tensor) else torch.tensor(v)
+            k: torch.from_numpy(v) if isinstance(v, np.ndarray) else torch.as_tensor(v)
             for k, v in data.items()
         }
         return data
@@ -165,7 +293,7 @@ def debug_print(board, model, data):
         if isinstance(data[k], torch.Tensor):
             data[k] = torch.unsqueeze(data[k], dim=0)
 
-    # get predicted value and policy from model results
+    # Trace-enabled models observe the real forward through this adapter.
     if hasattr(model, "forward_debug_print"):
         torch.set_printoptions(precision=4, linewidth=120, sci_mode=False)
         with torch.no_grad():
@@ -242,7 +370,6 @@ def test_play(
     board_height,
     dataset_args,
     data_pipelines,
-    **kwargs,
 ):
     if not os.path.exists(checkpoint) or not os.path.isfile(checkpoint):
         raise RuntimeError(f"Checkpoint {checkpoint} must be a valid file")
@@ -288,6 +415,11 @@ def test_play(
         board.move(*move)
 
 
+def main():
+    args = vars(parse_args_and_init())
+    args.pop("config", None)
+    test_play(**args)
+
+
 if __name__ == "__main__":
-    args = parse_args_and_init()
-    test_play(**vars(args))
+    main()

@@ -11,8 +11,9 @@ from torch.utils.flop_counter import FlopCounterMode
 from model import build_model
 from utils.compile_utils import model_inductor_config, with_inductor_options
 from utils.cuda_utils import configure_cuda_memory_limit
+from utils.file_utils import load_torch_ckpt
 from utils.misc_utils import set_performance_level
-from utils.training_utils import weights_init
+from utils.training_utils import build_optimizer
 
 
 LINE_ENCODING_MODELS = {"linennuev1", "mix9svq"}
@@ -81,11 +82,40 @@ def parse_model_args(value: str | None) -> dict:
     return args
 
 
+# Matches torch.optim.AdamW's defaults, which is what these tools used before the
+# optimizer became selectable, so the arithmetic per step is unchanged.
+BENCHMARK_OPTIMIZER_LR = 1e-3
+BENCHMARK_OPTIMIZER_WEIGHT_DECAY = 1e-2
+
+
+def build_benchmark_optimizer(model, optimizer_type: str, optimizer_args: dict):
+    """Build the benchmarked optimizer through the registry, with its metadata.
+
+    Routing through :func:`build_optimizer` is what makes a registry-level
+    optimizer change visible to these tools.  Pass ``fused: true`` in
+    *optimizer_args* to reproduce the hardcoded ``torch.optim.AdamW(fused=True)``
+    these tools used previously.
+    """
+    optimizer = build_optimizer(
+        optimizer_type,
+        model,
+        lr=BENCHMARK_OPTIMIZER_LR,
+        weight_decay=BENCHMARK_OPTIMIZER_WEIGHT_DECAY,
+        **optimizer_args,
+    )
+    metadata = {
+        "type": optimizer_type,
+        "args": optimizer_args,
+        "implementation": type(optimizer).__name__,
+        "lr": BENCHMARK_OPTIMIZER_LR,
+        "weight_decay": BENCHMARK_OPTIMIZER_WEIGHT_DECAY,
+    }
+    return optimizer, metadata
+
+
 def build_initialized_model(model_type: str, model_args: dict, seed: int):
     torch.manual_seed(seed)
-    model = build_model(model_type, **model_args)
-    model.apply(weights_init({}))
-    return model
+    return build_model(model_type, **model_args)
 
 
 def make_synthetic_data(
@@ -155,6 +185,36 @@ def move_data(data: dict[str, torch.Tensor], device: torch.device) -> dict[str, 
     return {key: value.to(device) for key, value in data.items()}
 
 
+def prepare_model_workload(
+    *,
+    model_type: str,
+    encoded_model_args: str | None,
+    checkpoint: str | None,
+    batch_size: int,
+    board_size: int,
+    seed: int,
+    device_name: str,
+    performance_level: int,
+    allow_tf32: bool | None,
+    max_memory_fraction: float,
+):
+    """Build the common deterministic model workload used by GPU tools."""
+    configure_torch_performance(performance_level, allow_tf32)
+    device = torch.device(device_name)
+    allocator_limit_bytes = configure_cuda_memory_limit(device, max_memory_fraction)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    model_args = parse_model_args(encoded_model_args)
+    model = build_initialized_model(model_type, model_args, seed)
+    if checkpoint:
+        state_dict, _, _ = load_torch_ckpt(checkpoint)
+        model.load_state_dict(state_dict)
+    model = model.to(device).train()
+    data = make_synthetic_data(model_type, model, batch_size, board_size, seed + 1)
+    return device, allocator_limit_bytes, model_args, model, move_data(data, device)
+
+
 def precision_dtype(precision: str):
     return {
         "fp32": None,
@@ -222,12 +282,154 @@ def configure_model_compilation(
     return compile_fn
 
 
+class ModelTrainingStep:
+    """Callable training step with optional phase-timing event capture."""
+
+    def __init__(self, model, data, device, precision, forward_loss, optimizer, scaler):
+        self.model = model
+        self.data = data
+        self.device = device
+        self.precision = precision
+        self.forward_loss = forward_loss
+        self.optimizer = optimizer
+        self.scaler = scaler
+
+    def __call__(self) -> None:
+        torch.compiler.cudagraph_mark_step_begin()
+        self.model.zero_grad(set_to_none=True)
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        with autocast_context(self.device, self.precision):
+            loss = self.forward_loss(self.data)
+        self.scaler.scale(loss).backward()
+        if self.optimizer is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+    def record_phases(self):
+        """Run one step while recording the historical CUDA phase boundaries."""
+        start = torch.cuda.Event(enable_timing=True)
+        forward_end = torch.cuda.Event(enable_timing=True)
+        backward_end = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+
+        torch.compiler.cudagraph_mark_step_begin()
+        start.record()
+        self.model.zero_grad(set_to_none=True)
+        if self.optimizer is not None:
+            self.optimizer.zero_grad(set_to_none=True)
+        with autocast_context(self.device, self.precision):
+            loss = self.forward_loss(self.data)
+        forward_end.record()
+        self.scaler.scale(loss).backward()
+        backward_end.record()
+        if self.optimizer is not None:
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        end.record()
+        return start, forward_end, backward_end, end
+
+
+def make_training_step(
+    model,
+    data: dict[str, torch.Tensor],
+    device: torch.device,
+    *,
+    precision: str,
+    compile_enabled: bool,
+    backend: str,
+    mode: str,
+    fullgraph: bool,
+    dynamic: bool | None,
+    optimizer_enabled: bool,
+    optimizer_type: str,
+    encoded_optimizer_args: str | None,
+):
+    """Create the shared benchmark loss step without changing timing boundaries."""
+    compile_fn = configure_model_compilation(
+        model,
+        enabled=compile_enabled,
+        backend=backend,
+        mode=mode,
+        fullgraph=fullgraph,
+        dynamic=dynamic,
+    )
+
+    def forward_loss(batch):
+        return benchmark_loss(model(batch))
+
+    forward_loss = compile_fn(forward_loss)
+    optimizer = None
+    optimizer_metadata = None
+    if optimizer_enabled:
+        optimizer, optimizer_metadata = build_benchmark_optimizer(
+            model, optimizer_type, parse_model_args(encoded_optimizer_args)
+        )
+    scaler = torch.amp.GradScaler("cuda", enabled=precision == "fp16")
+
+    step = ModelTrainingStep(model, data, device, precision, forward_loss, optimizer, scaler)
+    return step, optimizer_metadata
+
+
+def vq_initialization(model) -> dict[str, bool]:
+    """Return initialization state for every VQ codebook in a model tree."""
+    return {
+        name: bool(buffer.item())
+        for name, buffer in model.named_buffers()
+        if name == "inited" or name.endswith(".inited")
+    }
+
+
+def validate_vq_initialization(model, *, action: str) -> dict[str, bool]:
+    """Require every discovered VQ codebook to be initialized after warmup."""
+    initialized = vq_initialization(model)
+    if initialized and not all(initialized.values()):
+        raise RuntimeError(
+            "VQ codebooks are not initialized after warmup; pass an initialized checkpoint "
+            f"or {action} with kmeans_init: false"
+        )
+    return initialized
+
+
+def percentile(values: list[float], quantile: float) -> float:
+    """Interpolate a quantile using the tools' historical percentile rule."""
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    fraction = position - lower
+    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
+
+
+def _aux_loss_tensors(aux_losses: dict | None):
+    """Yield (name, tensor, is_raw_output) for every tensor in *aux_losses*.
+
+    Tensor-form entries are already-reduced scalar losses. Tuple-form entries
+    ``(loss_type, inputs)`` carry raw head outputs that training turns into
+    weighted losses (trainer/loss/supervised.py); they must be exercised too,
+    or the compiler can DCE the corresponding heads and equivalence checks
+    never compare them.
+    """
+    for name, aux_loss in (aux_losses or {}).items():
+        if isinstance(aux_loss, torch.Tensor):
+            yield name, aux_loss, False
+        elif isinstance(aux_loss, tuple) and len(aux_loss) == 2:
+            aux_input = aux_loss[1]
+            inputs = aux_input if isinstance(aux_input, tuple) else (aux_input,)
+            for index, tensor in enumerate(inputs):
+                if isinstance(tensor, torch.Tensor):
+                    key = name if len(inputs) == 1 else f"{name}.{index}"
+                    yield key, tensor, True
+
+
 def benchmark_loss(results: dict) -> torch.Tensor:
     """A target-independent scalar that exercises all standard train outputs."""
     loss = results["value"].float().square().mean()
     loss = loss + results["policy"].float().square().mean()
-    for aux_loss in (results.get("aux_losses") or {}).values():
-        if isinstance(aux_loss, torch.Tensor):
+    for _, aux_loss, is_raw_output in _aux_loss_tensors(results.get("aux_losses")):
+        if is_raw_output:
+            loss = loss + aux_loss.float().square().mean()
+        else:
             loss = loss + aux_loss.float()
     return loss
 
@@ -241,9 +443,8 @@ def collect_results(results: dict, model) -> dict:
         "value": results["value"].detach().cpu().clone(),
         "policy": results["policy"].detach().cpu().clone(),
     }
-    for name, aux_loss in (results.get("aux_losses") or {}).items():
-        if isinstance(aux_loss, torch.Tensor):
-            outputs[f"aux_losses.{name}"] = aux_loss.detach().cpu().clone()
+    for name, aux_loss, _ in _aux_loss_tensors(results.get("aux_losses")):
+        outputs[f"aux_losses.{name}"] = aux_loss.detach().cpu().clone()
     grads = {
         name: parameter.grad.detach().cpu().clone()
         for name, parameter in model.named_parameters()

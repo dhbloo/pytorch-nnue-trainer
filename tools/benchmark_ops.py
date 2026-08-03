@@ -18,6 +18,7 @@ from tools.model_perf import (
     configure_cuda_memory_limit,
     configure_torch_performance,
     make_flop_counter,
+    percentile,
     torch_performance_metadata,
 )
 from utils.quant_utils import fake_quant
@@ -274,15 +275,6 @@ def compare_tensors(name, actual, expected, rtol, atol) -> dict[str, float]:
         max_abs = max(max_abs, difference.max().item())
         max_mean_abs = max(max_mean_abs, difference.mean().item())
     return {"max_abs": max_abs, "max_mean_abs": max_mean_abs}
-
-
-def percentile(values: list[float], quantile: float) -> float:
-    ordered = sorted(values)
-    position = (len(ordered) - 1) * quantile
-    lower = int(position)
-    upper = min(lower + 1, len(ordered) - 1)
-    fraction = position - lower
-    return ordered[lower] * (1 - fraction) + ordered[upper] * fraction
 
 
 def benchmark(fn, inputs, args, device) -> dict[str, float]:

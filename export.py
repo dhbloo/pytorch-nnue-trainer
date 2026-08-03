@@ -7,8 +7,15 @@ import zlib
 from datetime import datetime
 
 from dataset import build_dataset
+from dataset.core import single_process_dataset_context
 from model import build_model
-from model.serialization import build_serializer, get_rules_from_args, get_boardsizes_from_args
+from model.serialization import (
+    build_serializer,
+    get_rules_from_args,
+    get_boardsizes_from_args,
+    rules_to_mask,
+    boardsizes_to_mask,
+)
 from utils.training_utils import build_data_loader
 from utils.file_utils import find_latest_ckpt, load_torch_ckpt
 from utils.misc_utils import set_performance_level, deep_update_dict
@@ -16,7 +23,13 @@ from utils.misc_utils import set_performance_level, deep_update_dict
 
 def parse_args_and_init():
     parser = configargparse.ArgParser(
-        description="Export", config_file_parser_class=configargparse.YAMLConfigFileParser
+        description="Export",
+        config_file_parser_class=configargparse.YAMLConfigFileParser,
+        # Run configs are shared with train.py, so config files carry keys
+        # that export.py does not define (batch_size, loss_args, kd_*, ...).
+        # Ignore those instead of converting them to (unrecognized) command
+        # line args; actual command line typos still fail loudly below.
+        ignore_unknown_config_file_keys=True,
     )
     parser.add("-c", "--config", is_config_file=True, help="Config file path")
     parser.add("-p", "--checkpoint", help="Model checkpoint file to test")
@@ -38,7 +51,7 @@ def parse_args_and_init():
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--use_cpu", action="store_true", help="Use cpu only")
 
-    args, _ = parser.parse_known_args()  # parse args
+    args = parser.parse_args()  # parse args, failing loudly on unknown command line flags
     parser.print_values()  # print out values
     print("-" * 60)
 
@@ -57,13 +70,22 @@ def _get_sample_data(
     # load dataset
     if datas is None and train_datas is not None:
         datas = train_datas
-    dataset = build_dataset(dataset_type, datas, shuffle=False, **dataset_args)
+    dataset = build_dataset(
+        dataset_type,
+        datas,
+        runtime_context=single_process_dataset_context(batch_size, mode="export"),
+        shuffle=False,
+        **dataset_args,
+    )
     loader = build_data_loader(
-        dataset, batch_size=batch_size, num_workers=1, shuffle=False, **dataloader_args
+        dataset, batch_size=batch_size, num_workers=0, shuffle=False, **dataloader_args
     )
 
     # get data for tracing
     data = next(iter(loader))
+    from dataset.stream import BatchEnvelope
+    if isinstance(data, BatchEnvelope):
+        data = data.data
     return data
 
 
@@ -135,16 +157,20 @@ class ModelIOv1(torch.nn.Module):
         return self.get_model_outputs(self.warpped_model(input_data))
 
 
-def _warp_model_io(model, model_io_version=1, apply_policy_softmax=False, **kwargs):
+def _warp_model_io(model, export_args: dict):
+    # Both options are read from export_args (like onnx_use_dynamo), since no
+    # top-level CLI flag defines them.
+    model_io_version = export_args.get("model_io_version", 1)
+    apply_policy_softmax = export_args.get("apply_policy_softmax", False)
     if model_io_version == 1:
         return ModelIOv1(model, apply_policy_softmax=apply_policy_softmax)
     else:
         raise ValueError(f"Unsupported model IO version {model_io_version}")
 
 
-def export_torch_jit(output, model, **kwargs):
+def export_torch_jit(output, model, export_args, **kwargs):
     # Warp the model with defined input/output interface
-    model = _warp_model_io(model, **kwargs)
+    model = _warp_model_io(model, export_args)
 
     # Use the example inputs to trace the model with the given IO
     sampled_data = _get_sample_data(**kwargs)
@@ -157,22 +183,11 @@ def export_torch_jit(output, model, **kwargs):
 
 
 def make_onnx_model_version(io_version: int, rules: list[str], boardsizes: list[int]) -> int:
-    assert 0 < io_version <= 0xFFFF, f"Invalid IO version {io_version}, must be in [1, 65535]"
-
-    rule_mask = 0
-    if "freestyle" in rules:
-        rule_mask |= 1
-    if "standard" in rules:
-        rule_mask |= 2
-    if "renju" in rules:
-        rule_mask |= 4
-
-    boardsize_mask = 0
-    for board_size in boardsizes:
-        assert 1 <= board_size <= 32
-        boardsize_mask |= 1 << (board_size - 1)
-
-    return (io_version << 48) | (rule_mask << 32) | boardsize_mask
+    # ModelProto.model_version is a signed int64, so the top bit of the 16-bit
+    # io_version field must stay clear: the effective budget is 15 bits, and
+    # io_version >= 0x8000 would overflow the protobuf field.
+    assert 0 < io_version <= 0x7FFF, f"Invalid IO version {io_version}, must be in [1, 32767]"
+    return (io_version << 48) | (rules_to_mask(rules) << 32) | boardsizes_to_mask(boardsizes)
 
 
 def parse_onnx_model_version(model_version: int) -> tuple[int, list[str], list[int]]:
@@ -197,10 +212,16 @@ def parse_onnx_model_version(model_version: int) -> tuple[int, list[str], list[i
 
 
 def export_onnx(output, model, export_args, **kwargs):
+    # Rules are required for ONNX exports (they are stamped into the model
+    # version metadata). Validate before the output file is overwritten, so a
+    # missing-rules error cannot destroy a previous good export.
+    supported_rules = get_rules_from_args(export_args)
+    supported_boardsizes = get_boardsizes_from_args(export_args)
+
     import onnx
 
     # Warp the model with defined input/output interface
-    model = _warp_model_io(model, **kwargs)
+    model = _warp_model_io(model, export_args)
 
     # Output model to ONNX format
     model.eval()
@@ -221,16 +242,17 @@ def export_onnx(output, model, export_args, **kwargs):
     # Run OnnxSlim if available
     try:
         import onnxslim
-
-        print("Running onnxslim to optimize the model...")
-        onnxslim.slim(output, output)
-    except Exception:
-        pass
+    except ImportError:
+        print("onnxslim is not installed, skipping onnx model optimization.")
+    else:
+        try:
+            print("Running onnxslim to optimize the model...")
+            onnxslim.slim(output, output)
+        except Exception as e:
+            print(f"Warning: onnxslim failed ({e!r}), keeping the unslimmed model.")
 
     # Add metadata to the exported ONNX model
     io_version = model.get_io_version()
-    supported_rules = get_rules_from_args(export_args)
-    supported_boardsizes = get_boardsizes_from_args(export_args)
     onnx_model = onnx.load(output)
     onnx_model.model_version = make_onnx_model_version(io_version, supported_rules, supported_boardsizes)
     onnx_model.producer_name = "https://github.com/dhbloo/pytorch-nnue-trainer"
@@ -251,7 +273,13 @@ def export_onnx(output, model, export_args, **kwargs):
 def export_serialization(
     output, output_type, model_type, model, export_args, use_cpu, no_header=False, **kwargs
 ):
-    serializer = build_serializer(model_type, **export_args)
+    # Rules are required for serialization exports: the rule mask is stamped
+    # into the weight metadata, and a permissive default would make the engine
+    # accept the weight for rules it was never trained on. Validate before
+    # anything is written.
+    rules = get_rules_from_args(export_args)
+    boardsizes = get_boardsizes_from_args(export_args)
+    serializer = build_serializer(model_type, rules=rules, boardsizes=boardsizes, **export_args)
     device = torch.device("cuda" if not use_cpu and torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -269,7 +297,12 @@ def export_serialization(
         else:
             raise ValueError(f"Unsupported serialization output type {output_type}")
 
-    with _open_output_file(output) as f:
+    # Atomic write: serializers can fail mid-stream (e.g. overflow asserts)
+    # after partial writes, which must not clobber a previous good weight
+    # file at the same path. Matches the checkpoint convention in
+    # utils/file_utils.py.
+    tmp_output = output + ".tmp"
+    with _open_output_file(tmp_output) as f:
         # serialize header for binary weight format
         if serializer.needs_header and not no_header:
             MAGIC = zlib.crc32(b"gomoku network weight version 1")  # 0xacd8cc6a
@@ -302,6 +335,7 @@ def export_serialization(
 
         with torch.no_grad():
             serializer.serialize(f, model, device)
+    os.replace(tmp_output, output)
 
     type = "binary" if serializer.is_binary else "text"
     print(f"Serialized {type} model has been exported to {output}")

@@ -40,10 +40,14 @@ def npz_split():
     print()
 
     # shuffle data array if requested
-    if args.shuffle:
+    if args.shuffle and data_to_split:
         print("Shuffling data arrays...")
-        for key, array in data_to_split.items():
-            np.random.shuffle(array)
+        lengths = {len(array) for array in data_to_split.values()}
+        assert len(lengths) == 1, f"Cannot shuffle arrays with mismatched lengths: {sorted(lengths)}"
+        # One shared permutation keeps parallel per-sample arrays aligned.
+        perm = np.random.permutation(next(iter(lengths)))
+        for key in data_to_split:
+            data_to_split[key] = data_to_split[key][perm]
 
     # split data and save
     print(f"Splitting data into {args.splits} chunks...")
