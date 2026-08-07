@@ -18,7 +18,6 @@ from accelerate.utils import (
     send_to_device,
 )
 from accelerate.utils.other import is_compiled_module
-from torch.utils.tensorboard import SummaryWriter
 from dataclasses import dataclass
 import inspect
 import json
@@ -57,7 +56,9 @@ from utils.training_utils import (
     DeviceLoaderWrapper,
     ObservedDeviceLoaderWrapper,
     CudaPrefetchLoaderWrapper,
+    StaticSlotLoaderWrapper,
     ResumableSampler,
+    clip_grad_norm,
 )
 from utils.misc_utils import (
     seed_everything,
@@ -66,6 +67,8 @@ from utils.misc_utils import (
     log_value_dict,
     format_time,
 )
+from utils.tb_writer import create_summary_writer
+from utils.async_checkpoint import AsyncCheckpointWriter
 from utils.file_utils import (
     make_dir,
     save_torch_ckpt,
@@ -103,6 +106,13 @@ def _devices_match(actual, expected):
     if actual.index is None or expected.index is None:
         return True
     return actual.index == expected.index
+
+
+def _atomic_torch_save(obj, path):
+    """Write ``obj`` with ``torch.save`` through a temporary file and rename."""
+    tmp_path = path + ".tmp"
+    torch.save(obj, tmp_path)
+    os.replace(tmp_path, path)
 
 
 _RUNTIME_SIDECAR_RE = re.compile(
@@ -360,9 +370,18 @@ class BaseTrainer:
         self._last_state_save_iteration = None
         self._checkpoint_attempt_failed = False
         self._checkpoint_safe = True
+        # Pipelined finite-check readback: two pinned slots ping-pong between
+        # steps, so the host only ever reads back a check enqueued (and
+        # completed) during an earlier step; see _drain_pending_step_validity.
+        self._validity_check_slots = None
+        self._validity_check_counter = 0
+        self._validity_checks_in_flight = []
         # Iterations of temporary (non-permanent) snapshots saved by this session;
         # cleanup only ever deletes snapshots recorded here.
         self._temp_snapshot_iters = set()
+        # Lazily created on the first save; serializes staged checkpoint
+        # payloads on a background thread (see utils/async_checkpoint.py).
+        self._async_checkpoint_writer = None
         self._setup_accelerator()
         if (
             self.cuda_prefetch_batches > 0
@@ -535,7 +554,11 @@ class BaseTrainer:
     def _setup_logging(self):
         """Open TensorBoard writer and JSONL log file (main process only)."""
         if self.accelerator.is_main_process:
-            self.tb_logger = SummaryWriter(os.path.join(self.rundir, "log"))
+            # Buffered event writes: stock TensorBoard frames each scalar into
+            # its own tiny write syscalls behind a size-10 queue, which stalls
+            # the training loop for hundreds of ms per log interval on
+            # latency-bound filesystems (e.g. WSL drvfs mounts).
+            self.tb_logger = create_summary_writer(os.path.join(self.rundir, "log"))
             self.log_file = open(os.path.join(self.rundir, "training_log.jsonl"), "a")
         else:
             self.tb_logger, self.log_file = None, None
@@ -1920,8 +1943,35 @@ class BaseTrainer:
                 + "; ".join(failures)
             )
 
+    def _get_checkpoint_writer(self):
+        if self._async_checkpoint_writer is None:
+            self._async_checkpoint_writer = AsyncCheckpointWriter(
+                self.accelerator.device
+            )
+        return self._async_checkpoint_writer
+
+    def _flush_async_checkpoint(self):
+        """Join the background checkpoint writer, re-raising any failure."""
+        if self._async_checkpoint_writer is not None:
+            self._async_checkpoint_writer.flush()
+
+    def _flush_async_checkpoint_collectively(self):
+        try:
+            self._run_synchronized_operation(
+                "async checkpoint flush",
+                self._flush_async_checkpoint,
+                main_process_only=True,
+            )
+        except BaseException:
+            self._checkpoint_attempt_failed = True
+            raise
+
     def _save_checkpoint(self, force_state: bool = False):
         """Save a checkpoint inside a collective rank boundary."""
+        # The previous save's files must be fully committed before the
+        # filesystem checks below (and before pruning state this save may
+        # rely on) can observe them.
+        self._flush_async_checkpoint_collectively()
         saves_state = hasattr(self, "state") and (
             force_state
             or self.state_save_interval is None
@@ -2039,21 +2089,20 @@ class BaseTrainer:
             self._resume_states_for_save = None
         if saves_state:
             self._last_state_save_iteration = self.state.iteration
-        if hasattr(self, "rundir"):
-            try:
-                self._run_synchronized_operation(
-                    "checkpoint cleanup",
-                    self._cleanup_checkpoints,
-                    main_process_only=True,
-                )
-            except BaseException as exc:
-                raise RuntimeError(
-                    "checkpoint committed; cleanup failed"
-                ) from exc
+        # No separate cleanup barrier here: pruning is the post-write hook of
+        # the commit above, so on the asynchronous path the training loop
+        # resumes while the writer thread serializes and prunes.
 
     def _save_checkpoint_main(self, force_state: bool = False):
         """Save per-model checkpoint files and (if due) the training state, then
         prune temporary snapshots and old state files.
+
+        On CUDA runs the payloads are snapshotted on-device and handed to a
+        background writer; pruning runs as that job's post-write hook, so the
+        directory is pruned once this save's files have durably replaced their
+        predecessors. ``_cleanup_checkpoints`` therefore never observes a
+        partially written save, and a writer failure surfaces at the next
+        flush point with the run marked failed.
 
         Args:
             force_state: Save the training state even if ``state_save_interval``
@@ -2065,12 +2114,16 @@ class BaseTrainer:
             "epoch": str(st.epoch),
             "rows": str(st.rows),
         }
+        payloads = []
         for name, m in self._checkpointed_models().items():
-            save_torch_ckpt(
-                self._model_ckpt_path(name, st.iteration),
-                self._unwrap(m).state_dict(),
-                {},
-                metadata,
+            model_path = self._model_ckpt_path(name, st.iteration)
+            payloads.append(
+                (
+                    self._unwrap(m).state_dict(),
+                    lambda staged_sd, path=model_path: save_torch_ckpt(
+                        path, staged_sd, {}, metadata
+                    ),
+                )
             )
         if st.iteration % self.save_interval != 0:
             self._temp_snapshot_iters.add(st.iteration)
@@ -2080,7 +2133,19 @@ class BaseTrainer:
             or self.state_save_interval is None
             or st.iteration % self.state_save_interval == 0
         ):
-            self._save_training_state()
+            state_path = self._state_path(st.iteration)
+            payloads.append(
+                (
+                    self._build_training_state(),
+                    lambda staged_state, path=state_path: _atomic_torch_save(
+                        staged_state, path
+                    ),
+                )
+            )
+        # The model files commit before the state file, so the newest
+        # on-disk training state never references unwritten model weights.
+        post_hook = self._cleanup_checkpoints if hasattr(self, "rundir") else None
+        self._get_checkpoint_writer().submit(payloads, post_hook=post_hook)
 
     def _run_synchronized_operation(
         self,
@@ -2112,10 +2177,10 @@ class BaseTrainer:
                 f"{operation} failed collectively: {'; '.join(errors)}"
             ) from local_exception
 
-    def _save_training_state(self):
-        """Atomically write optimizer/scaler states and counters to a state file."""
+    def _build_training_state(self):
+        """Collect optimizer/scaler states and counters for the state file."""
         st = self.state
-        state = {
+        return {
             "format_version": 2,
             "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
             "schedulers": {
@@ -2140,10 +2205,6 @@ class BaseTrainer:
                 "rows": st.rows,
             },
         }
-        state_path = self._state_path(st.iteration)
-        tmp_path = state_path + ".tmp"
-        torch.save(state, tmp_path)
-        os.replace(tmp_path, state_path)
 
     def _capture_rng_state(self):
         np_state = np.random.get_state()
@@ -3226,10 +3287,25 @@ class BaseTrainer:
             pipeline_stats = getattr(dataloader.dataset, "pipeline_stats", None)
             is_training_loader = dataloader is getattr(self, "train_loader", None)
             if is_training_loader and self.cuda_prefetch_batches > 0:
-                return CudaPrefetchLoaderWrapper(
+                # Static input slots replace multi-deep lookahead: with a
+                # cudagraph-compiled step, fresh device addresses each step
+                # force inductor into per-tensor stabilization copies, while
+                # one persistent slot set replays the graph against fixed
+                # input pointers with a single hidden H2D per tensor.
+                # Operational escape hatch: if the static-slot handoff ever
+                # misbehaves with a future dataset shape, one environment
+                # variable restores the deep-lookahead prefetcher without a
+                # code change.
+                if os.environ.get("NNUE_FORCE_CUDA_PREFETCH"):
+                    return CudaPrefetchLoaderWrapper(
+                        dataloader,
+                        self.accelerator.device,
+                        prefetch_batches=self.cuda_prefetch_batches,
+                        pipeline_stats=pipeline_stats,
+                    )
+                return StaticSlotLoaderWrapper(
                     dataloader,
                     self.accelerator.device,
-                    prefetch_batches=self.cuda_prefetch_batches,
                     pipeline_stats=pipeline_stats,
                 )
             if pipeline_stats is not None:
@@ -3299,10 +3375,14 @@ class BaseTrainer:
             if self.clip_grad_norm is not None
             else float("inf")
         )
-        grad_norm = self.accelerator.clip_grad_norm_(
-            parameters,
-            max_norm=max_norm,
-        )
+        if self.accelerator.num_processes == 1:
+            grad_norm = clip_grad_norm(parameters, max_norm=max_norm)
+        else:
+            # Accelerate's wrapper routes FSDP/DeepSpeed/Megatron-LM clipping
+            grad_norm = self.accelerator.clip_grad_norm_(
+                parameters,
+                max_norm=max_norm,
+            )
         if self.clip_grad_value is not None:
             self.accelerator.clip_grad_value_(
                 parameters,
@@ -3389,6 +3469,7 @@ class BaseTrainer:
         phase,
         require_grad=True,
         defer_finite=False,
+        defer_sync=False,
     ):
         accelerator = self.accelerator
         expected_schema = getattr(self, "_train_metric_schema", None)
@@ -3462,6 +3543,12 @@ class BaseTrainer:
                 + "; ".join(errors)
             )
 
+        # Finite checks launch as few kernels as possible: stack all scalars
+        # first, then one isfinite+all, instead of one isfinite per value
+        # (each tiny dispatch is expensive on high-latency hosts).
+        scalar_values = ([loss.detach()] if valid_loss else []) + [
+            value.detach() for value in metric_values
+        ]
         checks = []
         if accelerator.num_processes > 1:
             checks.append(
@@ -3471,21 +3558,29 @@ class BaseTrainer:
                     device=accelerator.device,
                 )
             )
-        if valid_loss:
-            checks.append(torch.isfinite(loss.detach()))
-        else:
+        if scalar_values:
+            checks.append(torch.isfinite(torch.stack(scalar_values)).all())
+        if not valid_loss:
             checks.append(
                 torch.tensor(False, dtype=torch.bool, device=accelerator.device)
             )
-        checks.extend(torch.isfinite(value.detach()) for value in metric_values)
-        local_valid = torch.stack(checks).all().to(dtype=torch.long)
+        local_valid = torch.stack(checks).all()
+        if accelerator.num_processes == 1 and defer_sync:
+            # Queue the combined check into the pipelined readback: a pinned
+            # slot plus a CUDA event on GPU (a plain bool on CPU), drained one
+            # iteration later (see _drain_pending_step_validity), so the host
+            # never waits on the device pipeline for the finite result.
+            self._enqueue_step_validity(local_valid, phase=phase)
+            return None
         global_valid_count = (
-            local_valid
+            local_valid.to(dtype=torch.long)
             if accelerator.num_processes == 1
-            else accelerator.reduce(local_valid, reduction="sum")
+            else accelerator.reduce(local_valid.to(dtype=torch.long), reduction="sum")
         )
+        if defer_sync and accelerator.num_processes != 1:
+            raise RuntimeError("defer_sync requires a single process")
         if int(global_valid_count.item()) == accelerator.num_processes:
-            return
+            return None
         if not errors:
             errors.append("non-finite loss, metric, or gradient norm")
         rank_error = (
@@ -3505,6 +3600,73 @@ class BaseTrainer:
         raise RuntimeError(
             "Training step validation failed: " + "; ".join(all_errors)
         )
+
+    def _enqueue_step_validity(self, check, *, phase):
+        """Queue the step's combined finite check for a late readback."""
+        if self._validity_check_slots is None:
+            on_cuda = self.accelerator.device.type == "cuda"
+            self._validity_check_slots = [
+                (
+                    torch.empty((), dtype=torch.bool, pin_memory=on_cuda),
+                    torch.cuda.Event() if on_cuda else None,
+                )
+                for _ in range(2)
+            ]
+        slot_index = self._validity_check_counter % len(self._validity_check_slots)
+        self._validity_check_counter += 1
+        buf, event = self._validity_check_slots[slot_index]
+        buf.copy_(check, non_blocking=buf.is_pinned())
+        if event is not None:
+            event.record()
+        self._validity_checks_in_flight.append(
+            (slot_index, phase, self.state.iteration)
+        )
+
+    def _drain_pending_step_validity(self, *, include_current):
+        """Read back queued finite checks and raise on a non-finite result.
+
+        In steady state only the previous step's queued check is read: its
+        async copy long completed, so draining never waits on the GPU. Before
+        a validation pass or a checkpoint the current step's check is drained
+        too (``include_current``), preserving the invariant that neither can
+        observe or commit the product of a step whose finite result has not
+        landed. A non-finite result still marks the run divergent and aborts;
+        relative to an in-order readback the reported iteration is at most
+        one later than the step that produced the non-finite value.
+        """
+        in_flight = self._validity_checks_in_flight
+        n = len(in_flight) if include_current else max(0, len(in_flight) - 1)
+        # Pop just the entry being judged: when a check fails here, the queued
+        # entries after it stay tracked, so the abort/teardown paths can still
+        # settle their device copies via _discard_pending_step_validity.
+        for _ in range(n):
+            slot_index, phase, iteration = in_flight.pop(0)
+            buf, event = self._validity_check_slots[slot_index]
+            if event is not None:
+                event.synchronize()
+            if bool(buf.item()):
+                continue
+            self._known_divergent = True
+            raise RuntimeError(
+                "Training step validation failed: "
+                f"iteration {iteration} rank"
+                f" {self.accelerator.process_index} {phase}: "
+                "non-finite loss, metric, or gradient norm"
+            )
+
+    def _discard_pending_step_validity(self):
+        """Drop queued finite checks without judging their results.
+
+        Used when (re)starting or tearing down a run: the values belong to the
+        aborted attempt and must not fail the next one, but any in-flight
+        device copies must settle before their pinned slots can be reused.
+        """
+        if self._validity_check_slots is not None:
+            for slot_index, _phase, _iteration in self._validity_checks_in_flight:
+                event = self._validity_check_slots[slot_index][1]
+                if event is not None:
+                    event.synchronize()
+        self._validity_checks_in_flight = []
 
     def _synchronize_phase_errors(self, phase, errors, *, divergent=False):
         """Raise rank-local phase failures at one matching all-rank boundary."""
@@ -3640,14 +3802,26 @@ class BaseTrainer:
                                 self._all_trained_parameters()
                             )
                             final_grad_norm = self._clip_gradients()
-                            if accelerator.scaler is None:
+                            if accelerator.scaler is None and defer_finite:
+                                # Single-rank unscaled path: queue the combined
+                                # finite check into the pipelined readback; it
+                                # is drained after this iteration's optimiser
+                                # work has been enqueued (steady state: one
+                                # iteration later), so the finite-sync never
+                                # idles the pipeline.
                                 self._synchronize_step_validity(
                                     loss=final_grad_norm,
-                                    metric_values=(
-                                        [loss, *metric_values]
-                                        if defer_finite
-                                        else []
-                                    ),
+                                    metric_values=[loss, *metric_values],
+                                    schema=metric_schema,
+                                    errors=[],
+                                    phase="after backward",
+                                    require_grad=False,
+                                    defer_sync=True,
+                                )
+                            elif accelerator.scaler is None:
+                                self._synchronize_step_validity(
+                                    loss=final_grad_norm,
+                                    metric_values=[],
                                     schema=metric_schema,
                                     errors=[],
                                     phase="after backward",
@@ -3823,6 +3997,9 @@ class BaseTrainer:
         primary_exception = None
         self._checkpoint_safe = False
         self._known_divergent = False
+        # Defensive: checks queued by a previous aborted run() in this process
+        # belong to that attempt; discard them before starting a fresh loop.
+        self._discard_pending_step_validity()
         try:
             accelerator.print(
                 f"Start training from iteration {st.iteration}, epoch {st.epoch}"
@@ -3886,7 +4063,20 @@ class BaseTrainer:
                         lambda: self._show_progress(loss_dict),
                     )
 
-                if st.iteration % self.val_interval == 0 and self.val_loader is not None:
+                save_due = self._is_save_iteration(st.iteration)
+                val_due = (
+                    st.iteration % self.val_interval == 0
+                    and self.val_loader is not None
+                )
+                # Pipelined finite checks are drained one step late in steady
+                # state, but never across a validation pass or a checkpoint:
+                # neither may observe the product of a step whose finite
+                # result has not landed yet.
+                self._drain_pending_step_validity(
+                    include_current=save_due or val_due
+                )
+
+                if val_due:
                     self._validate()
 
                 if self.profiler is NULL_PROFILER:
@@ -3900,11 +4090,17 @@ class BaseTrainer:
 
                 # Checkpoint last: its RNG/sampler state is the exact point from
                 # which the next iteration will continue.
-                if self._is_save_iteration(st.iteration):
+                if save_due:
                     self._save_checkpoint()
 
             if self._last_state_save_iteration != st.iteration:
+                # The final iteration's pipelined finite check must land
+                # before its state can be committed.
+                self._drain_pending_step_validity(include_current=True)
                 self._save_checkpoint(force_state=True)
+            # A save may still be committing on the background writer; the
+            # run is not finished until its files are on disk.
+            self._flush_async_checkpoint_collectively()
         except BaseException as exc:
             primary_exception = exc
             if (
@@ -3938,6 +4134,18 @@ class BaseTrainer:
         """Close final resources coherently across all ranks."""
 
         def close_local_resources():
+            # Join the background checkpoint writer (if any), but still close
+            # the remaining outputs when a pending save failed.
+            failures = []
+            try:
+                self._flush_async_checkpoint()
+            except BaseException as exc:
+                failures.append(
+                    f"background checkpoint writer: {type(exc).__name__}: {exc}"
+                )
+            # Aborted runs may leave finite checks queued; let their device
+            # copies settle before the process tears CUDA down.
+            self._discard_pending_step_validity()
             resources = []
             train_data_iter = getattr(self, "_train_data_iter", None)
             if train_data_iter is not None and hasattr(train_data_iter, "close"):
@@ -3950,7 +4158,6 @@ class BaseTrainer:
                         ("training log", self.log_file),
                     ]
                 )
-            failures = []
             for name, resource in resources:
                 try:
                     resource.close()
@@ -4007,6 +4214,9 @@ class BaseTrainer:
                 torch.compiler.cudagraph_mark_step_begin()
                 data = self._fetch_batch()
                 self._run_train_step(data)
+                # Profiling is diagnostic, not throughput-critical: read every
+                # step's finite check within its own iteration.
+                self._drain_pending_step_validity(include_current=True)
                 profiler.step()
 
         accelerator.print("Profiling complete.")

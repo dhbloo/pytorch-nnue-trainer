@@ -35,6 +35,35 @@ need module structure (e.g. muon's per-parameter routing).
 """
 
 
+def clip_grad_norm(parameters, max_norm: float, norm_type: float = 2.0):
+    """Streamlined gradient clipping for the single-(device, dtype) case.
+
+    Numerically identical to ``torch.nn.utils.clip_grad_norm_`` with
+    ``error_if_nonfinite=False`` (same per-tensor foreach norms, same total
+    norm, same clamped coefficient scaled in place), but skips the per-step
+    python ceremony of the stock implementation (device/dtype regrouping,
+    generator plumbing, wrapper dispatch), which costs several hundred
+    microseconds per step on high-latency hosts.  Parameters spanning
+    multiple devices or dtypes fall back to the stock implementation.
+    """
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        # Mirrors torch.nn.utils._get_total_norm on the empty-grads path.
+        return torch.tensor(0.0)
+    first_device, first_dtype = grads[0].device, grads[0].dtype
+    for grad in grads[1:]:
+        if grad.device != first_device or grad.dtype != first_dtype:
+            return torch.nn.utils.clip_grad_norm_(
+                parameters, max_norm, norm_type=norm_type
+            )
+    norms = torch._foreach_norm(grads, norm_type)
+    total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
+    clip_coef = float(max_norm) / (total_norm + 1e-6)
+    clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
+    torch._foreach_mul_(grads, clip_coef_clamped)
+    return total_norm
+
+
 # Keywords for which MultiTensorAdamW is the better implementation. Anything
 # else falls back to torch.optim.AdamW: the implementation selectors (`fused`,
 # `foreach`, `capturable`, ...), which is also the documented opt-out, and the
@@ -597,6 +626,136 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
             flush_completed_timings()
         finally:
             self._synchronize_and_close(prefetch_stream, source)
+
+
+class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
+    """H2D every batch into one fixed set of device tensors on a side stream.
+
+    When a ``torch.compile`` region runs under Inductor CUDA graphs (the
+    trainer default), every input whose data pointer changes between steps is
+    first copied into graph-owned storage: one tiny DtoD memcpy plus
+    host-side ceremony per tensor per step, which on high-latency hosts
+    serializes into several hundred microseconds of compute-stream idle time
+    per step. Delivering the batch in *persistent* device slots marked with
+    ``torch._dynamo.mark_static_address`` skips that stabilization entirely;
+    the only per-tensor work left is the H2D copy itself on a dedicated copy
+    stream.
+
+    Ordering is guaranteed by two events per step: the compute stream waits
+    for "copy ready", and the next copy waits for "previous consumption
+    recorded" (enqueued after the consumer's forward/backward launches), so
+    a slot is never overwritten while its contents can still be read. A fresh
+    iterator (epoch restart) starts by ordering its first refill behind the
+    compute stream's current tail, which covers the previous epoch's final
+    step still executing against the slots.
+
+    Requires a constant batch schema (keys, shapes, dtypes) for the whole
+    run, which the planned-batch datasets already guarantee.
+    """
+
+    def __init__(self, dataloader, device, *, pipeline_stats=None, non_blocking=True):
+        super().__init__(dataloader, device, non_blocking)
+        self._copy_stream = torch.cuda.Stream(device=self.device)
+        self._pipeline_stats = pipeline_stats
+        self._slots = None
+        self._schema = None
+
+    def _resolve_schema(self, data, mask):
+        if not (type(data) is dict and all(
+            isinstance(value, torch.Tensor) for value in data.values()
+        )):
+            raise RuntimeError(
+                "StaticSlotLoaderWrapper requires dict[str, Tensor] batches"
+            )
+        entries = list(data.items())
+        if mask is not None:
+            entries.append(("__is_real", torch.as_tensor(mask)))
+        return tuple(
+            (name, tuple(t.shape), t.dtype) for name, t in entries
+        ), entries
+
+    def _build_slots(self, entries):
+        slots = {}
+        for name, tensor in entries:
+            slot = torch.empty(
+                tuple(tensor.shape), dtype=tensor.dtype, device=self.device
+            )
+            torch._dynamo.mark_static_address(slot)
+            slots[name] = slot
+        return slots
+
+    def __iter__(self):
+        import time
+        from dataclasses import replace
+
+        from dataset.stream import BatchEnvelope
+        from dataset.telemetry import tensor_bytes
+
+        source = iter(self.dataloader)
+        compute_stream = torch.cuda.current_stream(self.device)
+        # Ordered behind whatever is enqueued on the compute stream right now:
+        # epoch restarts reach here while the previous epoch's final step may
+        # still be executing against the slots.
+        read_done = torch.cuda.Event()
+        read_done.record(compute_stream)
+        try:
+            while True:
+                wait_start = time.perf_counter_ns()
+                try:
+                    host_batch = next(source)
+                except StopIteration:
+                    return
+                if self._pipeline_stats is not None:
+                    self._pipeline_stats.record_source_wait(
+                        time.perf_counter_ns() - wait_start
+                    )
+                if isinstance(host_batch, BatchEnvelope):
+                    data, mask = host_batch.data, host_batch.is_real
+                else:
+                    data, mask = host_batch, None
+                schema, entries = self._resolve_schema(data, mask)
+                if self._slots is None:
+                    self._schema = schema
+                    self._slots = self._build_slots(entries)
+                elif schema != self._schema:
+                    raise RuntimeError(
+                        "batch schema changed mid-run; static input slots "
+                        "require constant keys/shapes/dtypes"
+                    )
+                copy_start = time.perf_counter_ns()
+                with torch.cuda.stream(self._copy_stream):
+                    self._copy_stream.wait_event(read_done)
+                    for name, tensor in entries:
+                        self._slots[name].copy_(tensor, non_blocking=self.non_blocking)
+                    ready = torch.cuda.Event()
+                    ready.record(self._copy_stream)
+                if self._pipeline_stats is not None:
+                    self._pipeline_stats.record_h2d(
+                        time.perf_counter_ns() - copy_start,
+                        tensor_bytes(dict(entries)),
+                    )
+                compute_stream.wait_event(ready)
+                slot_data = {
+                    name: self._slots[name]
+                    for name, _shape, _dtype in schema
+                    if name != "__is_real"
+                }
+                slot_mask = self._slots.get("__is_real")
+                if isinstance(host_batch, BatchEnvelope):
+                    yield replace(host_batch, data=slot_data, is_real=slot_mask)
+                else:
+                    yield slot_data
+                # The consumer has enqueued this step's work by the time it
+                # asks for the next batch; the event lands behind forward and
+                # backward on the compute stream, so the next slot refill is
+                # ordered after the last possible reader.
+                read_done = torch.cuda.Event()
+                read_done.record(compute_stream)
+        finally:
+            self._copy_stream.synchronize()
+            close = getattr(source, "close", None)
+            if close is not None:
+                close()
 
 
 @dataclass(frozen=True)
