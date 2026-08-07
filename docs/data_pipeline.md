@@ -253,27 +253,48 @@ conversion also runs in the workers. Planner state, stateful pipelines, publicat
 on the owning thread. In normal Mix9S training, Accelerate performs the pinned-host-to-device copies while
 fetching the next loader batch.
 
-Training can optionally set the top-level `cuda_prefetch_batches` option from `1` through `4`. A value of `1`
-provides double buffering: while the compute stream consumes one batch, a dedicated CUDA stream copies the next
-batch from pinned host memory. CUDA events preserve stream ordering without a host synchronization, and every
-device tensor records the consuming stream so allocator reuse remains safe. Host allocations remain retained
-until their copy event completes. Both queued device batches and retired host batches have fixed count bounds.
+Training can optionally set the top-level `cuda_prefetch_batches` option from `1` through `4`. Any positive
+value delivers training batches through `StaticSlotLoaderWrapper`: the first batch fixes a schema of keys,
+shapes, and dtypes (batches must be flat `dict`s of tensors, which the planned-batch datasets guarantee),
+and every later batch is copied H2D into one persistent set of device tensors on a dedicated copy stream.
+Each slot is marked `torch._dynamo.mark_static_address`, so under Inductor CUDA graphs the compiled step
+replays against fixed input pointers and skips the per-tensor input-stabilization DtoD copies (and their
+host-side latency) that fresh device addresses would otherwise force every step. Ordering uses two events per
+step: the compute stream waits for "copy ready", and the next refill waits for an event recorded behind the
+consumer's forward/backward launches, so a slot is never overwritten while its contents can still be read. A
+fresh iterator (epoch restart) orders its first refill behind the compute stream's current tail, covering the
+previous epoch's final step still executing against the slots. A batch whose schema does not match the
+established one raises immediately. The configured depth only gates engagement; the slot path holds one batch
+on device regardless of the value.
 
-The default is `0`, which selects the original device-loader class and adds no stream, event, queue, clock, or
-per-batch branch to the normal path. CUDA lookahead applies to the training loader only; validation retains its
+Setting the `NNUE_FORCE_CUDA_PREFETCH` environment variable restores the previous deep-lookahead prefetcher
+(`CudaPrefetchLoaderWrapper`): while the compute stream consumes one batch, a dedicated CUDA stream copies up
+to `cuda_prefetch_batches` upcoming batches from pinned host memory into a bounded device queue. CUDA events
+preserve stream ordering without a host synchronization, and every device tensor records the consuming stream
+so allocator reuse remains safe. Host allocations remain retained until their copy event completes, and both
+queued device batches and retired host batches have fixed count bounds. It remains the fallback for any future
+dataset shape or compile regime where static-address slots misbehave.
+
+The default is `0`, which selects the original device-loader class and, with observability off, adds no
+stream, event, queue, clock, or per-batch branch to the normal path (observability mode selects the
+instrumented loader variant instead; see below). Device handoff applies to the training loader only;
+validation retains its
 existing device-placement behavior. It supports built-in iterable streams and exact-resume map loaders with
 `num_worker: 0`. Other map loaders leave device placement to Accelerate and reject this option instead of silently
 ignoring it. Prefetched `BatchEnvelope` tokens remain uncommitted until the optimizer transaction consumes them.
-Closing or failing the iterator discards lookahead and invokes the planner's existing rollback path, so checkpoint
-identity depends only on consumed batches.
+Closing or failing the iterator drains pending copies and then invokes the planner's existing rollback path
+(a pending device error surfaces from that drain first), so checkpoint identity depends only on consumed
+batches.
 
-Dedicated-stream lookahead is disabled by default for the reference workload because its small host-to-device
-transfers are already hidden by host-side preprocessing. Enable it only after an end-to-end measurement shows a
-benefit for a workload with larger transfers or less host work before its first kernel.
+The gomoku ResNet reference configurations run the batched processed pipeline with `cuda_prefetch_batches: 1`
+since the 2026-08-07 acceptance: that combination measured +9-53% effective end-to-end throughput over the
+previous reference across the eleven 600k-iteration runs (see [training performance](performance.md)). The
+generic default stays `0` because the slot path presumes a constant batch schema and CUDA training; enable it
+for other workloads after an end-to-end measurement shows a benefit.
 
 Batch-yielding and resumable built-in streams require DataLoader `num_worker: 0`; loader processes are rejected
 because they would duplicate planner ownership and checkpoint state. The production Mix9S path gets its
-parallelism from the dataset's two internal ordered decode threads.
+parallelism from the dataset's internal ordered decode workers (configured by `prefetch_threads`).
 
 ### Observability and automatic tuning
 
@@ -289,9 +310,10 @@ The dataset layer exposes numeric interval snapshots but does not depend on a lo
 normal `log_interval`, the trainer aggregates the snapshots across ranks and publishes them alongside existing
 metrics under the independent `data_pipeline/...` and `data_pipeline_rows/...` namespaces. Metrics cover
 producer capacity, source-wait and H2D submission latency, prefetch queue depth and starvation, decoded-cache
-behavior, manifest cost, and retained memory. With CUDA lookahead enabled, CUDA events additionally report
-actual device-copy time and compute-stream exposed wait. Distributed summaries use the slowest producer and
-largest exposed wait.
+behavior, manifest cost, and retained memory. The static-slot handoff reports its per-batch source-wait and
+H2D submission latency and bytes through the same channel; the legacy lookahead prefetcher
+(`NNUE_FORCE_CUDA_PREFETCH`) additionally uses CUDA events to report actual device-copy time and
+compute-stream exposed wait. Distributed summaries use the slowest producer and largest exposed wait.
 
 Automatic tuning may adjust active decode workers, ordered-prefetch depth, and processed-NPZ decoded-cache
 limits within configured CPU limits and cache budgets. The decoder still permits one file larger than its byte
@@ -429,10 +451,9 @@ The representative scan reached the six-entry decoded-cache bound without throug
 progressed. Traced live Python memory remained stable after warm-up, and the pipeline supplies roughly 15 times
 the rows consumed by training on this host.
 
-The end-to-end Mix9S KD reference sustained roughly 73–77 iterations/s. Useful end-to-end MFU was
-29.26%; profiling attributes the remaining gap to teacher forward, student forward/backward, optimizer work,
-and required numerical synchronization rather than data starvation. See
-[Training performance](performance.md) for model-side methodology and results.
+End-to-end training references and model-side methodology live in
+[Training performance](performance.md); the measured runs there confirm the pipeline is not the bottleneck
+for the reference workloads.
 
 These are reference measurements, not portable guarantees. New hardware, formats, filters, worker/process
 counts, cache policies, or storage should be measured end to end.

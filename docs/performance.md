@@ -51,24 +51,36 @@ The uniform 34-model profile gives the following structural picture:
 - Pattern models are dominated by repeated-index embedding backward, scatter/sort, and small depthwise work.
   Linear and the smallest Flat models are launch- and optimizer-bound.
 
-### End-to-end Mix9s knowledge-distillation reference
+### End-to-end ResNet reference (600k acceptance, 2026-08-07)
 
-The latest real-data end-to-end reference was measured on 2026-08-03 from commit `f534671` on the reference
-RTX 4080 SUPER. It used the Mix9s model, batch size 128, BF16 autocast, TorchInductor
-`max-autotune`, the `batched_processed_katago_numpy` input pipeline with four prefetch threads and a
-512-batch queue, and the ResNetV2 KD teacher. The run used the real training and validation streams,
-validation every 50,000 iterations, and model/trainer-state checkpoints every 50,000 iterations.
+Full 600,000-iteration runs per reference config on the RTX 4080 SUPER, recipe identical between
+codebases (seed 42, weight decay 1e-7, save every 50k / rolling temp save every 5k / validation
+every 50k). The `perf` runs use the `batched_processed_katago_numpy` pipeline (4 prefetch threads,
+64-batch queue) with static input slots, `cuda_prefetch_batches: 1`, BF16 autocast, TorchInductor
+`max-autotune`. Rates derive from TensorBoard wall times: **effective** is the whole-run rate
+including validation and checkpoint pauses; **clean** is the median per-interval speed with
+pause-containing intervals excluded. `old` is the historical codebase, `master` the previous
+reference implementation. Final validation loss establishes training-quality parity (the old↔master
+spacing per config is itself up to ±0.008 at this horizon).
 
-| Run | Iterations | Trainer elapsed | Effective rate | Clean steady-state rate | Final validation loss |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Current implementation (`f534671`) | 1,000,000 | 3:30:05.844 | 79.33 it/s, 10,154 samples/s | 84.93 median, 84.43 harmonic | 0.612722 |
-| Previous reference (`bf96979`) | 1,000,000 | 4:35:52.262 | 60.41 it/s, 7,733 samples/s | 66.12 median, 66.05 harmonic | 0.614139 |
+| Workload | Old eff | Master eff | `perf` eff | vs master | Final val (perf / master) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| ResNet v1 2b32 | 88.3 | 159.9 | 224.6 | +40.5% | 1.9622 / 1.9641 |
+| ResNet v1 4b64 | 85.5 | 148.1 | 189.8 | +28.2% | 1.7456 / 1.7465 |
+| ResNet v1 6b96 | 46.7 | 120.3 | 178.5 | +48.4% | 1.6336 / 1.6332 |
+| ResNet v1 10b128 | 41.2 | 76.2 | 109.9 | +44.1% | 1.5545 / 1.5572 |
+| ResNet v1 15b192 | 16.1 | 32.3 | 37.7 | +16.8% | 1.5025 / 1.5059 |
+| ResNet v1 20b256 | 7.7 | 17.3 | 18.9 | +9.4% | 1.4649 / 1.4608 |
+| ResNet v2 4b64 | 120.4 | 139.3 | 197.2 | +41.6% | 1.7440 / 1.7417 |
+| ResNet v2 6b96 | 110.5 | 114.8 | 175.4 | +52.8% | 1.6321 / 1.6324 |
+| ResNet v2 10b128 | 80.7 | 78.2 | 105.5 | +34.9% | 1.5708 / 1.5729 |
+| ResNet v2 15b192 | 33.2 | 30.5 | 37.1 | +21.4% | 1.5173 / 1.5136 |
+| ResNet v2 20b256 | 17.7 | 16.8 | 18.6 | +10.5% | 1.5011 / 1.4978 |
 
-Trainer elapsed includes the training loop, validation, and checkpoint costs through the final validation.
-Clean steady-state rates cover iterations 50,000 through 1,000,000 and exclude the first 500-step window
-following each periodic state save; the harmonic mean retains the cost of remaining slow windows. Relative to
-the previous reference, the current implementation reduced trainer time by 23.8%, increased clean harmonic
-throughput by 27.8%, and ended with a validation loss lower by 0.001417.
+Clean steady-state rates (it/s): v1 233.8 / 199.0 / 185.4 / 113.0 / 38.3 / 19.1 and v2 — / 205.0 /
+181.2 / 108.8 / 37.7 / 19.0. Estimated end-to-end MFU at clean steady state (forward+backward FLOPs
+over the 97.5 TFLOP/s dense BF16 roofline): ~59% for the 10b128 class, ~79% for the 20b256 class.
+The 2b32-class models are launch-bound at batch 128 and are tracked by step time rather than MFU.
 
 ## Optimizations retained in the code
 
@@ -86,9 +98,44 @@ throughput by 27.8%, and ended with a validation loss lower by 0.001417.
   gradients, batches same-shape updates, and updates persistent momentum buffers in place.
 - KataGo input can be decoded and collated as complete batches, with bounded producer concurrency and
   asynchronous device preparation. The loader explicitly marks batch ownership to avoid double batching.
-- Single-process training handles rank-local phase errors on the CPU and performs one combined CUDA finite-value
-  check after backward. It does not construct and synchronously copy six success flags to CUDA every step. This
-  also prevents those pageable scalar copies from serializing an optional dedicated-stream H2D prefetch.
+  Since the 2026-08-07 acceptance, the gomoku ResNet reference configs run this pipeline with four
+  prefetch threads, a 64-batch queue, and `cuda_prefetch_batches: 1`.
+- Training batches are delivered through persistent device slots marked `mark_static_address` when
+  `cuda_prefetch_batches > 0` (`StaticSlotLoaderWrapper`). With Inductor CUDA graphs this eliminates the
+  per-tensor input-stabilization DtoD copies and their host latency; copy ordering uses a two-event
+  handshake on a dedicated stream, and a fresh iterator (epoch restart) orders its first refill behind
+  the compute stream's current tail, so slots are never overwritten while a previous step can still
+  read them. `NNUE_FORCE_CUDA_PREFETCH=1` restores the ring prefetcher.
+- Single-process training handles rank-local phase errors on the CPU and performs one combined
+  finite-value check after backward. The check is one stack->isfinite->all chain whose result is
+  copied asynchronously into a ping-pong pair of pinned slots and read one iteration later, so the
+  host never waits on the GPU pipeline for the finite result. Validation passes and checkpoints
+  first drain every queued check including the current step's, preserving the invariant that neither
+  can observe or commit the product of a step whose finite result has not landed. A divergence abort
+  still reports the poisoned step's own iteration number; at most one extra (already-poisoned)
+  optimizer step can be applied before the abort, and the profiling loop keeps the stricter
+  same-iteration readback.
+- Single-device gradient clipping uses a direct `_foreach_norm -> vector_norm -> clamp -> _foreach_mul_`
+  chain (`utils/training_utils.clip_grad_norm`), bitwise-identical to the stock implementation, skipping
+  its per-step regrouping and dispatcher overhead; multi-device/dtype layouts and multi-process runs fall
+  back to the stock path.
+- TensorBoard event writes pass through a buffer shim below the TFRecord framing
+  (`utils/tb_writer.py`); on latency-bound filesystems (e.g. drvfs mounts) the stock per-scalar framing
+  could block the training loop for hundreds of milliseconds per log interval.
+- Periodic checkpoints serialize off the training loop (`utils/async_checkpoint.py`). Submitting a
+  save clones every payload tensor on a dedicated copy stream behind the compute tail and blocks the
+  compute stream only until that device-resident snapshot completes (~2 ms for a 238 MiB state); a
+  single writer thread then pickles (its DtoH copies overlap training), commits each file through an
+  atomic tmp+rename — model files before the training-state file, so a state file never references
+  unwritten model weights — and prunes older snapshots as a post-write hook. A failed write surfaces
+  at the next save or at shutdown and fails the run exactly like a synchronous failure; an OOM during
+  staging drains the copy stream and falls back to the historic inline path. The only behavioural
+  delta is that checkpoint bytes reach the filesystem shortly after the save iteration instead of
+  before it: a crash inside that window resumes from the previous completed checkpoint, and torn
+  partial writes remain invisible (verified with a mid-write SIGKILL + resume test).
+  `NNUE_SYNC_CHECKPOINT=1` forces the old inline path. Measured +6.4% throughput on the 10b128
+  ResNet with saves every 250 iterations; the win is ~0.3-0.4% at the 5000-iteration reference
+  cadence.
 - `easyrun.sh` creates an Accelerate configuration when none exists, saving BF16 and TorchInductor defaults
   there instead of injecting them on every launch. Existing Accelerate configurations are not overwritten.
 - `max_memory_fraction` is applied before datasets and models allocate CUDA tensors. This is a safety boundary
