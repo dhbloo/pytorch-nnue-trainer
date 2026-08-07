@@ -70,7 +70,6 @@ from utils.misc_utils import (
 from utils.tb_writer import create_summary_writer
 from utils.async_checkpoint import AsyncCheckpointWriter
 from utils.file_utils import (
-    make_dir,
     save_torch_ckpt,
     load_torch_ckpt,
     find_latest_ckpt,
@@ -3696,15 +3695,11 @@ class BaseTrainer:
             if errors
             else None
         )
-        all_errors = (
-            [rank_error]
-            if accelerator.num_processes == 1
-            else [
-                item
-                for item in gather_object([rank_error])
-                if item is not None
-            ]
-        )
+        all_errors = [
+            item
+            for item in gather_object([rank_error])
+            if item is not None
+        ]
         if divergent:
             self._known_divergent = True
         raise RuntimeError(f"{phase} failed collectively: {'; '.join(all_errors)}")
@@ -4863,25 +4858,6 @@ class BaseTrainer:
                 "Maximum, or registered SufficientStats"
             )
         return finalized
-
-    def _as_global_batch_statistics(
-        self,
-        metric_dict,
-        data,
-        *,
-        maximum_keys=(),
-    ):
-        """Reject opaque scalars instead of guessing their reduction algebra."""
-        typed = {}
-        for key, value in metric_dict.items():
-            if isinstance(value, (SumCount, Maximum, SufficientStats)):
-                typed[key] = value
-            else:
-                raise ValueError(
-                    f"built-in evaluation output {key!r} is opaque; producers "
-                    "must return SumCount, Maximum, or registered SufficientStats"
-                )
-        return typed
 
     def _vq_eval_modules(self):
         """Return trained-model modules that expose deferred eval perplexity stats."""

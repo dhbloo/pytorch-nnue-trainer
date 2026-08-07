@@ -303,7 +303,6 @@ def debug_print(board, model, data):
             results = model(data)
     value, policy = results["value"], results["policy"]
     aux_losses = results.get("aux_losses")
-    aux_outputs = results.get("aux_outputs")
 
     def print_value(value: torch.Tensor) -> torch.Tensor:
         value = value.squeeze(0)  # remove batch dimension

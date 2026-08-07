@@ -11,7 +11,6 @@ from .core import deterministic_permutation, rng_u64
 from .shuffle import RESERVOIR_ALGORITHM, ReservoirStats
 
 
-PACKED_RECORD_BLOCK_SCHEMA = "packed-record-block-v1"
 PACKED_RESERVOIR_ALGORITHM = RESERVOIR_ALGORITHM + "-uint64"
 
 

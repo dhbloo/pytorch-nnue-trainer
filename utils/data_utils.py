@@ -27,16 +27,6 @@ class Rule(Enum):
         RuleName = ["freestyle", "standard", None, None, "renju"]
         return RuleName[self.value]
 
-    @staticmethod
-    def from_str(rule_str: str) -> "Rule":
-        RuleStr = {"freestyle": Rule.FREESTYLE, "standard": Rule.STANDARD, "renju": Rule.RENJU}
-        return RuleStr[rule_str]
-
-    @staticmethod
-    def from_index(rule_idx: int) -> "Rule":
-        RuleIndex = [Rule.FREESTYLE, Rule.STANDARD, Rule.RENJU]
-        return RuleIndex[rule_idx]
-
 
 class Move:
     PASS: "Move"

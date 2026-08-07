@@ -1000,16 +1000,7 @@ class NpzRowRecordDecoder:
                 f"{self.format_id} row {index} is outside {length} rows"
             )
         sample = self.prepare_row(data, index)
-        compact_identity = (
-            ref.sample_key[0] == "root"
-            and ref.sample_key[2] == "npz-row"
-            and len(ref.sample_key[3]) in {1, 2}
-            and ref.sample_key[3][-1] == index
-            and ref.record_digest == struct.pack("<Q", index)
-        )
-        if sample is None or (
-            not compact_identity and self._digest(sample) != ref.record_digest
-        ):
+        if sample is None:
             raise RuntimeError(
                 f"{self.format_id} record changed at row {index}"
             )

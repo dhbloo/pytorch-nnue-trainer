@@ -11,17 +11,6 @@ from .sequential_source import InterleavedSequentialSource
 from .source_dataset import PlannedBatchDataset, SourceBatchDataset
 
 
-class Entry(ctypes.Structure):
-    _fields_ = [
-        ("result", ctypes.c_uint16, 2),
-        ("ply", ctypes.c_uint16, 9),
-        ("boardsize", ctypes.c_uint16, 5),
-        ("rule", ctypes.c_uint16, 3),
-        ("move", ctypes.c_uint16, 13),
-        ("position", ctypes.c_uint16 * 1024),
-    ]
-
-
 class EntryHead(ctypes.Structure):
     _fields_ = [
         ("result", ctypes.c_uint16, 2),
@@ -30,26 +19,6 @@ class EntryHead(ctypes.Structure):
         ("rule", ctypes.c_uint16, 3),
         ("move", ctypes.c_uint16, 13),
     ]
-
-
-def write_entry(
-    f: io.RawIOBase,
-    result: Result,
-    boardsize: int,
-    rule: Rule,
-    move: Move,
-    position: list[Move],
-):
-    entry = Entry()
-    entry.result = result.value
-    entry.ply = len(position)
-    entry.boardsize = boardsize
-    entry.rule = rule.value
-    entry.move = move.value
-    for i, m in enumerate(position):
-        entry.position[i] = m.value
-
-    f.write(bytearray(entry)[: 4 + 2 * len(position)])
 
 
 def _readinto_exact(f: io.RawIOBase, buf) -> None:

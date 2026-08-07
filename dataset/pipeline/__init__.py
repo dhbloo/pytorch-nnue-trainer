@@ -1,7 +1,6 @@
 from torch.utils.data.dataset import Dataset, IterableDataset
 from utils.misc_utils import Registry, import_submodules
 from abc import ABC, abstractmethod
-from dataset.core import FieldSpec
 
 
 class BasePipeline(ABC):

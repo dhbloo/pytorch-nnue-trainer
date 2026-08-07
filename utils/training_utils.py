@@ -1065,7 +1065,6 @@ def build_data_loader(
             dataset.shuffle_window_size = requested_window
             if planner is not None:
                 planner.shuffle_window_size = requested_window
-                planner._signature_digest_cache = None
         else:
             requested_window = configured_window
         mode = getattr(runtime_context, "mode", None)

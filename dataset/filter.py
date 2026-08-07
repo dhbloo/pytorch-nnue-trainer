@@ -244,7 +244,6 @@ class SafeFilterEvaluator:
             shape = np.broadcast_shapes(*shapes)
         except ValueError as exc:
             raise self._error(node, f"incompatible broadcast shapes {shapes}") from exc
-        elements = math.prod(shape)
         itemsize = max(
             (
                 value.dtype.itemsize

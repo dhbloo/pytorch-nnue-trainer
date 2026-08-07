@@ -227,7 +227,6 @@ def entropy_regularization(logits: LazyTensor, temperature=1.0) -> Tensor:
 def sample_vectors(inputs: Tensor, num_samples: int) -> Tensor:
     """Sample num_samples vectors from the input tensor (supports DDP)."""
     num_processes = PartialState().num_processes
-    process_idx = PartialState().process_index
     num_samples_per_rank = (num_samples + num_processes - 1) // num_processes
 
     num_inputs, device = inputs.shape[0], inputs.device

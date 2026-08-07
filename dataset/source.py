@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from typing import Hashable, Literal, Protocol, Sequence, TypeVar
 
 
-SOURCE_MANIFEST_SCHEMA = "record-source-manifest-v2"
 SOURCE_CURSOR_SCHEMA = "record-source-cursor-v2"
 
 

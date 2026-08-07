@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from . import MODELS
-from .layers.activation import ChannelWiseLeakyReLU, QuantPReLU, SwitchPReLU
+from .layers.activation import ChannelWiseLeakyReLU, QuantPReLU
 from .layers.convolution import Conv2d, Conv2dBlock
 from .layers.linear import LinearBlock
 from .layers.normalization import build_norm2d_layer

@@ -4,7 +4,7 @@ from torch.optim import Optimizer
 from torch.optim.optimizer import ParamsT
 from dataclasses import dataclass
 from typing import Any
-from collections.abc import Callable, Iterable
+from collections.abc import Callable
 
 
 @dataclass

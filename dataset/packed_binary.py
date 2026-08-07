@@ -2,7 +2,6 @@ import numpy as np
 import lz4.frame
 import ctypes
 import copy
-import random
 import io
 from utils.data_utils import *
 from utils.winrate_model import WinrateModel
@@ -428,15 +427,13 @@ class PackedBinaryDataset(PlannedBatchDataset):
 
         return policy if self.has_pass_move else policy.reshape(boardsize)
 
-    def _process_entry(
-        self, entry: EntryData, selected_subrecord: int | None = None
-    ) -> list[dict] | dict | None:
+    def _process_entry(self, entry: EntryData, selected_subrecord: int) -> dict | None:
         # Skip other rules and board sizes
         boardsize = (entry.boardsize, entry.boardsize)
         if str(entry.rule) not in self.rules:
-            return [] if selected_subrecord is None else None
+            return None
         if boardsize not in self.boardsizes:
-            return [] if selected_subrecord is None else None
+            return None
 
         current_result = entry.result
         current_position = entry.init_position.copy()
@@ -450,21 +447,12 @@ class PackedBinaryDataset(PlannedBatchDataset):
                 current_board_input[max(current_stm_input, 0), move.y, move.x] = 1
             current_stm_input = -current_stm_input
 
-        data_list = []
         for moveidx, movedata in enumerate(entry.moves):
             bestmove, bestmove_eval = movedata[0]
 
-            # Map-style readers sample moves here. Planned readers address one
-            # already-admitted move directly and never materialize siblings.
-            selected = (
-                selected_subrecord is None or moveidx == selected_subrecord
-            )
-            admitted = (
-                selected_subrecord is not None
-                or self.sample_rate >= 1.0
-                or random.random() < self.sample_rate
-            )
-            if selected and admitted:
+            # Planned readers address one already-admitted move directly and
+            # never materialize siblings.
+            if moveidx == selected_subrecord:
                 game_stage = min(max(moveidx / max(len(entry.moves) - 1, 1), 0.0), 1.0)
                 value_target = self._setup_value_target(current_result, bestmove_eval, game_stage)
                 policy_target = self._setup_policy_target(boardsize, movedata)
@@ -491,16 +479,13 @@ class PackedBinaryDataset(PlannedBatchDataset):
                         np.nan if bestmove_eval is None else bestmove_eval, dtype=np.float32
                     ),
                 }
-                data = post_process_data(
+                return post_process_data(
                     data,
                     fixed_side_input=self.fixed_side_input,
                     fixed_board_size=self.fixed_board_size,
                     symmetry_type=self.apply_symmetry,
                     drop_extra=self.drop_extra,
                 )
-                if selected_subrecord is not None:
-                    return data
-                data_list.append(data)
 
             current_result = Result.opposite(current_result)
             current_position.append(bestmove)
@@ -509,8 +494,8 @@ class PackedBinaryDataset(PlannedBatchDataset):
                 current_board_input[max(current_stm_input, 0), bestmove.y, bestmove.x] = 1
             current_stm_input = -current_stm_input
 
-        return data_list if selected_subrecord is None else None
+        return None
 
     def _process_subrecord(self, entry: EntryData, subrecord: int) -> dict | None:
         """Replay only far enough to materialize the selected move sample."""
-        return self._process_entry(entry, selected_subrecord=int(subrecord))
+        return self._process_entry(entry, int(subrecord))
