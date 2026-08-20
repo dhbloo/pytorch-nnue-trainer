@@ -57,6 +57,11 @@ Training config is saved to `run_config.yaml` under the running directory. When 
 accelerate launch train.py -c run_dirs/run01/run_config.yaml
 ```
 
+Training also saves EMA weights by default with decay `0.9999`. They are stored as
+`ckpts/ckpt_ema0.9999_<model>_<iteration>.pt` and resume with the regular checkpoint;
+validation continues to use the regular model. Set `ema_decay` to change the decay or
+`disable_ema: true` to omit EMA updates and checkpoints.
+
 #### Train on the CPU
 
 By defaults, accelerate uses GPU for training. However if you want to use CPU only, pass `--use_cpu` to the trainer.

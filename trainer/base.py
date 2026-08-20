@@ -78,6 +78,7 @@ from utils.misc_utils import (
 )
 from utils.tb_writer import create_summary_writer
 from utils.async_checkpoint import AsyncCheckpointWriter
+from utils.model_ema import ModelEMA
 from utils.file_utils import (
     save_torch_ckpt,
     load_torch_ckpt,
@@ -316,6 +317,8 @@ class BaseTrainer:
         model_args: Extra keyword arguments forwarded to the model constructor.
         load_from: Path to a pretrained checkpoint to load before training, or
             ``None`` to skip.
+        disable_ema: Disable the additional EMA weight checkpoints.
+        ema_decay: Constant decay used for EMA weight updates.
         # Optimizer
         optim_type: Optimizer name (e.g. ``"adamw"``).
         optim_args: Extra keyword arguments forwarded to the optimizer constructor.
@@ -374,6 +377,8 @@ class BaseTrainer:
         model_type: str,
         model_args: dict | None = None,
         load_from: str | None = None,
+        disable_ema: bool = False,
+        ema_decay: float = 0.9999,
         # Optimizer
         optim_type: str = "adamw",
         optim_args: dict | None = None,
@@ -440,6 +445,19 @@ class BaseTrainer:
         self.model_type = model_type
         self.model_args = model_args or {}
         self.load_from = load_from
+        if isinstance(ema_decay, bool) or not isinstance(ema_decay, numbers.Real):
+            raise TypeError("ema_decay must be a real number")
+        if not math.isfinite(ema_decay) or not 0 <= ema_decay < 1:
+            raise ValueError("ema_decay must be in [0, 1)")
+        self.disable_ema = disable_ema
+        self.ema_decay = float(ema_decay)
+        self.ema_enabled = not disable_ema
+        self._pending_ema_states = None
+        self._ema_models = {}
+        self._ema_stream = None
+        self._ema_events = ()
+        self._ema_event_index = 0
+        self._ema_update_done = None
 
         self.optim_type = optim_type
         self.optim_args = optim_args or {}
@@ -1359,6 +1377,129 @@ class BaseTrainer:
             "iterations": self.iterations,
         }
 
+    def _ema_config(self):
+        enabled = bool(getattr(self, "ema_enabled", False))
+        return {
+            "version": 1,
+            "enabled": enabled,
+            "decay": self.ema_decay if enabled else None,
+            "models": sorted(getattr(self, "models", {})),
+        }
+
+    def _validate_ema_resume_config(self, saved_config, state_filename):
+        if saved_config is not None and saved_config != self._ema_config():
+            raise RuntimeError(
+                f"Cannot resume checkpoint {state_filename}: EMA configuration"
+                f" changed from {saved_config!r} to {self._ema_config()!r}."
+            )
+
+    @property
+    def _ema_decay_label(self):
+        return str(self.ema_decay)
+
+    def _ema_ckpt_path(self, name: str, iteration: int) -> str:
+        return os.path.join(
+            self.ckpt_dir,
+            f"ckpt_ema{self._ema_decay_label}_{name}_{iteration:07d}.pt",
+        )
+
+    def _load_ema_checkpoint(self, iteration, saved_config):
+        """Stage EMA weights for construction after device preparation."""
+        if not self.ema_enabled:
+            self._pending_ema_states = None
+            return
+        if saved_config is None:
+            self._pending_ema_states = None
+            self.accelerator.print(
+                "Warning: resumed checkpoint predates EMA support; initializing"
+                " EMA from the resumed training weights."
+            )
+            return
+
+        states = {}
+        for name in self.models:
+            path = self._ema_ckpt_path(name, iteration)
+            if not os.path.isfile(path):
+                raise FileNotFoundError(
+                    f"Training state refers to iteration {iteration}, but EMA"
+                    f" checkpoint {path} is missing"
+                )
+            state_dict, _, metadata = load_torch_ckpt(path)
+            if (
+                int(metadata.get("iteration", -1)) != iteration
+                or metadata.get("ema_decay") != self._ema_decay_label
+            ):
+                raise RuntimeError(
+                    f"Cannot resume: EMA model {name!r} metadata differs."
+                )
+            states[name] = state_dict
+        self._pending_ema_states = states
+
+    def _setup_ema(self):
+        """Create one rank-zero EMA shadow after models reach their devices."""
+        if not self.ema_enabled:
+            self._pending_ema_states = None
+            return
+        if (
+            getattr(self.accelerator, "num_processes", 1) > 1
+            and any(_prepared_ddp(model) is None for model in self.models.values())
+        ):
+            raise RuntimeError(
+                "EMA with multiple processes requires replicated DDP models;"
+                " sharded distributed strategies are not supported."
+            )
+        if not self.accelerator.is_main_process:
+            self._pending_ema_states = None
+            return
+        pending = self._pending_ema_states
+        if pending is not None and set(pending) != set(self.models):
+            raise RuntimeError("EMA checkpoint model names differ from the trainer")
+        self._ema_models = {
+            name: ModelEMA(
+                self._unwrap(model),
+                self.ema_decay,
+                None if pending is None else pending[name],
+            )
+            for name, model in self.models.items()
+        }
+        self._pending_ema_states = None
+        if self.accelerator.device.type == "cuda":
+            self._ema_stream = torch.cuda.Stream(device=self.accelerator.device)
+            self._ema_events = (
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+            )
+
+    def _wait_for_ema_before_optimizer(self):
+        """Protect live weights until the previous asynchronous EMA read ends."""
+        event = getattr(self, "_ema_update_done", None)
+        if event is not None:
+            torch.cuda.current_stream(self.accelerator.device).wait_event(event)
+
+    def _update_ema_after_optimizer(self):
+        """Queue one EMA update, overlapping it with the next forward/backward."""
+        ema_models = getattr(self, "_ema_models", {})
+        if not ema_models:
+            return
+        if self._ema_stream is None:
+            for ema in ema_models.values():
+                ema.update()
+            return
+
+        current_stream = torch.cuda.current_stream(self.accelerator.device)
+        self._ema_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self._ema_stream):
+            for ema in ema_models.values():
+                ema.update()
+            event = self._ema_events[self._ema_event_index]
+            event.record(self._ema_stream)
+        self._ema_event_index = (self._ema_event_index + 1) % len(self._ema_events)
+        self._ema_update_done = event
+
+    def _wait_for_ema_checkpoint(self):
+        """Order checkpoint snapshotting after the latest EMA update."""
+        self._wait_for_ema_before_optimizer()
+
     @property
     def scheduler(self):
         """The primary LR scheduler (shortcut into ``self.schedulers``)."""
@@ -1373,6 +1514,9 @@ class BaseTrainer:
     # Layout (new format), under ``rundir/ckpts/``:
     #   ckpt_{model_name}_{iteration:07d}.pt   one standard single-model file per
     #                                          checkpointed model (weights + metadata)
+    #   ckpt_ema{decay}_{model_name}_{iteration:07d}.pt
+    #                                          optional EMA weights for each
+    #                                          trained model
     #   state_{iteration:07d}.pt               training state: per-name optimizer
     #                                          states, scaler state, and counters
     #
@@ -1733,6 +1877,8 @@ class BaseTrainer:
                 f"Cannot resume checkpoint {state_filename}: exact continuation"
                 " state format version 2 is required."
             )
+        saved_ema_config = state.get("ema")
+        self._validate_ema_resume_config(saved_ema_config, state_filename)
         saved_optimizer_config = state.get("optimizer_config")
         if saved_optimizer_config != self._optimizer_config:
             raise RuntimeError(
@@ -1808,6 +1954,8 @@ class BaseTrainer:
                     f"Cannot resume: model {name!r} metadata iteration differs."
                 )
             m.load_state_dict(model_state_dict)
+
+        self._load_ema_checkpoint(iteration, saved_ema_config)
 
         vq_modules = self._vq_runtime_modules()
         if resume["version"] == 1:
@@ -2095,6 +2243,10 @@ class BaseTrainer:
         if (
             state.get("optimizer_config") != self._optimizer_config
             or state.get("scheduler_config") != self._scheduler_config()
+            or (
+                state.get("ema") is not None
+                and state.get("ema") != self._ema_config()
+            )
             or not self._checkpoint_values_equal(
                 state.get("optimizers"),
                 {
@@ -2165,6 +2317,32 @@ class BaseTrainer:
                     f"checkpoint state collision at iteration {iteration}:"
                     f" committed model {name!r} differs"
                 )
+        if (
+            isinstance(state.get("ema"), dict)
+            and state["ema"].get("enabled", False)
+            and self.accelerator.is_main_process
+        ):
+            for name, ema in self._ema_models.items():
+                ema_path = self._ema_ckpt_path(name, iteration)
+                if not os.path.isfile(ema_path):
+                    raise RuntimeError(
+                        f"checkpoint state collision at iteration {iteration}:"
+                        f" committed EMA model {name!r} is missing"
+                    )
+                saved_ema, _, metadata = load_torch_ckpt(ema_path)
+                current_ema = ema.state_dict(self._unwrap(self.models[name]))
+                if (
+                    int(metadata.get("iteration", -1)) != iteration
+                    or metadata.get("ema_decay") != self._ema_decay_label
+                    or not self._checkpoint_values_equal(
+                        saved_ema,
+                        current_ema,
+                    )
+                ):
+                    raise RuntimeError(
+                        f"checkpoint state collision at iteration {iteration}:"
+                        f" committed EMA model {name!r} differs"
+                    )
         if resume["version"] == 2:
             current_schema = self._vq_runtime_schema(
                 self._vq_runtime_modules()
@@ -2272,6 +2450,7 @@ class BaseTrainer:
         ):
             local_error = None
             try:
+                self._wait_for_ema_checkpoint()
                 self._validate_committed_checkpoint_set(
                     self.state.iteration
                 )
@@ -2415,6 +2594,21 @@ class BaseTrainer:
                     ),
                 )
             )
+        ema_models = getattr(self, "_ema_models", {})
+        if ema_models:
+            self._wait_for_ema_checkpoint()
+            ema_metadata = {**metadata, "ema_decay": self._ema_decay_label}
+            for name, ema in ema_models.items():
+                model = self._unwrap(self.models[name])
+                ema_path = self._ema_ckpt_path(name, st.iteration)
+                payloads.append(
+                    (
+                        ema.state_dict(model),
+                        lambda staged_sd, path=ema_path: save_torch_ckpt(
+                            path, staged_sd, {}, ema_metadata
+                        ),
+                    )
+                )
         if st.iteration % self.save_interval != 0:
             self._temp_snapshot_iters.add(st.iteration)
 
@@ -2472,6 +2666,7 @@ class BaseTrainer:
         st = self.state
         return {
             "format_version": 2,
+            "ema": self._ema_config(),
             "optimizers": {name: opt.state_dict() for name, opt in self.optimizers.items()},
             "schedulers": {
                 name: scheduler.state_dict()
@@ -3552,6 +3747,7 @@ class BaseTrainer:
                 even_batches=False,
             )
         self._setup_weight_clipping()
+        self._setup_ema()
 
     def _configure_evaluation_buffer_syncs(self):
         """Defer DDP broadcasts for models whose buffers only affect evaluation."""
@@ -4300,6 +4496,9 @@ class BaseTrainer:
 
         # apply weight clipping if needed (groups resolved in _prepare_for_training)
         if self._weight_clip_groups:
+            # Clipping mutates live weights, so it cannot race the previous
+            # rank-zero EMA read.
+            self._wait_for_ema_before_optimizer()
             with self.profiler.region("clip"):
                 apply_weight_clipping(self._weight_clip_groups)
 
@@ -4386,6 +4585,7 @@ class BaseTrainer:
 
                 mutation_errors = []
                 grad_norm_readback = None
+                optimizer_stepped = False
                 with self.profiler.region("opt"):
                     try:
                         if accelerator.sync_gradients:
@@ -4469,10 +4669,19 @@ class BaseTrainer:
                                         )
                                     )
 
+                        # Let the previous rank-zero EMA read overlap this
+                        # micro-batch, but finish before weights mutate again.
+                        if accelerator.sync_gradients:
+                            self._wait_for_ema_before_optimizer()
+
                         # step/zero_grad are skipped internally on non-sync micro-batches
                         for opt in self.optimizers.values():
                             self._optimizer_state_mutated = True
                             opt.step()
+                            optimizer_stepped |= (
+                                accelerator.sync_gradients
+                                and not getattr(opt, "step_was_skipped", False)
+                            )
                         if accelerator.sync_gradients:
                             # keep an LR unchanged when AMP overflow skipped its
                             # optimizer's step; each optimizer decides overflow
@@ -4488,6 +4697,8 @@ class BaseTrainer:
                         for opt in self.optimizers.values():
                             self._optimizer_state_mutated = True
                             opt.zero_grad(set_to_none=True)
+                        if optimizer_stepped:
+                            self._update_ema_after_optimizer()
                     except BaseException as exc:
                         mutation_errors.append(
                             f"{type(exc).__name__}: {exc}"

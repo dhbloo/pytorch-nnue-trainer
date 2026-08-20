@@ -30,6 +30,8 @@ _TRAIN_CONFIG_KEYS = frozenset(
         "num_worker",
         "model_type",
         "model_args",
+        "disable_ema",
+        "ema_decay",
         "optim_type",
         "optim_args",
         "lr_scheduler_type",

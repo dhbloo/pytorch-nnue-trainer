@@ -84,6 +84,17 @@ def parse_args_and_init():
     )
     parser.add("--model_type", required=True, help="Model type")
     parser.add("--model_args", type=yaml.safe_load, default={}, help="Extra model arguments")
+    parser.add(
+        "--disable_ema",
+        action="store_true",
+        help="Disable additional EMA weight checkpoints",
+    )
+    parser.add(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="Decay for EMA weight checkpoints",
+    )
     parser.add("--optim_type", default="adamw", help="Optimizer type")
     parser.add("--optim_args", type=yaml.safe_load, default={}, help="Extra optimizer arguments")
     parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
