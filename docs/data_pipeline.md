@@ -1,8 +1,7 @@
 # Data pipeline
 
 This page is the maintained reference for the training data pipeline. It describes the implemented architecture,
-the behavior developers and users can rely on, the relevant configuration, and the current representative
-performance.
+the behavior developers and users can rely on, the portable resource policy, and the relevant configuration.
 
 The central design rule is to unify scheduling semantics without forcing every file format into the same physical
 record representation. Each `RecordSource` owns deterministic admission, compact identity, and format-specific
@@ -81,7 +80,7 @@ datasets use the planner and receive a required `DatasetRuntimeContext` from the
 | `katago_numpy`, `processed_katago_numpy`, `multi` | Map-style indexing and sampler-owned sampling |
 | `iterative_katago_numpy`, `iterative_processed_katago_numpy` | Planned NPZ with Dense or Indexed identities |
 | `batched_processed_katago_numpy` | Dense NPZ with a packed uniform-shape fast path and internal decode prefetch |
-| `iterative_sparse_numpy` | Planned Indexed NPZ |
+| `sparse_numpy`, `iterative_sparse_numpy` | Planned Indexed NPZ |
 | `simple_binary`, `packed_binary` | Interleaved sequential source |
 | `iterative_multi` | Composite of native child sources |
 
@@ -198,10 +197,10 @@ row counts, board shape, and declared payload bounds, then hashes the physical f
 and ZIP-stored mmap paths retain full inspection where values or mapping validation are required.
 
 The processed Dense fast path resolves a packed batch once, groups rows by physical file, gathers one file at a
-time, and scatters results back into planner order. Its decode workers share two independent bounded caches:
-
-- deflated arrays: at most six files and 1.125 GiB, while always permitting one oversize file;
-- ZIP-stored read-only mappings: at most 16 files.
+time, and scatters results back into planner order. In the primary adaptive mode, decoded arrays, in-flight
+loads, ready batches, and pinned batches are charged to one hard rank-local host-memory budget. Compatibility
+mode retains the older fixed entry/byte limits. Both modes keep ZIP-stored read-only mappings in a separately
+bounded cache.
 
 One-file-at-a-time gather prevents a prefetch chunk from retaining all touched files as temporary arrays. Cache
 limits are independent of total dataset file count.
@@ -250,7 +249,7 @@ never exceed `prefetch_batches`.
 
 The processed NPZ path can decode several neighboring batches in one call. Its stateless NumPy-to-pinned-Tensor
 conversion also runs in the workers. Planner state, stateful pipelines, publication, and transaction commits stay
-on the owning thread. In normal Mix9S training, Accelerate performs the pinned-host-to-device copies while
+on the owning thread. In normal training, Accelerate performs the pinned-host-to-device copies while
 fetching the next loader batch.
 
 Training can optionally set the top-level `cuda_prefetch_batches` option from `1` through `4`. Any positive
@@ -286,49 +285,158 @@ Closing or failing the iterator drains pending copies and then invokes the plann
 (a pending device error surfaces from that drain first), so checkpoint identity depends only on consumed
 batches.
 
-The gomoku ResNet reference configurations run the batched processed pipeline with `cuda_prefetch_batches: 1`
-since the 2026-08-07 acceptance: that combination measured +9-53% effective end-to-end throughput over the
-previous reference across the eleven 600k-iteration runs (see [training performance](performance.md)). The
-generic default stays `0` because the slot path presumes a constant batch schema and CUDA training; enable it
-for other workloads after an end-to-end measurement shows a benefit.
+The generic `cuda_prefetch_batches` default stays `0` because the slot path presumes a constant batch schema and
+CUDA training. Enable it only after representative end-to-end validation shows a benefit.
 
 Batch-yielding and resumable built-in streams require DataLoader `num_worker: 0`; loader processes are rejected
-because they would duplicate planner ownership and checkpoint state. The production Mix9S path gets its
-parallelism from the dataset's internal ordered decode workers (configured by `prefetch_threads`).
+because they would duplicate planner ownership and checkpoint state. Parallelism comes from the dataset's
+internal ordered decode workers. The adaptive controller selects their active count; compatibility mode uses
+the legacy `prefetch_threads` setting.
 
-### Observability and automatic tuning
+## Adaptive resource control
 
-The batched processed-NPZ path has three construction-time execution modes:
+The primary resource interface is the top-level singular `data_pipeline` mapping. It is separate from
+`data_pipelines`, the older list of semantic batch transforms. The adaptive interface currently supports only
+`dataset_type: batched_processed_katago_numpy` and requires `num_worker: 0`. It can compose `data_pipelines`
+whose registered transforms declare themselves parallel and stateless; other semantic transforms remain on the
+compatibility path and are rejected when adaptive control is explicitly requested.
 
-- `off` (the default) keeps the original uninstrumented dataset, decoder, and device-loader classes. It performs
-  no per-batch metric branches, counter updates, clocks, locks, or tuning callbacks;
-- `metrics` selects separate instrumented classes that aggregate only at batch, decode-chunk, cache, and file
-  boundaries;
-- `autotune` enables the same metrics plus a bounded controller for timing-only runtime parameters.
+For the standard training entry point, omitting `data_pipeline` enables its default adaptive policy when those
+requirements hold and no fixed `prefetch_threads`, `prefetch_batches`, `pin_memory`, or loader performance alias is
+present. Existing fixed configurations, nonzero loader-worker configurations, and semantic `data_pipelines` remain
+on their compatibility path. Supplying an explicit `data_pipeline` mapping is strict: incompatible options are
+reported as configuration errors instead of silently disabling adaptation.
 
-The dataset layer exposes numeric interval snapshots but does not depend on a logging backend. At the trainer's
-normal `log_interval`, the trainer aggregates the snapshots across ranks and publishes them alongside existing
-metrics under the independent `data_pipeline/...` and `data_pipeline_rows/...` namespaces. Metrics cover
-producer capacity, source-wait and H2D submission latency, prefetch queue depth and starvation, decoded-cache
-behavior, manifest cost, and retained memory. The static-slot handoff reports its per-batch source-wait and
-H2D submission latency and bytes through the same channel; the legacy lookahead prefetcher
-(`NNUE_FORCE_CUDA_PREFETCH`) additionally uses CUDA events to report actual device-copy time and
-compute-stream exposed wait. Distributed summaries use the slowest producer and largest exposed wait.
+### Portable resource resolution
 
-Automatic tuning may adjust active decode workers, ordered-prefetch depth, and processed-NPZ decoded-cache
-limits within configured CPU limits and cache budgets. The decoder still permits one file larger than its byte
-budget so oversized datasets remain usable. Tuning never changes sample admission, reservoir size, record order,
-batch size, source mixture, augmentation, or another value that affects training semantics. One option changes
-at a time, decisions have a cooldown, and tuning freezes after it meets the configured producer-headroom and
-data-wait targets or reaches its bounded tuning window. When excess producer headroom exists, it may deliberately
-reduce raw scan throughput to release CPU and queue memory while preserving the configured margin over training
-demand. Explicit prefetch values are locked by default.
+Each training process collects an immutable snapshot of host memory and CPU availability. Probing uses
+standard-library interfaces first. Isolated platform adapters then provide Windows native memory/affinity
+fallbacks and Linux procfs/cgroup v1/v2 refinements; cgroup discovery is best-effort rather than the primary source
+of host capacity.
+Malformed values and unlimited sentinels are ignored instead of becoming artificial limits.
+Native Windows execution is best-effort rather than a tier-one support target.
 
-Resolved settings and decision reasons are persisted as non-semantic runtime metadata and included in checkpoint
-state. A checkpoint made on a different runtime ignores incompatible tuning state without affecting data resume.
-After the controller freezes, an optional metadata-only profile can be reused when the hardware, software,
-dataset, batch, and pipeline fingerprint matches. Dataset payloads, file paths, and decoded cache contents are
-never part of that profile.
+Automatic memory selection requires a safe effective-available-memory observation. It starts from:
+
+```text
+50% of effective available memory
+```
+
+When effective total memory is also available, 25% of that total is an additional ceiling. Total capacity alone is
+never used to guess current headroom: if effective available memory cannot be established safely, automatic memory
+sizing fails with guidance to set `host_memory_budget` explicitly. An explicit budget remains a user maximum, but
+a medium- or high-confidence effective-available observation may reduce it to 80% of current headroom. Automatic
+CPU selection floors the effective affinity/quota count and falls back to the logical CPU count. An explicit CPU
+budget is likewise a maximum and is reduced when a smaller observed CPU ceiling exists. Automatic CPU selection
+fails with an actionable request for an explicit value when no usable CPU fact is available.
+
+Reports are grouped by opaque node identity so each node total is divided by its actual number of local ranks.
+Every report is resolved independently, then all ranks select the conservative global minima for per-rank memory
+and CPU. This gives every distributed rank identical performance settings even when nodes differ or concurrent
+probes vary slightly. Node identities are not included in serialized resource metadata.
+
+### Run-scoped decoded storage
+
+Automatic processed-NPZ runs keep the source files and their format unchanged. At startup, one leader per node
+streams the fixed NPY members into a unique temporary directory. Local ranks then open the same read-only files
+with NumPy mmap, so compressed members are expanded once per node rather than once per rank. The operating system
+shares resident pages and evicts them under ordinary memory pressure; the trainer does not reserve the full
+expanded size as private rank memory.
+
+The cache is intentionally ephemeral. It is never reused by another run, does not add a content hash or payload
+scan, and is deleted only after all local decoders have closed. If the temporary directory is not visible to every
+local rank, any node lacks space, or load-time filtering/channel transforms require private arrays, activation is
+disabled globally and every rank uses the existing bounded private cache. `manual` plans also retain the private
+cache so their explicit byte allocation keeps its literal meaning.
+
+### Bounded automatic adaptation
+
+`continuous` starts with a throughput-oriented plan that fits the resolved memory and CPU limits. The private-cache
+working set is estimated from dataset size, batch size, and shuffle lookahead. Decode concurrency starts at half the
+portable CPU ceiling; chunk size and queue depth are balanced around that count. Workers, chunk size, and queue
+depth form one layout: the controller never adjusts one value while leaving the other two in an unrelated
+intermediate state.
+
+The controller has only two adaptive decisions:
+
+- two consecutive wait-heavy windows with private-cache reloads grow the cache geometrically, by at least one
+  decoded file and never beyond the resolved memory limit; cache capacity never shrinks during a run;
+- two consistent windows may start one adjacent layout trial. During initial calibration, healthy operation with
+  at least 1.5x producer headroom can halve worker concurrency and rebalance the layout. Under starvation, a
+  candidate instead doubles workers, reduces a head-of-line-blocked chunk, or doubles chunk and queue depth together
+  to amortize source-tail work. The candidate skips one settling window, is measured for two windows, and is either
+  accepted as the new layout or rejected in favor of the previously accepted layout. Acceptance requires producer
+  headroom without a material throughput or prefetch-wait regression; larger-granularity trials must additionally
+  improve throughput by at least 3%.
+
+Layout rejection is an online performance choice, not a data rollback. It changes only workers, chunk size, and
+queue depth; it never rewinds samples, planner state, model state, or optimizer state. The controller never runs
+independent healthy-path shrink actions for cache, queue, or chunk. Epoch-transition windows are excluded from
+signals and trials, and a rejected complete layout is not retried within the same process. `continuous` can still
+try unseen layouts after a later sustained data bottleneck, while `manual` validates and freezes the supplied
+`advanced` plan immediately.
+
+The controller changes performance capacity only. It never changes sample admission, shuffle/reservoir size,
+record order, source mixture, batch size, augmentation, or any other semantic setting.
+
+### Hard logical-memory accounting and backpressure
+
+The selected per-rank budget is a hard cap over dataset-owned allocations explicitly charged in these categories:
+
+- `semantic_fixed`: live planner, transactional, and queued-token state;
+- `decoded_cache`: retained decoded NPZ arrays;
+- `inflight_transient`: temporary bytes required while loading a file;
+- `ready_pageable`: decoded pageable batches awaiting consumption;
+- `pinned`: pinned batches awaiting consumption, including bounded device-copy lookahead.
+
+Device lookahead is also reserved as fixed capacity headroom when the controller validates a plan, including
+pending copies and the bounded set of host transfer owners whose completion events have not retired yet. The
+lookahead wrapper transfers each output lease to that event-backed owner and releases it only after the copy is
+complete; transaction-token leases continue with the delivered batch.
+The trainer likewise reports its gradient-accumulation depth to the runtime, which reserves output and
+transaction-token headroom for every micro-batch retained until the optimizer transaction commits. Both values
+are derived runtime facts, not additional user tuning parameters.
+
+This logical budget is deliberately not a claim about whole-process RSS, allocator fragmentation, or operating-
+system page cache. Run-scoped mmap payloads therefore remain outside the rank-private logical budget. A temporary
+queue reservation that does not fit applies non-blocking backpressure: the ordered producer stops submitting work
+until the consumer releases bytes. A single request that cannot fit even in an empty budget fails clearly.
+Semantic memory cannot be reclassified as performance memory, and pressure never causes semantic settings to be
+changed automatically.
+
+### Metrics and runtime state
+
+TensorBoard records a compact iteration-axis view under `data_pipeline/...`:
+
+- exposed data wait, H2D wait, producer headroom, and the worst-rank prefetch and source-tail wait fractions;
+- the worst-rank cache-reload count;
+- worst-rank logical-memory use and backpressure events, with high-water fraction emitted initially and only when
+  it changes;
+- decoder workers, chunk size, ready-queue depth, and decoded-cache capacity when those settings initialize or
+  change.
+
+Mean process RSS is recorded as `running_stat/process_rss_gib_mean` because it covers the whole training process,
+not only the data pipeline.
+
+The controller's raw window totals and throughput inputs remain internal and are discarded after each decision.
+Pipeline metrics are not duplicated under `data_pipeline_rows/...`; global sample throughput remains available as
+`running_stat/entry/s`. The JSONL log uses the same compact public pipeline view, while controller decisions remain
+available as `data_pipeline_tuning` events.
+
+Resolved settings and decision reasons are non-semantic runtime state; incompatible runtime state is ignored without
+changing data-resume semantics. Rank coordination and checkpoints retain only the selected settings, the accepted
+layout boundary, the controller phase, the frozen flag, and the latest event. Incomplete trial measurements are
+discarded on checkpoint restore: the accepted layout is installed immediately, and fresh calibration may later
+select another candidate from new windows instead of persisting timing noise.
+
+Automatic CPU or memory probe drift alone does not invalidate a compatible saved layout; restore accepts it when it
+still fits the current effective resource limits. Cumulative elapsed time, epoch, and consumed rows continue from
+the checkpoint. JSONL and TensorBoard suffixes beyond that checkpoint are replaced so resumed curves have one
+continuous history rather than overlapping branches.
+
+The distributed source-tail fraction subtracts nested decoded-prefetch wait from source wait on each rank before
+taking the worst rank. This avoids mixing maxima from different ranks and keeps H2D, CUDA, or trainer time from
+masquerading as synchronous planner or task-submission work.
 
 ## Distributed behavior
 
@@ -366,11 +474,71 @@ producing a partial continuation.
 
 ## Configuration
 
-Common iterable options are:
+The recommended processed-NPZ configuration omits the adaptive mapping because the standard training entry point
+selects its portable defaults:
+
+```yaml
+dataset_type: batched_processed_katago_numpy
+dataset_args:
+  shuffle_window_size: 32768
+  apply_symmetry: true
+```
+
+The four normal `data_pipeline` options are:
+
+| Option | Meaning | Default |
+| --- | --- | --- |
+| `host_memory_budget` | Maximum host-data memory for the whole node; `auto` requires safe effective available memory | `auto` |
+| `data_wait_budget` | Maximum tolerated data-wait fraction; accepts a fraction or percentage | `0.01` (1%) |
+| `data_cpu_budget` | Maximum decode CPU count for the whole node; `auto` uses effective/logical CPU facts | `auto` |
+| `adaptation` | Automatic `continuous` or fixed `manual` control | `continuous` |
+
+Memory and CPU values are node totals, not per-rank allowances. The coordinator divides them across local ranks
+and then applies the most conservative per-rank result globally. Adding ranks therefore does not multiply the
+configured resource cap. Byte values accept positive integers or strings such as `512 MiB` and `2.5 GiB`.
+`data_wait_budget` is a controller target, not a per-window guarantee. Each observation window spans
+`log_interval`, which therefore also controls adaptation cadence and the amount of short-term noise in a decision.
+`continuous` is the default because available resources and producer demand can change during a long run, while
+the controller changes only bounded performance capacity. `manual` is reserved for an explicitly fixed,
+hardware-specific plan.
+
+Adaptive mode rejects fixed performance keys in `dataset_args`: `prefetch_threads`, `prefetch_batches`, and
+`pin_memory`. It also rejects nonempty `data_pipelines`, because stateful semantic transforms are
+not yet supported by the adaptive runtime. Format, filtering, admission, target, and augmentation options remain
+under `dataset_args` and keep their existing semantics. Training shuffle is enabled by default and disabled with
+top-level `no_shuffle: true`; only its semantic window belongs in `dataset_args`. Loader aliases `dataloader_args.pin_memory`
+and `dataloader_args.shuffle_buffer_size` are rejected as well: pinning belongs to the adaptive plan, while the
+semantic shuffle window must be configured once as `dataset_args.shuffle_window_size` before runtime sizing.
+
+For a completely fixed performance plan, use `adaptation: manual` with all five `advanced` values:
+
+```yaml
+data_pipeline:
+  host_memory_budget: auto
+  data_wait_budget: 1%
+  data_cpu_budget: auto
+  adaptation: manual
+  advanced:
+    decoded_cache_bytes: 2 GiB
+    decode_workers: 4
+    decode_chunk_batches: 2
+    ready_queue_batches: 8
+    pin_memory: true
+```
+
+`advanced.decoded_cache_bytes` and `advanced.decode_workers` are node totals. Decode workers must divide evenly
+across local ranks and provide at least one worker per rank. Chunk and ready-queue counts are rank-local, the ready
+queue must be at least as deep as the chunk, and the entire plan must fit the resolved memory/CPU caps. Pinned
+memory must be supported by the runtime.
+
+### Fixed compatibility configuration
+
+When the adaptive mapping is omitted, explicit legacy performance controls, a nonzero `num_worker`, or nonempty
+semantic `data_pipelines` keep the existing fixed path. This preserves older configurations and direct dataset use:
 
 | Option | Meaning | Typical/default value |
 | --- | --- | --- |
-| `shuffle` | Enable deterministic reservoir shuffle | training-dependent |
+| `no_shuffle` (top level) | Disable the trainer's deterministic reservoir shuffle | `false` |
 | `sample_rate` | Deterministic pre-reservoir admission rate | `1.0` |
 | `shuffle_window_size` | Maximum active reservoir records | `32768` |
 | `shuffle_buffer_bytes` | Additional payload byte ceiling | binary default: 256 MiB |
@@ -381,39 +549,20 @@ Common iterable options are:
 | `prefetch_batches` | Maximum submitted but unpublished batches | `32` |
 | `pin_memory` | Convert decoded NumPy batches to pinned tensors | CUDA availability |
 | `observability` | Enable grouped pipeline metrics | `false` |
-| `autotune` | Enable conservative runtime tuning and profile reuse | `false` |
 
-A representative processed-NPZ configuration is:
+A fixed configuration example is:
 
 ```yaml
 dataset_type: batched_processed_katago_numpy
 num_worker: 0
-cuda_prefetch_batches: 0
 dataset_args:
-  shuffle: true
-  sample_rate: 1.0
-  shuffle_window_size: 32768
   prefetch_threads: 2
   prefetch_batches: 32
   pin_memory: true
-  apply_symmetry: true
-  observability: true
-  autotune:
-    reuse: exact
-    respect_explicit: false
-    warmup_iterations: 1000
-    verify_iterations: 500
-    decision_interval: 500
-    freeze_after: 10000
-    target_producer_headroom: 1.5
-    max_data_wait_fraction: 0.02
-    max_prefetch_threads: 4
-    max_prefetch_batches: 64
-    host_cache_budget_bytes: 2147483648
 ```
 
-Format-specific filtering and target options remain under `dataset_args`. Unknown or removed options are rejected
-during dataset construction.
+These controls do not form a second runtime controller. New adaptive configurations should use the top-level
+interface. Unknown or removed options are rejected during dataset construction.
 
 ## Memory model
 
@@ -425,38 +574,17 @@ during dataset construction.
 | Packed binary | file descriptors and active readers | bounded raw entries/subrecords | no |
 | Composite | sum of child metadata | one bounded planner state | no |
 
-The decoded NPZ LRU is the dominant retained host allocation on the reference Mix9S path. It is deliberately
-bounded to avoid decompression thrash while remaining independent of the total number of files. After the cache
-is full, Python control-plane memory does not grow with rows or batches processed.
+Automatic processed-NPZ runs normally use one run-scoped mmap cache per node, leaving ready batches and planner
+state as the dominant private rank allocations. Private fallback and manual modes retain the bounded decoded NPZ
+LRU. In either backend, Python control-plane memory does not grow with rows or batches processed.
 
-## Current performance
+## Performance validation
 
-The following snapshot was measured on 2026-08-02 with an AMD Ryzen 9 5950X, an RTX 4080 SUPER, batch size 128,
-two internal decode threads, a 32-batch prefetch bound, symmetry enabled, and a representative Mix9S dataset.
-Filesystem cache, storage, compression ratio, board size, and filtering materially affect absolute numbers.
-
-| Measurement | Current result |
-| --- | ---: |
-| Packed planning without materialization | 14.7–16.2M rows/s |
-| Transactional packed planning | 6.83M rows/s |
-| Manifest construction | 0.97 s, zero decoded cache entries |
-| Full pinned scan | 126.4K rows/s |
-| Full-scan peak process RSS | 2,052,072 KiB |
-| Mix9S steady training consumption | approximately 9.6K rows/s |
-| Mix9S training process RSS | approximately 3.05–3.12 GiB |
-| Main-thread source publication | approximately 0.014 ms/batch |
-| Loader region including H2D | approximately 0.7 ms/batch |
-
-The representative scan reached the six-entry decoded-cache bound without throughput degrading as the dataset
-progressed. Traced live Python memory remained stable after warm-up, and the pipeline supplies roughly 15 times
-the rows consumed by training on this host.
-
-End-to-end training references and model-side methodology live in
-[Training performance](performance.md); the measured runs there confirm the pipeline is not the bottleneck
-for the reference workloads.
-
-These are reference measurements, not portable guarantees. New hardware, formats, filters, worker/process
-counts, cache policies, or storage should be measured end to end.
+Absolute throughput and memory use depend on storage, compression, board shape, filtering, process count, and
+model demand. Treat automatic settings as safe starting points rather than portable performance guarantees.
+Validate materially different workloads end to end, using the emitted producer, wait, cache, queue, and logical-
+memory metrics to distinguish data-pipeline limits from model-side limits. The benchmark methodology is described
+in [Training performance](performance.md).
 
 ## Operational checks
 
