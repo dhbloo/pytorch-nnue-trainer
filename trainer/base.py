@@ -16,6 +16,7 @@ from accelerate.utils import (
     DistributedType,
     DynamoBackend,
     GradientAccumulationPlugin,
+    find_batch_size,
     gather_object,
     send_to_device,
 )
@@ -5470,29 +5471,6 @@ class BaseTrainer:
             else:
                 totals[key] = value
 
-    @staticmethod
-    def _zero_evaluation_stat(value):
-        """Return a schema-preserving empty contribution for a replayed batch."""
-        if isinstance(value, SumCount):
-            return SumCount(
-                value.scope, torch.zeros_like(value.sum), 0
-            )
-        if isinstance(value, Maximum):
-            return Maximum("evaluation", value.value, 0)
-        if isinstance(value, SufficientStats):
-            return SufficientStats(
-                value.scope,
-                value.finalizer_id,
-                {
-                    name: torch.zeros_like(tensor)
-                    for name, tensor in value.tensors.items()
-                },
-                {name: 0 for name in value.counts},
-            )
-        if isinstance(value, torch.Tensor):
-            return torch.zeros_like(value)
-        return 0.0
-
     def _preflight_evaluation_schema(
         self, *, state_attr=None, **namespaces
     ):
@@ -5605,8 +5583,33 @@ class BaseTrainer:
                 + " | ".join(all_errors)
             )
 
+    def _evaluation_entry_counts(self, data, *, include_metrics):
+        """Return local and global real-entry counts for one evaluation batch."""
+        local_count = 0
+        if include_metrics:
+            local_count = int(
+                data["is_real"].sum().item()
+                if isinstance(data, dict) and "is_real" in data
+                else find_batch_size(data)
+            )
+        global_count = int(
+            self.accelerator.reduce(
+                torch.tensor(
+                    local_count,
+                    dtype=torch.long,
+                    device=self.accelerator.device,
+                ),
+                reduction="sum",
+            ).item()
+        )
+        return local_count, global_count
+
     def _finalize_masked_global_batch(
-        self, metric_dict, data, *, include_metrics=True
+        self,
+        metric_dict,
+        *,
+        global_real_entries,
+        include_metrics=True,
     ):
         """Reduce typed rank-local statistics and close one global batch."""
         finalized = {}
@@ -5640,11 +5643,8 @@ class BaseTrainer:
                         reduction="sum",
                     ).item()
                 )
-                global_value = SumCount(
-                    "global_batch", global_sum, global_count
-                ).finalize()
                 finalized[key] = SumCount(
-                    "evaluation", global_value, 1
+                    "evaluation", global_sum, global_count
                 )
                 continue
             if isinstance(value, SufficientStats):
@@ -5694,7 +5694,9 @@ class BaseTrainer:
                     counts,
                 ).finalize()
                 finalized[key] = SumCount(
-                    "evaluation", global_value, 1
+                    "evaluation",
+                    global_value * global_real_entries,
+                    global_real_entries,
                 )
                 continue
             if isinstance(value, Maximum):
@@ -5935,12 +5937,11 @@ class BaseTrainer:
             for val_data, include_metrics in self._iter_collective_safe_batches(
                 self.val_loader
             ):
-                if include_metrics:
-                    local_val_entries += int(
-                        val_data["is_real"].sum().item()
-                        if isinstance(val_data, dict) and "is_real" in val_data
-                        else self.batch_size_per_process * self.eval_bs_multipler
-                    )
+                local_entries, global_entries = self._evaluation_entry_counts(
+                    val_data,
+                    include_metrics=include_metrics,
+                )
+                local_val_entries += local_entries
                 step_errors = []
                 val_losses, val_auxs = {}, {}
                 try:
@@ -5959,27 +5960,17 @@ class BaseTrainer:
                 )
                 val_losses = self._finalize_masked_global_batch(
                     val_losses,
-                    val_data,
+                    global_real_entries=global_entries,
                     include_metrics=include_metrics,
                 )
                 val_auxs = self._finalize_masked_global_batch(
                     val_auxs,
-                    val_data,
+                    global_real_entries=global_entries,
                     include_metrics=include_metrics,
                 )
-                if not include_metrics:
-                    for totals, values in (
-                        (val_loss_dict, val_losses),
-                        (val_aux_dict, val_auxs),
-                    ):
-                        for key, value in values.items():
-                            if key not in totals:
-                                totals[key] = self._zero_evaluation_stat(
-                                    value
-                                )
-                else:
-                    self._accumulate_evaluation_metrics(val_loss_dict, val_losses)
-                    self._accumulate_evaluation_metrics(val_aux_dict, val_auxs)
+                self._accumulate_evaluation_metrics(val_loss_dict, val_losses)
+                self._accumulate_evaluation_metrics(val_aux_dict, val_auxs)
+                if include_metrics:
                     num_val_batches += 1
         teardown_errors = []
         try:
@@ -6125,12 +6116,11 @@ class BaseTrainer:
                 batches,
                 disable=not accelerator.is_local_main_process,
             ):
-                if include_metrics:
-                    local_test_entries += int(
-                        data["is_real"].sum().item()
-                        if isinstance(data, dict) and "is_real" in data
-                        else self.batch_size_per_process * self.eval_bs_multipler
-                    )
+                local_entries, global_entries = self._evaluation_entry_counts(
+                    data,
+                    include_metrics=include_metrics,
+                )
+                local_test_entries += local_entries
                 step_errors = []
                 metrics = {}
                 try:
@@ -6144,17 +6134,13 @@ class BaseTrainer:
                     test_metric=metrics,
                 )
                 metrics = self._finalize_masked_global_batch(
-                    metrics, data, include_metrics=include_metrics
+                    metrics,
+                    global_real_entries=global_entries,
+                    include_metrics=include_metrics,
                 )
-                if not include_metrics:
-                    for key, value in metrics.items():
-                        if key not in metric_dict:
-                            metric_dict[key] = self._zero_evaluation_stat(
-                                value
-                            )
-                    continue
                 self._accumulate_evaluation_metrics(metric_dict, metrics)
-                num_batches += 1
+                if include_metrics:
+                    num_batches += 1
 
         self._set_vq_eval_stats_enabled(True)
         global_vq_metrics = self._global_vq_eval_metrics()
