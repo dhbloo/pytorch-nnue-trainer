@@ -220,6 +220,12 @@ rate are transferred from the short constant-rate experiment; the long-run resul
 - TensorBoard event writes pass through a buffer shim below the TFRecord framing
   (`utils/tb_writer.py`); on latency-bound filesystems (e.g. drvfs mounts) the stock per-scalar framing
   could block the training loop for hundreds of milliseconds per log interval.
+- TensorBoard stores iteration-axis events and selected consumed-row views in the same `log` event stream,
+  so each new training directory appears as one run. Training loss, training auxiliaries, and validation loss
+  use the `train_rows/...`, `train_aux_rows/...`, and `validation_rows/...` tags for row views; pipeline,
+  running-stat, and validation-auxiliary metrics remain iteration-only. TensorBoard is observational and
+  append-only: an abnormal resume can leave a short tail of overlapping points, while the JSONL log remains
+  the exact rollback-aware record. Existing split-layout event directories are not migrated.
 - Periodic checkpoints serialize off the training loop (`utils/async_checkpoint.py`). Submitting a
   save clones every payload tensor on a dedicated copy stream behind the compute tail and blocks the
   compute stream only until that device-resident snapshot completes (~2 ms for a 238 MiB state); a

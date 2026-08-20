@@ -674,14 +674,21 @@ class BaseTrainer:
             resumed = self._last_state_save_iteration is not None
             if resumed:
                 _trim_training_log(log_path, self.state.iteration)
-            purge_step = self.state.iteration + 1 if resumed else None
-            self.tb_logger = create_summary_writer(
-                os.path.join(self.rundir, "log"),
-                purge_step=purge_step,
-            )
+            tensorboard_dir = os.path.join(self.rundir, "log")
+            self.tb_logger = create_summary_writer(tensorboard_dir)
             self.log_file = open(log_path, "a", encoding="utf-8")
         else:
             self.tb_logger, self.log_file = None, None
+
+    def _log_metric_views(self, tag, values):
+        """Log selected metrics against both iteration and consumed rows."""
+        log_value_dict(self.tb_logger, tag, values, self.state.iteration)
+        log_value_dict(
+            self.tb_logger,
+            f"{tag}_rows",
+            values,
+            self.state.rows,
+        )
 
     def _collective_dataset_call(self, phase, callback):
         """Run rank-local dataset I/O and exchange status before later collectives."""
@@ -5002,9 +5009,9 @@ class BaseTrainer:
         if not self.accelerator.is_main_process:
             return
 
-        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration)
+        self._log_metric_views("train", loss_dict)
         if aux_dict:
-            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration)
+            self._log_metric_views("train_aux", aux_dict)
 
         now = time.perf_counter()
         iters_per_second = (st.iteration - self._log_last_it) / (
@@ -5059,9 +5066,9 @@ class BaseTrainer:
             self._log_last_time = now
             return
 
-        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration)
+        self._log_metric_views("train", loss_dict)
         if aux_dict:
-            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration)
+            self._log_metric_views("train_aux", aux_dict)
 
         elapsed_time = self._elapsed_seconds(now)
         running_stat_dict = {
@@ -5830,7 +5837,7 @@ class BaseTrainer:
         def log_validation_results():
             elapsed_time = self._elapsed_seconds()
             num_val_entries = total_val_entries
-            log_value_dict(self.tb_logger, "validation", val_loss_dict, st.iteration)
+            self._log_metric_views("validation", val_loss_dict)
             if val_aux_dict:
                 log_value_dict(
                     self.tb_logger, "validation_aux", val_aux_dict, st.iteration

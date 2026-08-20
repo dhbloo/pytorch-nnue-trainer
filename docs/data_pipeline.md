@@ -431,8 +431,11 @@ select another candidate from new windows instead of persisting timing noise.
 
 Automatic CPU or memory probe drift alone does not invalidate a compatible saved layout; restore accepts it when it
 still fits the current effective resource limits. Cumulative elapsed time, epoch, and consumed rows continue from
-the checkpoint. JSONL and TensorBoard suffixes beyond that checkpoint are replaced so resumed curves have one
-continuous history rather than overlapping branches.
+the checkpoint. JSONL records beyond that checkpoint are removed before appending the resumed trajectory.
+For runs created by this version, TensorBoard keeps iteration-axis and selected train/validation row-axis tags in
+one `log` stream; an abnormal resume can therefore leave a short overlapping tail in this observational view
+rather than risk purging one axis with the other axis's scale. Existing split-layout event directories are not
+migrated.
 
 The distributed source-tail fraction subtracts nested decoded-prefetch wait from source wait on each rank before
 taking the worst rank. This avoids mixing maxima from different ranks and keeps H2D, CUDA, or trainer time from
