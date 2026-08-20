@@ -84,6 +84,8 @@ def buffer_tensorboard_writer(writer, capacity=_DEFAULT_BUFFER_CAPACITY):
     return writer
 
 
-def create_summary_writer(log_dir):
+def create_summary_writer(log_dir, *, purge_step=None):
     """Create a SummaryWriter whose event file writes are buffered."""
-    return buffer_tensorboard_writer(SummaryWriter(log_dir))
+    return buffer_tensorboard_writer(
+        SummaryWriter(log_dir, purge_step=purge_step)
+    )

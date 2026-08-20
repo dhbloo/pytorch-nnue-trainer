@@ -4,6 +4,7 @@ import torch
 import numpy as np
 import random
 import numbers
+from torch.nn.modules.batchnorm import _BatchNorm
 from torch.utils.data import IterableDataset
 from accelerate import (
     Accelerator,
@@ -12,6 +13,7 @@ from accelerate import (
 )
 from accelerate.data_loader import BatchSamplerShard
 from accelerate.utils import (
+    DistributedType,
     DynamoBackend,
     GradientAccumulationPlugin,
     gather_object,
@@ -22,10 +24,13 @@ from dataclasses import dataclass
 import inspect
 import json
 import hashlib
+import math
 import time
 import os
 import re
+import socket
 import stat
+import tempfile
 
 from tqdm.auto import tqdm
 
@@ -44,6 +49,10 @@ from model.vq import (
     clear_ddp_preinit_gradients,
 )
 from trainer.profiler import NULL_PROFILER, build_profiler
+from trainer.replica import (
+    assert_replicated_parameters_equal,
+    optimizer_parameters,
+)
 from utils.compile_utils import model_inductor_config, with_inductor_options
 from utils.cuda_utils import configure_cuda_memory_limit
 from utils.training_utils import (
@@ -77,6 +86,15 @@ from utils.file_utils import (
 )
 
 
+@dataclass(frozen=True)
+class _BatchFetchResult:
+    """Local fetch outcome carried to the existing pre-forward rank boundary."""
+
+    data: object | None
+    error: str | None = None
+    restarted_epoch: bool = False
+
+
 def _devices_match(actual, expected):
     """Compare devices using PyTorch's current-device semantics.
 
@@ -107,6 +125,35 @@ def _devices_match(actual, expected):
     return actual.index == expected.index
 
 
+def _batch_norm_only_buffers(module):
+    """Return buffers when every one is owned by an ordinary BatchNorm."""
+    buffers = tuple(module.buffers())
+    if not buffers:
+        return ()
+
+    batch_norm_buffer_ids = set()
+    for child in module.modules():
+        if isinstance(child, _BatchNorm) and not isinstance(
+            child, torch.nn.SyncBatchNorm
+        ):
+            for name in ("running_mean", "running_var", "num_batches_tracked"):
+                value = child._buffers.get(name)
+                if value is not None:
+                    batch_norm_buffer_ids.add(id(value))
+    if all(id(buffer) in batch_norm_buffer_ids for buffer in buffers):
+        return buffers
+    return ()
+
+
+def _prepared_ddp(model):
+    """Return the live DDP wrapper below an optional compiled wrapper."""
+    while is_compiled_module(model):
+        model = model._orig_mod
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        return model
+    return None
+
+
 def _atomic_torch_save(obj, path):
     """Write ``obj`` with ``torch.save`` through a temporary file and rename."""
     tmp_path = path + ".tmp"
@@ -114,12 +161,51 @@ def _atomic_torch_save(obj, path):
     os.replace(tmp_path, path)
 
 
+def _trim_training_log(path, committed_iteration):
+    """Drop JSONL records beyond the checkpoint that will be resumed."""
+    if not os.path.isfile(path):
+        return
+
+    keep_offset = 0
+    changed = False
+    with open(path, "rb") as source:
+        while line := source.readline():
+            if not line.endswith(b"\n"):
+                changed = True
+                break
+            try:
+                iteration = int(json.loads(line)["it"])
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                changed = True
+                break
+            if iteration > committed_iteration:
+                changed = True
+                break
+            keep_offset = source.tell()
+    if changed:
+        with open(path, "r+b") as output:
+            output.truncate(keep_offset)
+
+
+def _scheduler_configs_match_for_resume(saved, current):
+    """Compare scheduler configs while allowing a new StepLR stop limit."""
+    if saved == current:
+        return True
+    if not isinstance(saved, dict) or not isinstance(current, dict):
+        return False
+    if saved.get("type") != "step" or current.get("type") != "step":
+        return False
+    saved = {key: value for key, value in saved.items() if key != "iterations"}
+    current = {key: value for key, value in current.items() if key != "iterations"}
+    return saved == current
+
+
 _RUNTIME_SIDECAR_RE = re.compile(
     r"runtime_(?P<iteration>(?:[0-9]{7}|[1-9][0-9]{7,}))_"
     r"(?P<generation>[0-9a-f]{32})"
     r"_rank_(?P<rank>(?:0|[1-9][0-9]*))\.pt"
 )
-_RUNTIME_TEMP_RE = re.compile(
+_LEGACY_RUNTIME_TEMP_RE = re.compile(
     r"\.runtime-tmp_(?P<iteration>(?:[0-9]{7}|[1-9][0-9]{7,}))_"
     r"(?P<generation>[0-9a-f]{32})"
     r"_rank_(?P<rank>(?:0|[1-9][0-9]*))_"
@@ -128,6 +214,7 @@ _RUNTIME_TEMP_RE = re.compile(
 _RUNTIME_SIDECAR_VERSION = 1
 _RUNTIME_MANIFEST_VERSION = 1
 _RUNTIME_SERIALIZATION_ALLOWANCE = 1024 * 1024
+_RUNTIME_BINARY_OPEN_FLAG = getattr(os, "O_BINARY", 0)
 _RUNTIME_DTYPE_BYTES = {
     "torch.float16": 2,
     "torch.bfloat16": 2,
@@ -174,6 +261,7 @@ class TrainingState:
     iteration: int = 0
     epoch: int = 0
     rows: int = 0
+    elapsed_seconds: float = 0.0
 
 
 class BaseTrainer:
@@ -216,6 +304,8 @@ class BaseTrainer:
             ``None`` to reuse ``dataset_args``.
         dataloader_args: Extra keyword arguments forwarded to ``build_data_loader``.
         data_pipelines: Optional list of pipeline configurations for data transforms.
+        data_pipeline: Optional adaptive host-data resource policy for the
+            processed-NPZ training pipeline.
         num_worker: Number of dataloader worker processes.
         cuda_prefetch_batches: Bounded training-batch lookahead on a dedicated
             CUDA H2D stream. ``0`` disables it; ``1`` is double buffering.
@@ -275,6 +365,7 @@ class BaseTrainer:
         val_dataset_args: dict | None = None,
         dataloader_args: dict | None = None,
         data_pipelines: list | None = None,
+        data_pipeline: dict | None = None,
         num_worker: int = 4,
         cuda_prefetch_batches: int = 0,
         no_shuffle: bool = False,
@@ -324,6 +415,17 @@ class BaseTrainer:
         self.val_dataset_args = val_dataset_args or {}
         self.dataloader_args = dataloader_args or {}
         self.data_pipelines = data_pipelines
+        self._data_pipeline_explicit = data_pipeline is not None
+        if data_pipeline is None:
+            self.data_pipeline = None
+        else:
+            from dataset.pipeline_config import (
+                parse_adaptive_data_pipeline_config,
+            )
+
+            self.data_pipeline = parse_adaptive_data_pipeline_config(
+                data_pipeline
+            )
         self.num_worker = num_worker
         if (
             type(cuda_prefetch_batches) is not int
@@ -369,12 +471,22 @@ class BaseTrainer:
         self._last_state_save_iteration = None
         self._checkpoint_attempt_failed = False
         self._checkpoint_safe = True
+        self._first_replica_check_done = False
+        self._last_replica_check_iteration = None
         # Pipelined finite-check readback: two pinned slots ping-pong between
         # steps, so the host only ever reads back a check enqueued (and
         # completed) during an earlier step; see _drain_pending_step_validity.
         self._validity_check_slots = None
+        self._validity_check_stream = None
         self._validity_check_counter = 0
         self._validity_checks_in_flight = []
+        # Vanilla DDP already computes one scalar gradient norm per rank. Copy
+        # that scalar to pinned host memory beside optimizer work instead of
+        # launching another finite-check kernel and collective.
+        self._grad_norm_readback_enabled = None
+        self._grad_norm_readback_stream = None
+        self._grad_norm_readback_slot = None
+        self._evaluation_buffer_syncs = ()
         # Iterations of temporary (non-permanent) snapshots saved by this session;
         # cleanup only ever deletes snapshots recorded here.
         self._temp_snapshot_iters = set()
@@ -388,13 +500,13 @@ class BaseTrainer:
         ):
             raise ValueError("cuda_prefetch_batches requires CUDA training")
         self._setup_cuda_memory_limit()
-        self._setup_logging()
         self._setup_profiler()
         self._setup_data()
         self._init_models()
         self._setup_optimizer()
         self._optimizer_config = self._current_optimizer_config()
         self._load_checkpoint()
+        self._setup_logging()
         self._setup_scheduler()
         self._prepare_for_training()
 
@@ -510,7 +622,8 @@ class BaseTrainer:
         """Create the Accelerator with DDP config, set random seed and performance level."""
         dataloader_config = DataLoaderConfiguration(dispatch_batches=False, non_blocking=True)
         ddp_kwargs = DistributedDataParallelKwargs(
-            find_unused_parameters=self.find_unused_parameters
+            find_unused_parameters=self.find_unused_parameters,
+            gradient_as_bucket_view=True,
         )
         # sync_with_dataloader=False: our micro-batch loop restarts the data
         # iterator across epochs, so accumulation must not sync on dataloader
@@ -557,8 +670,16 @@ class BaseTrainer:
             # its own tiny write syscalls behind a size-10 queue, which stalls
             # the training loop for hundreds of ms per log interval on
             # latency-bound filesystems (e.g. WSL drvfs mounts).
-            self.tb_logger = create_summary_writer(os.path.join(self.rundir, "log"))
-            self.log_file = open(os.path.join(self.rundir, "training_log.jsonl"), "a")
+            log_path = os.path.join(self.rundir, "training_log.jsonl")
+            resumed = self._last_state_save_iteration is not None
+            if resumed:
+                _trim_training_log(log_path, self.state.iteration)
+            purge_step = self.state.iteration + 1 if resumed else None
+            self.tb_logger = create_summary_writer(
+                os.path.join(self.rundir, "log"),
+                purge_step=purge_step,
+            )
+            self.log_file = open(log_path, "a", encoding="utf-8")
         else:
             self.tb_logger, self.log_file = None, None
 
@@ -607,9 +728,159 @@ class BaseTrainer:
                 )
             )
 
+    def _resolve_adaptive_pipeline_spec(self):
+        legacy_options = {
+            "prefetch_threads",
+            "prefetch_batches",
+            "pin_memory",
+        }
+        loader_options = {"pin_memory", "shuffle_buffer_size"}
+        from dataset.pipeline import supports_parallel_stateless_pipeline
+
+        pipeline_eligible = supports_parallel_stateless_pipeline(
+            self.data_pipelines
+        )
+        policy_explicit = getattr(
+            self,
+            "_data_pipeline_explicit",
+            self.data_pipeline is not None,
+        )
+        if self.data_pipeline is None:
+            if (
+                self.dataset_type != "batched_processed_katago_numpy"
+                or self.num_worker != 0
+                or not pipeline_eligible
+                or legacy_options.intersection(self.dataset_args)
+                or loader_options.intersection(self.dataloader_args)
+            ):
+                return None
+            from dataset.pipeline_config import AdaptiveDataPipelineConfig
+
+            self.data_pipeline = AdaptiveDataPipelineConfig()
+        elif policy_explicit and not pipeline_eligible:
+            raise ValueError(
+                "data_pipeline requires parallel-stateless data_pipelines"
+            )
+        if self.dataset_type != "batched_processed_katago_numpy":
+            raise ValueError(
+                "data_pipeline currently supports only "
+                "dataset_type='batched_processed_katago_numpy'"
+            )
+        if self.num_worker != 0:
+            raise ValueError(
+                "data_pipeline requires num_worker=0 because its internal "
+                "decode workers own the rank-local memory budget"
+            )
+        conflicts = sorted(legacy_options.intersection(self.dataset_args))
+        if conflicts:
+            raise ValueError(
+                "data_pipeline cannot be combined with legacy dataset option(s): "
+                + ", ".join(conflicts)
+            )
+        loader_conflicts = sorted(loader_options.intersection(self.dataloader_args))
+        if loader_conflicts:
+            raise ValueError(
+                "data_pipeline cannot be combined with dataloader option(s): "
+                + ", ".join(loader_conflicts)
+                + "; configure shuffle_window_size under dataset_args and let "
+                "the adaptive runtime select pinning"
+            )
+
+        from dataset.pipeline_runtime import AdaptivePipelineRuntimeSpec
+        from dataset.pipeline_topology import (
+            RankResourceReport,
+            coordinate_pipeline_resources,
+            resolve_node_rank_layout,
+        )
+        from utils.system_resources import probe_system_resources
+
+        local_report = self._collective_dataset_call(
+            "adaptive data-pipeline resource probe",
+            lambda: RankResourceReport(
+                rank=self.accelerator.process_index,
+                node_key=socket.gethostname(),
+                resources=probe_system_resources(),
+            ),
+        )
+        reports = (
+            [local_report]
+            if self.accelerator.num_processes == 1
+            else gather_object([local_report])
+        )
+        resources = coordinate_pipeline_resources(
+            self.data_pipeline,
+            reports,
+        )
+        layout = resolve_node_rank_layout(
+            reports,
+            self.accelerator.process_index,
+        )
+        cache_candidate = None
+        if layout.is_leader:
+            try:
+                cache_directory = tempfile.mkdtemp(prefix="ntr-decoded-")
+                visibility_token = os.urandom(16).hex()
+                with open(
+                    os.path.join(cache_directory, "VISIBILITY"),
+                    "w",
+                    encoding="ascii",
+                ) as stream:
+                    stream.write(visibility_token)
+                cache_candidate = (cache_directory, visibility_token)
+            except OSError:
+                cache_candidate = None
+        cache_candidates = (
+            [cache_candidate]
+            if self.accelerator.num_processes == 1
+            else gather_object([cache_candidate])
+        )
+        leader_candidate = cache_candidates[layout.leader_rank]
+        cache_visible = False
+        if leader_candidate is not None:
+            cache_directory, visibility_token = leader_candidate
+            try:
+                with open(
+                    os.path.join(cache_directory, "VISIBILITY"),
+                    encoding="ascii",
+                ) as stream:
+                    cache_visible = stream.read() == visibility_token
+            except OSError:
+                cache_visible = False
+        visibility = (
+            [cache_visible]
+            if self.accelerator.num_processes == 1
+            else gather_object([cache_visible])
+        )
+        node_cache = None
+        if all(visibility):
+            from dataset.node_decoded_cache import NodeDecodedCache
+
+            node_cache = NodeDecodedCache(
+                leader_candidate[0],
+                owner=layout.is_leader,
+            )
+        elif cache_candidate is not None:
+            import shutil
+
+            shutil.rmtree(cache_candidate[0], ignore_errors=True)
+        self.accelerator.print(
+            "Adaptive data pipeline resolved "
+            f"{resources.per_rank_host_budget_bytes / 1024**3:.2f} GiB and "
+            f"{resources.per_rank_cpu_limit} CPU(s) per rank."
+        )
+        return AdaptivePipelineRuntimeSpec(
+            self.data_pipeline,
+            resources,
+            pin_memory_supported=self.accelerator.device.type == "cuda",
+            consumer_retained_batches=self.gradient_accumulation_steps,
+            h2d_lookahead_batches=self.cuda_prefetch_batches,
+            node_decoded_cache=node_cache,
+        )
+
     def _setup_data(self):
         """Build train and validation datasets and their dataloaders."""
         self._set_batch_size_per_process()
+        self._adaptive_pipeline_spec = self._resolve_adaptive_pipeline_spec()
         shuffle = not self.no_shuffle
         train_dataset_args = self._training_dataset_args()
 
@@ -628,10 +899,36 @@ class BaseTrainer:
             ),
             shuffle=shuffle,
             pipeline_args=self.data_pipelines,
+            adaptive_pipeline=self._adaptive_pipeline_spec,
             **train_dataset_args,
             ),
         )
-        self.train_dataset._cuda_prefetch_batches = self.cuda_prefetch_batches
+        prepare_node_cache = getattr(
+            self.train_dataset,
+            "prepare_node_decoded_cache",
+            None,
+        )
+        if prepare_node_cache is not None:
+            self._collective_dataset_call(
+                "node decoded-cache preparation",
+                prepare_node_cache,
+            )
+            local_cache_ready = self._collective_dataset_call(
+                "node decoded-cache readiness",
+                self.train_dataset.node_decoded_cache_ready,
+            )
+            cache_readiness = (
+                [local_cache_ready]
+                if self.accelerator.num_processes == 1
+                else gather_object([local_cache_ready])
+            )
+            cache_enabled = all(cache_readiness)
+            self._collective_dataset_call(
+                "node decoded-cache activation",
+                lambda: self.train_dataset.set_node_decoded_cache_enabled(
+                    cache_enabled
+                ),
+            )
         stream_capabilities = getattr(self.train_dataset, "capabilities", None)
         self._resume_stream = None
         if (
@@ -695,10 +992,6 @@ class BaseTrainer:
         )
         self._validate_cuda_prefetch_support(self.train_loader)
         self._data_stream_signature = self._build_data_stream_signature()
-        if hasattr(self.train_dataset, "attach_pipeline_run_dir"):
-            self.train_dataset.attach_pipeline_run_dir(
-                self.rundir if self.accelerator.is_main_process else None
-            )
         if getattr(self.train_dataset, "pipeline_stats", None) is not None:
             self._log_metrics = self._log_metrics_observed
         self._synchronize_pipeline_tuning_state()
@@ -782,7 +1075,6 @@ class BaseTrainer:
         """Remove training-only stream limits from evaluation datasets."""
         dataset_args = dict(configured_args)
         dataset_args.pop("steps_per_epoch", None)
-        dataset_args.pop("autotune", None)
         dataset_args.pop("observability", None)
         return dataset_args
 
@@ -1282,27 +1574,20 @@ class BaseTrainer:
             or "\x00" in basename
         ):
             raise RuntimeError(f"invalid runtime sidecar path {basename!r}")
-        directory_fd = os.open(
-            self.ckpt_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+        path = os.path.join(self.ckpt_dir, basename)
+        file_fd = os.open(
+            path,
+            os.O_RDONLY
+            | _RUNTIME_BINARY_OPEN_FLAG
+            | getattr(os, "O_NOFOLLOW", 0),
         )
-        try:
-            file_fd = os.open(
-                basename,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
-                dir_fd=directory_fd,
-            )
-        except BaseException:
-            os.close(directory_fd)
-            raise
         file_stat = os.fstat(file_fd)
         if not stat.S_ISREG(file_stat.st_mode):
             os.close(file_fd)
-            os.close(directory_fd)
             raise RuntimeError(
                 f"runtime sidecar {basename!r} is not a regular file"
             )
-        return directory_fd, file_fd, file_stat
+        return file_fd, file_stat
 
     def _write_vq_runtime_sidecar(self, iteration, generation):
         rank = self.accelerator.process_index
@@ -1316,59 +1601,40 @@ class BaseTrainer:
                 "generation": generation,
             }
         )
-        nonce = os.urandom(16).hex()
-        temp_basename = (
-            f".runtime-tmp_{iteration:07d}_{generation}_rank_{rank}_"
-            f"{os.getpid()}_{nonce}.pt"
-        )
-        if _RUNTIME_TEMP_RE.fullmatch(temp_basename) is None:
-            raise RuntimeError(
-                f"invalid runtime temporary basename {temp_basename!r}"
-            )
-        directory_fd = os.open(
-            self.ckpt_dir,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        temp_exists = False
+        final_path = os.path.join(self.ckpt_dir, basename)
+        final_exists = False
         try:
-            temp_fd = os.open(
-                temp_basename,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            # Reserve the final name without replacement. The checkpoint state
+            # publishes this sidecar only after the complete file is verified;
+            # cleanup removes any unreferenced file left by an abrupt exit.
+            file_fd = os.open(
+                final_path,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | _RUNTIME_BINARY_OPEN_FLAG,
                 0o600,
-                dir_fd=directory_fd,
             )
-            temp_exists = True
-            with os.fdopen(temp_fd, "wb") as output:
+            final_exists = True
+            with os.fdopen(file_fd, "wb") as output:
                 torch.save(payload, output)
                 output.flush()
                 os.fsync(output.fileno())
-            os.link(
-                temp_basename,
-                basename,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-            os.unlink(temp_basename, dir_fd=directory_fd)
-            temp_exists = False
-        finally:
-            if temp_exists:
+        except BaseException:
+            if final_exists:
                 try:
-                    os.unlink(temp_basename, dir_fd=directory_fd)
+                    os.unlink(final_path)
                 except FileNotFoundError:
                     pass
-            os.close(directory_fd)
+            raise
 
-        directory_fd, file_fd, file_stat = self._open_runtime_file(
-            basename
-        )
+        file_fd, file_stat = self._open_runtime_file(basename)
         try:
             digest = hashlib.sha256()
             while chunk := os.read(file_fd, 1024 * 1024):
                 digest.update(chunk)
         finally:
             os.close(file_fd)
-            os.close(directory_fd)
         if (
             file_stat.st_size > manifest["maximum_bytes"]
             or file_stat.st_size
@@ -1469,7 +1735,10 @@ class BaseTrainer:
             )
         saved_scheduler_config = state.get("scheduler_config")
         current_scheduler_config = self._scheduler_config()
-        if saved_scheduler_config != current_scheduler_config:
+        if not _scheduler_configs_match_for_resume(
+            saved_scheduler_config,
+            current_scheduler_config,
+        ):
             raise RuntimeError(
                 f"Cannot resume checkpoint {state_filename}: scheduler"
                 f" configuration changed from {saved_scheduler_config!r} to"
@@ -1558,6 +1827,7 @@ class BaseTrainer:
         self.state.iteration = int(metadata.get("iteration", 0))
         self.state.epoch = int(metadata.get("epoch", 0))
         self.state.rows = int(metadata.get("rows", 0))
+        self.state.elapsed_seconds = float(metadata.get("elapsed_seconds", 0.0))
         self._pending_resume_state = rank_state
         self._pending_resume_version = resume["version"]
         self._last_state_save_iteration = self.state.iteration
@@ -1971,6 +2241,20 @@ class BaseTrainer:
         # filesystem checks below (and before pruning state this save may
         # rely on) can observe them.
         self._flush_async_checkpoint_collectively()
+        iteration = self.state.iteration
+        if (
+            (
+                force_state
+                or iteration >= self.iterations
+                or iteration % self.save_interval == 0
+            )
+            and self._last_replica_check_iteration != iteration
+        ):
+            try:
+                self._check_replicated_parameters()
+            except BaseException:
+                self._checkpoint_attempt_failed = True
+                raise
         saves_state = hasattr(self, "state") and (
             force_state
             or self.state_save_interval is None
@@ -2202,6 +2486,7 @@ class BaseTrainer:
                 "iteration": st.iteration,
                 "epoch": st.epoch,
                 "rows": st.rows,
+                "elapsed_seconds": self._elapsed_seconds(),
             },
         }
 
@@ -2488,9 +2773,7 @@ class BaseTrainer:
             )
         )
         basename = manifest.get("basename")
-        directory_fd, file_fd, file_stat = self._open_runtime_file(
-            basename
-        )
+        file_fd, file_stat = self._open_runtime_file(basename)
         try:
             expected_size = manifest.get("size")
             maximum_size = manifest.get("maximum_bytes")
@@ -2524,7 +2807,6 @@ class BaseTrainer:
                 )
         finally:
             os.close(file_fd)
-            os.close(directory_fd)
 
         if (
             not isinstance(payload, dict)
@@ -2903,7 +3185,7 @@ class BaseTrainer:
                 "retained state has invalid VQ runtime storage bounds"
             )
 
-        directory_fd, file_fd, file_stat = self._open_runtime_file(basename)
+        file_fd, file_stat = self._open_runtime_file(basename)
         try:
             if file_stat.st_size != size:
                 raise RuntimeError(
@@ -2918,7 +3200,6 @@ class BaseTrainer:
                 )
         finally:
             os.close(file_fd)
-            os.close(directory_fd)
         return basename
 
     def _validate_current_vq_runtime_collision(
@@ -2935,9 +3216,7 @@ class BaseTrainer:
             rank=rank,
         )
         basename = manifest["basename"]
-        directory_fd, file_fd, file_stat = self._open_runtime_file(
-            basename
-        )
+        file_fd, file_stat = self._open_runtime_file(basename)
         try:
             if (
                 file_stat.st_size != manifest["size"]
@@ -2965,7 +3244,6 @@ class BaseTrainer:
                 )
         finally:
             os.close(file_fd)
-            os.close(directory_fd)
 
         if (
             not isinstance(payload, dict)
@@ -3121,7 +3399,7 @@ class BaseTrainer:
             )
             or (
                 filename.startswith(".runtime-tmp_")
-                and _RUNTIME_TEMP_RE.fullmatch(filename) is None
+                and _LEGACY_RUNTIME_TEMP_RE.fullmatch(filename) is None
             )
         ]
         if malformed_runtime:
@@ -3139,7 +3417,7 @@ class BaseTrainer:
             if (
                 _RUNTIME_SIDECAR_RE.fullmatch(filename) is not None
                 and filename not in protected_sidecars
-            ) or _RUNTIME_TEMP_RE.fullmatch(filename) is not None:
+            ) or _LEGACY_RUNTIME_TEMP_RE.fullmatch(filename) is not None:
                 try:
                     os.remove(path)
                 except FileNotFoundError:
@@ -3183,7 +3461,7 @@ class BaseTrainer:
 
     def _unwrap(self, model):
         """Strip DDP and ``torch.compile`` wrappers from *model*."""
-        m = self.accelerator.unwrap_model(model)
+        m = self.accelerator.unwrap_model(model, keep_torch_compile=False)
         if is_compiled_module(m):
             m = m._orig_mod
         return m
@@ -3254,6 +3532,7 @@ class BaseTrainer:
         prepared = accelerator.prepare(*to_prepare)
         for i, name in enumerate(model_names):
             self.models[name] = prepared[i]
+        self._configure_evaluation_buffer_syncs()
         for i, name in enumerate(optimizer_names):
             self.optimizers[name] = prepared[len(model_names) + i]
         if iterable_train or exact_resume_train:
@@ -3266,6 +3545,33 @@ class BaseTrainer:
                 even_batches=False,
             )
         self._setup_weight_clipping()
+
+    def _configure_evaluation_buffer_syncs(self):
+        """Defer DDP broadcasts for models whose buffers only affect evaluation."""
+        syncs = []
+        for model in self.models.values():
+            ddp = _prepared_ddp(model)
+            if ddp is None:
+                continue
+            buffers = _batch_norm_only_buffers(ddp.module)
+            if not buffers:
+                continue
+            ddp.broadcast_buffers = False
+            syncs.append((ddp.process_group, buffers))
+        self._evaluation_buffer_syncs = tuple(syncs)
+
+    def _synchronize_evaluation_buffers(self):
+        """Restore rank-zero BatchNorm buffers before evaluation."""
+        for process_group, buffers in getattr(
+            self, "_evaluation_buffer_syncs", ()
+        ):
+            source = torch.distributed.get_global_rank(process_group, 0)
+            for buffer in buffers:
+                torch.distributed.broadcast(
+                    buffer,
+                    src=source,
+                    group=process_group,
+                )
 
     def _prepare_data_loader(self, dataloader, *, even_batches=True):
         """Prepare *dataloader* for this process: shard across ranks and move to device.
@@ -3363,6 +3669,62 @@ class BaseTrainer:
         from itertools import chain
         return chain(*(m.parameters() for m in self.models.values()))
 
+    def _replicated_parameter_group(self):
+        """Return the process group whose optimizer parameters are replicated."""
+        accelerator = self.accelerator
+        if (
+            accelerator.num_processes > 1
+            and accelerator.distributed_type.name.startswith("MULTI_")
+            and torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+        ):
+            return torch.distributed.group.WORLD
+        return None
+
+    def _check_replicated_parameters(self, *, require_update=False):
+        """Check replicated optimizer weights after an update or save boundary."""
+        group = self._replicated_parameter_group()
+        if group is None:
+            self._last_replica_check_iteration = self.state.iteration
+            return True
+
+        try:
+            if require_update:
+                # A deferred finite all-reduce may still be in flight on a side
+                # stream. Settle it before issuing a new collective sequence.
+                self._drain_pending_step_validity(include_current=True)
+                local_update = torch.tensor(
+                    any(
+                        not getattr(optimizer, "step_was_skipped", False)
+                        for optimizer in self.optimizers.values()
+                    ),
+                    dtype=torch.long,
+                    device=self.accelerator.device,
+                )
+                torch.distributed.all_reduce(
+                    local_update,
+                    op=torch.distributed.ReduceOp.SUM,
+                    group=group,
+                )
+                updated_ranks = int(local_update.item())
+                if updated_ranks == 0:
+                    return False
+                if updated_ranks != self.accelerator.num_processes:
+                    raise RuntimeError(
+                        "optimizer-step skip state differs across replicated ranks"
+                    )
+
+            assert_replicated_parameters_equal(
+                optimizer_parameters(self.optimizers),
+                process_group=group,
+            )
+        except BaseException:
+            self._known_divergent = True
+            raise
+
+        self._last_replica_check_iteration = self.state.iteration
+        return True
+
     def _clip_gradients(self, parameters=None):
         """Measure gradient norm and apply configured clipping."""
         if parameters is None:
@@ -3386,6 +3748,12 @@ class BaseTrainer:
             self.accelerator.clip_grad_value_(
                 parameters,
                 clip_value=self.clip_grad_value,
+            )
+        if isinstance(grad_norm, numbers.Real) and not isinstance(grad_norm, bool):
+            grad_norm = torch.as_tensor(
+                grad_norm,
+                device=self.accelerator.device,
+                dtype=torch.get_default_dtype(),
             )
         return grad_norm
 
@@ -3564,20 +3932,24 @@ class BaseTrainer:
                 torch.tensor(False, dtype=torch.bool, device=accelerator.device)
             )
         local_valid = torch.stack(checks).all()
-        if accelerator.num_processes == 1 and defer_sync:
-            # Queue the combined check into the pipelined readback: a pinned
-            # slot plus a CUDA event on GPU (a plain bool on CPU), drained one
-            # iteration later (see _drain_pending_step_validity), so the host
-            # never waits on the device pipeline for the finite result.
-            self._enqueue_step_validity(local_valid, phase=phase)
-            return None
+        if defer_sync:
+            if accelerator.num_processes == 1:
+                # Queue the combined check into the pipelined readback: a pinned
+                # slot plus a CUDA event on GPU (a plain bool on CPU), drained one
+                # iteration later (see _drain_pending_step_validity), so the host
+                # never waits on the device pipeline for the finite result.
+                self._enqueue_step_validity(local_valid, phase=phase)
+                return None
+            if self._defer_distributed_step_validity(
+                local_valid,
+                phase=phase,
+            ):
+                return None
         global_valid_count = (
             local_valid.to(dtype=torch.long)
             if accelerator.num_processes == 1
             else accelerator.reduce(local_valid.to(dtype=torch.long), reduction="sum")
         )
-        if defer_sync and accelerator.num_processes != 1:
-            raise RuntimeError("defer_sync requires a single process")
         if int(global_valid_count.item()) == accelerator.num_processes:
             return None
         if not errors:
@@ -3600,13 +3972,121 @@ class BaseTrainer:
             "Training step validation failed: " + "; ".join(all_errors)
         )
 
-    def _enqueue_step_validity(self, check, *, phase):
+    def _defer_distributed_step_validity(self, local_valid, *, phase):
+        """Queue a CUDA/NCCL validity reduction without blocking the host."""
+        accelerator = self.accelerator
+        if (
+            accelerator.distributed_type != DistributedType.MULTI_GPU
+            or inspect.getattr_static(self, "_clip_gradients", None)
+            is not BaseTrainer._clip_gradients
+            or accelerator.device.type != "cuda"
+            or not torch.distributed.is_available()
+            or not torch.distributed.is_initialized()
+        ):
+            return False
+        try:
+            backend = torch.distributed.get_backend()
+        except (RuntimeError, ValueError):
+            return False
+        if backend != torch.distributed.Backend.NCCL:
+            return False
+
+        # Vanilla Accelerate MULTI_GPU reaches torch.nn.utils.clip_grad_norm_,
+        # whose result is a scalar tensor. Plugin backends and custom clipping
+        # hooks stay synchronous because their result contract can carry a
+        # structural error that must be agreed before optimizer mutation.
+
+        global_valid_count = local_valid.to(dtype=torch.long)
+        work = torch.distributed.all_reduce(
+            global_valid_count,
+            op=torch.distributed.ReduceOp.SUM,
+            async_op=True,
+        )
+        self._enqueue_step_validity(
+            global_valid_count,
+            phase=phase,
+            work=work,
+            expected_valid_count=accelerator.num_processes,
+        )
+        return True
+
+    def _defer_ddp_grad_norm_readback(self, grad_norm):
+        """Copy a vanilla-DDP gradient norm to the host beside optimizer work."""
+        accelerator = self.accelerator
+        enabled = getattr(self, "_grad_norm_readback_enabled", None)
+        if enabled is None:
+            enabled = (
+                accelerator.distributed_type == DistributedType.MULTI_GPU
+                and inspect.getattr_static(self, "_clip_gradients", None)
+                is BaseTrainer._clip_gradients
+                and accelerator.device.type == "cuda"
+                and accelerator.scaler is None
+                and torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+            )
+            if enabled:
+                try:
+                    enabled = (
+                        torch.distributed.get_backend()
+                        == torch.distributed.Backend.NCCL
+                    )
+                except (RuntimeError, ValueError):
+                    enabled = False
+            self._grad_norm_readback_enabled = enabled
+        if not enabled or not (
+            isinstance(grad_norm, torch.Tensor)
+            and grad_norm.ndim == 0
+            and grad_norm.is_floating_point()
+            and _devices_match(grad_norm.device, accelerator.device)
+        ):
+            return None
+
+        slot = getattr(self, "_grad_norm_readback_slot", None)
+        if slot is None or slot[0].dtype != grad_norm.dtype:
+            slot = (
+                torch.empty(
+                    (),
+                    dtype=grad_norm.dtype,
+                    pin_memory=True,
+                ),
+                torch.cuda.Event(),
+                torch.cuda.Event(),
+            )
+            self._grad_norm_readback_slot = slot
+        host_value, produced, copied = slot
+        if getattr(self, "_grad_norm_readback_stream", None) is None:
+            self._grad_norm_readback_stream = torch.cuda.Stream(
+                device=accelerator.device
+            )
+
+        produced.record(torch.cuda.current_stream(accelerator.device))
+        with torch.cuda.stream(self._grad_norm_readback_stream):
+            self._grad_norm_readback_stream.wait_event(produced)
+            host_value.copy_(grad_norm, non_blocking=True)
+            copied.record()
+        return host_value, copied, grad_norm
+
+    @staticmethod
+    def _finish_ddp_grad_norm_readback(readback):
+        """Return whether a deferred host gradient norm is finite."""
+        host_value, copied, _keepalive = readback
+        copied.synchronize()
+        return math.isfinite(host_value.item())
+
+    def _enqueue_step_validity(
+        self,
+        check,
+        *,
+        phase,
+        work=None,
+        expected_valid_count=None,
+    ):
         """Queue the step's combined finite check for a late readback."""
         if self._validity_check_slots is None:
             on_cuda = self.accelerator.device.type == "cuda"
             self._validity_check_slots = [
                 (
-                    torch.empty((), dtype=torch.bool, pin_memory=on_cuda),
+                    torch.empty((), dtype=torch.long, pin_memory=on_cuda),
                     torch.cuda.Event() if on_cuda else None,
                 )
                 for _ in range(2)
@@ -3614,12 +4094,62 @@ class BaseTrainer:
         slot_index = self._validity_check_counter % len(self._validity_check_slots)
         self._validity_check_counter += 1
         buf, event = self._validity_check_slots[slot_index]
-        buf.copy_(check, non_blocking=buf.is_pinned())
-        if event is not None:
-            event.record()
+        keepalive = None
+        if work is None:
+            if expected_valid_count is not None:
+                raise ValueError("expected_valid_count requires distributed work")
+            expected_valid_count = 1
+            buf.copy_(check, non_blocking=buf.is_pinned())
+            if event is not None:
+                event.record()
+        else:
+            if event is None or expected_valid_count is None:
+                raise ValueError(
+                    "distributed validity work requires CUDA and an expected count"
+                )
+            if getattr(self, "_validity_check_stream", None) is None:
+                self._validity_check_stream = torch.cuda.Stream(
+                    device=self.accelerator.device
+                )
+            with torch.cuda.stream(self._validity_check_stream):
+                block_current_stream = getattr(
+                    work,
+                    "block_current_stream",
+                    work.wait,
+                )
+                block_current_stream()
+                buf.copy_(check, non_blocking=True)
+                event.record()
+            # The process group work and its result tensor must outlive the
+            # stream dependency and asynchronous device-to-host copy.
+            keepalive = (work, check)
         self._validity_checks_in_flight.append(
-            (slot_index, phase, self.state.iteration)
+            (
+                slot_index,
+                phase,
+                self.state.iteration,
+                expected_valid_count,
+                keepalive,
+            )
         )
+
+    def _settle_step_validity(self, slot_index, keepalive):
+        """Wait until one queued host result and its collective are complete."""
+        _buf, event = self._validity_check_slots[slot_index]
+        failures = []
+        if event is not None:
+            try:
+                event.synchronize()
+            except BaseException as exc:
+                failures.append(f"host copy: {type(exc).__name__}: {exc}")
+        if keepalive is not None:
+            work, _check = keepalive
+            try:
+                work.wait()
+            except BaseException as exc:
+                failures.append(f"collective: {type(exc).__name__}: {exc}")
+        if failures:
+            raise RuntimeError("; ".join(failures))
 
     def _drain_pending_step_validity(self, *, include_current):
         """Read back queued finite checks and raise on a non-finite result.
@@ -3639,11 +4169,16 @@ class BaseTrainer:
         # entries after it stay tracked, so the abort/teardown paths can still
         # settle their device copies via _discard_pending_step_validity.
         for _ in range(n):
-            slot_index, phase, iteration = in_flight.pop(0)
-            buf, event = self._validity_check_slots[slot_index]
-            if event is not None:
-                event.synchronize()
-            if bool(buf.item()):
+            (
+                slot_index,
+                phase,
+                iteration,
+                expected_valid_count,
+                keepalive,
+            ) = in_flight.pop(0)
+            self._settle_step_validity(slot_index, keepalive)
+            buf, _event = self._validity_check_slots[slot_index]
+            if int(buf.item()) == expected_valid_count:
                 continue
             self._known_divergent = True
             raise RuntimeError(
@@ -3660,15 +4195,39 @@ class BaseTrainer:
         aborted attempt and must not fail the next one, but any in-flight
         device copies must settle before their pinned slots can be reused.
         """
+        failures = []
         if self._validity_check_slots is not None:
-            for slot_index, _phase, _iteration in self._validity_checks_in_flight:
-                event = self._validity_check_slots[slot_index][1]
-                if event is not None:
-                    event.synchronize()
+            for (
+                slot_index,
+                _phase,
+                _iteration,
+                _expected_valid_count,
+                keepalive,
+            ) in self._validity_checks_in_flight:
+                try:
+                    self._settle_step_validity(slot_index, keepalive)
+                except BaseException as exc:
+                    failures.append(f"{type(exc).__name__}: {exc}")
         self._validity_checks_in_flight = []
+        if failures:
+            raise RuntimeError(
+                "finite-check shutdown failed: " + "; ".join(failures)
+            )
 
-    def _synchronize_phase_errors(self, phase, errors, *, divergent=False):
-        """Raise rank-local phase failures at one matching all-rank boundary."""
+    def _synchronize_phase_errors(
+        self,
+        phase,
+        errors,
+        *,
+        divergent=False,
+        agreement=None,
+    ):
+        """Raise rank-local phase failures at one matching all-rank boundary.
+
+        ``agreement`` reuses the same fixed-size reduction to require a boolean
+        condition to match on every rank.  Object payloads are gathered only
+        when an error or mismatch actually occurs.
+        """
         accelerator = self.accelerator
         if accelerator.num_processes == 1:
             if not errors:
@@ -3680,13 +4239,22 @@ class BaseTrainer:
                 f"{phase} failed collectively: iteration {iteration} rank"
                 f" {accelerator.process_index} {phase}: {'; '.join(errors)}"
             )
-        local_ok = torch.tensor(
-            not errors,
+        local_status = [not errors]
+        if agreement is not None:
+            local_status.append(bool(agreement[1]))
+        local_status = torch.tensor(
+            local_status,
             dtype=torch.long,
             device=accelerator.device,
         )
-        global_ok = accelerator.reduce(local_ok, reduction="sum")
-        if int(global_ok.item()) == accelerator.num_processes:
+        global_status = accelerator.reduce(local_status, reduction="sum")
+        error_free = int(global_status[0].item()) == accelerator.num_processes
+        agreement_mismatch = (
+            agreement is not None
+            and int(global_status[1].item())
+            not in (0, accelerator.num_processes)
+        )
+        if error_free and not agreement_mismatch:
             return
         iteration = getattr(getattr(self, "state", None), "iteration", "?")
         rank_error = (
@@ -3695,6 +4263,11 @@ class BaseTrainer:
             if errors
             else None
         )
+        if rank_error is None and agreement_mismatch:
+            rank_error = (
+                f"iteration {iteration} rank {accelerator.process_index} "
+                f"{phase}: {agreement[0]}={bool(agreement[1])}"
+            )
         all_errors = [
             item
             for item in gather_object([rank_error])
@@ -3723,6 +4296,13 @@ class BaseTrainer:
             with self.profiler.region("clip"):
                 apply_weight_clipping(self._weight_clip_groups)
 
+        single_step_fast_path = (
+            self.gradient_accumulation_steps == 1
+            and type(self).__getattribute__ is object.__getattribute__
+            and "on_after_step" not in vars(self)
+            and inspect.getattr_static(self, "on_after_step", None)
+            is _BASE_NOOP_AFTER_STEP
+        )
         total_loss_dict, total_aux_dict = {}, {}
         final_grad_norm = None
         prepared_stream_commit = None
@@ -3731,18 +4311,26 @@ class BaseTrainer:
             if micro_step > 0:
                 with self.profiler.region("data"):
                     data = self._fetch_batch()
+            fetch_restarted_epoch = False
             step_errors = []
+            if isinstance(data, _BatchFetchResult):
+                fetch_restarted_epoch = data.restarted_epoch
+                if data.error is not None:
+                    step_errors.append(f"batch fetch raised {data.error}")
+                data = data.data
             extra_kwargs = {}
             with self.profiler.region("pre"):
-                try:
-                    extra_kwargs = self.on_before_step(data)
-                except BaseException as exc:
-                    step_errors.append(
-                        f"on_before_step raised {type(exc).__name__}: {exc}"
-                    )
+                if not step_errors:
+                    try:
+                        extra_kwargs = self.on_before_step(data)
+                    except BaseException as exc:
+                        step_errors.append(
+                            f"on_before_step raised {type(exc).__name__}: {exc}"
+                        )
             self._synchronize_phase_errors(
                 f"micro-step {micro_step} pre-step hook",
                 step_errors,
+                agreement=("restarted_epoch", fetch_restarted_epoch),
             )
             with accelerator.accumulate(*self.models.values()), accelerator.autocast():
                 with self.profiler.region("fwd"):
@@ -3790,6 +4378,7 @@ class BaseTrainer:
                     accelerator.backward(loss)
 
                 mutation_errors = []
+                grad_norm_readback = None
                 with self.profiler.region("opt"):
                     try:
                         if accelerator.sync_gradients:
@@ -3814,14 +4403,23 @@ class BaseTrainer:
                                     defer_sync=True,
                                 )
                             elif accelerator.scaler is None:
-                                self._synchronize_step_validity(
-                                    loss=final_grad_norm,
-                                    metric_values=[],
-                                    schema=metric_schema,
-                                    errors=[],
-                                    phase="after backward",
-                                    require_grad=False,
+                                grad_norm_readback = (
+                                    self._defer_ddp_grad_norm_readback(
+                                        final_grad_norm
+                                    )
                                 )
+                                if grad_norm_readback is None:
+                                    # Plugin and non-NCCL backends retain the
+                                    # general distributed validity path.
+                                    self._synchronize_step_validity(
+                                        loss=final_grad_norm,
+                                        metric_values=[],
+                                        schema=metric_schema,
+                                        errors=[],
+                                        phase="after backward",
+                                        require_grad=False,
+                                        defer_sync=True,
+                                    )
                             pending_tokens = getattr(
                                 self, "_pending_stream_tokens", []
                             )
@@ -3829,31 +4427,6 @@ class BaseTrainer:
                                 prepared_stream_commit = (
                                     self._resume_stream.prepare_commit(pending_tokens)
                                 )
-                                descriptor = getattr(
-                                    prepared_stream_commit,
-                                    "coordination_descriptor",
-                                    (
-                                        prepared_stream_commit.before_digest,
-                                        prepared_stream_commit.after_digest,
-                                        prepared_stream_commit.token_count,
-                                    ),
-                                )
-                                descriptors = (
-                                    [descriptor]
-                                    if accelerator.num_processes == 1
-                                    else gather_object([descriptor])
-                                )
-                                if any(
-                                    value != descriptors[0]
-                                    for value in descriptors[1:]
-                                ):
-                                    raise RuntimeError(
-                                        "stream commit digest differs across ranks: "
-                                        + "; ".join(
-                                            f"rank {rank}={value!r}"
-                                            for rank, value in enumerate(descriptors)
-                                        )
-                                    )
                             pending_sampler_tokens = getattr(
                                 self, "_pending_sampler_tokens", []
                             )
@@ -3912,13 +4485,28 @@ class BaseTrainer:
                         mutation_errors.append(
                             f"{type(exc).__name__}: {exc}"
                         )
+                if grad_norm_readback is not None:
+                    try:
+                        if not self._finish_ddp_grad_norm_readback(
+                            grad_norm_readback
+                        ):
+                            mutation_errors.append("non-finite gradient norm")
+                    except BaseException as exc:
+                        mutation_errors.append(
+                            "gradient-norm readback failed: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
             self._synchronize_phase_errors(
                 f"micro-step {micro_step} optimizer mutation",
                 mutation_errors,
                 divergent=True,
+                agreement=("single_step_fast_path", single_step_fast_path),
             )
-            add_dict_to(total_loss_dict, loss_dict)
-            add_dict_to(total_aux_dict, aux_dict)
+            if single_step_fast_path:
+                total_loss_dict, total_aux_dict = loss_dict, aux_dict
+            else:
+                add_dict_to(total_loss_dict, loss_dict)
+                add_dict_to(total_aux_dict, aux_dict)
 
         if self.gradient_accumulation_steps > 1:
             for metric_dict in (total_loss_dict, total_aux_dict):
@@ -3927,17 +4515,18 @@ class BaseTrainer:
         if self.clip_grad_norm is not None and final_grad_norm is not None:
             total_aux_dict["grad_norm"] = final_grad_norm.detach()
 
-        after_errors = []
-        try:
-            self._optimizer_state_mutated = True
-            self.on_after_step(data)
-        except BaseException as exc:
-            after_errors.append(f"{type(exc).__name__}: {exc}")
-        self._synchronize_phase_errors(
-            "post-step hook",
-            after_errors,
-            divergent=True,
-        )
+        self._optimizer_state_mutated = True
+        if not single_step_fast_path:
+            after_errors = []
+            try:
+                self.on_after_step(data)
+            except BaseException as exc:
+                after_errors.append(f"{type(exc).__name__}: {exc}")
+            self._synchronize_phase_errors(
+                "post-step hook",
+                after_errors,
+                divergent=True,
+            )
         pending_tokens = getattr(self, "_pending_stream_tokens", [])
         if pending_tokens:
             if prepared_stream_commit is None:
@@ -3954,6 +4543,8 @@ class BaseTrainer:
             self._resume_sampler.commit_prepared(prepared_sampler_commit)
             self.state.epoch = self._resume_sampler.epoch
             self._pending_sampler_tokens = []
+
+        self._release_pending_batch_memory()
 
         return total_loss_dict, total_aux_dict
 
@@ -3984,6 +4575,14 @@ class BaseTrainer:
             dict(zip(aux_keys, host_values[loss_count:])),
         )
 
+    def _elapsed_seconds(self, now=None):
+        """Return cumulative active run time across checkpoint resumes."""
+        elapsed = self.state.elapsed_seconds
+        start = getattr(self, "_run_start_time", None)
+        if start is not None:
+            elapsed += (time.perf_counter() if now is None else now) - start
+        return elapsed
+
     def run(self):
         """Run the full training loop from ``state.iteration`` to ``iterations``."""
         st = self.state
@@ -4001,8 +4600,10 @@ class BaseTrainer:
             )
             self._restore_continuation_state()
             self._train_data_iter = iter(self.train_loader)
-            self._start_time = self._log_last_time = self._show_last_time = time.time()
+            now = time.perf_counter()
+            self._run_start_time = self._log_last_time = self._show_last_time = now
             self._log_last_it = self._show_last_it = st.iteration
+            self._pipeline_log_epoch = st.epoch
             gpu_loss_sum, gpu_aux_sum, gpu_metric_count = {}, {}, 0
             self._train_metric_schema = None
             for m in self.models.values():
@@ -4020,7 +4621,14 @@ class BaseTrainer:
                 st.rows += self.batch_size * self.gradient_accumulation_steps
                 try:
                     loss_dict, aux_dict = self._run_train_step(data)
+                    if not self._first_replica_check_done:
+                        self._first_replica_check_done = (
+                            self._check_replicated_parameters(
+                                require_update=True
+                            )
+                        )
                 except BaseException:
+                    self._release_pending_batch_memory()
                     st.iteration -= 1
                     st.rows -= self.batch_size * self.gradient_accumulation_steps
                     if self._resume_sampler is not None:
@@ -4140,11 +4748,19 @@ class BaseTrainer:
                 )
             # Aborted runs may leave finite checks queued; let their device
             # copies settle before the process tears CUDA down.
-            self._discard_pending_step_validity()
+            try:
+                self._discard_pending_step_validity()
+            except BaseException as exc:
+                failures.append(
+                    f"pending finite checks: {type(exc).__name__}: {exc}"
+                )
             resources = []
             train_data_iter = getattr(self, "_train_data_iter", None)
             if train_data_iter is not None and hasattr(train_data_iter, "close"):
                 resources.append(("training data iterator", train_data_iter))
+            train_dataset = getattr(self, "train_dataset", None)
+            if train_dataset is not None and hasattr(train_dataset, "close"):
+                resources.append(("training dataset", train_dataset))
             resources.append(("profiler", self.profiler))
             if self.accelerator.is_main_process:
                 resources.extend(
@@ -4158,6 +4774,7 @@ class BaseTrainer:
                     resource.close()
                 except BaseException as exc:
                     failures.append(f"{name}: {type(exc).__name__}: {exc}")
+            self._release_pending_batch_memory()
             if failures:
                 raise RuntimeError("; ".join(failures))
 
@@ -4165,6 +4782,18 @@ class BaseTrainer:
             "final resource shutdown",
             close_local_resources,
         )
+
+        train_dataset = getattr(self, "train_dataset", None)
+        cleanup_node_cache = getattr(
+            train_dataset,
+            "cleanup_node_decoded_cache",
+            None,
+        )
+        if cleanup_node_cache is not None:
+            self._run_synchronized_operation(
+                "node decoded-cache cleanup",
+                cleanup_node_cache,
+            )
 
     def profile(self, *, wait=0, warmup=10, active=30, profile_memory=False):
         """Run a short profiling loop and save trace to rundir.
@@ -4191,134 +4820,114 @@ class BaseTrainer:
         if not self.use_cpu:
             activities.append(torch.profiler.ProfilerActivity.CUDA)
 
-        self._train_data_iter = iter(self.train_loader)
-        for m in self.models.values():
-            m.train()
+        primary_exception = None
+        try:
+            self._train_data_iter = iter(self.train_loader)
+            for m in self.models.values():
+                m.train()
 
-        with torch.profiler.profile(
-            activities=activities,
-            schedule=schedule,
-            on_trace_ready=on_trace_ready,
-            record_shapes=True,
-            profile_memory=profile_memory,
-            with_stack=True,
-            with_flops=True,
-            with_modules=True,
-        ) as profiler:
-            for _ in range(total_iters):
-                torch.compiler.cudagraph_mark_step_begin()
-                data = self._fetch_batch()
-                self._run_train_step(data)
-                # Profiling is diagnostic, not throughput-critical: read every
-                # step's finite check within its own iteration.
-                self._drain_pending_step_validity(include_current=True)
-                profiler.step()
+            with torch.profiler.profile(
+                activities=activities,
+                schedule=schedule,
+                on_trace_ready=on_trace_ready,
+                record_shapes=True,
+                profile_memory=profile_memory,
+                with_stack=True,
+                with_flops=True,
+                with_modules=True,
+            ) as profiler:
+                for _ in range(total_iters):
+                    torch.compiler.cudagraph_mark_step_begin()
+                    data = self._fetch_batch()
+                    self._run_train_step(data)
+                    # Profiling is diagnostic, not throughput-critical: read every
+                    # step's finite check within its own iteration.
+                    self._drain_pending_step_validity(include_current=True)
+                    profiler.step()
 
-        accelerator.print("Profiling complete.")
+            accelerator.print("Profiling complete.")
+        except BaseException as exc:
+            primary_exception = exc
+            raise
+        finally:
+            try:
+                self._shutdown_resources()
+            except BaseException as shutdown_exc:
+                if primary_exception is None:
+                    raise
+                accelerator.print(
+                    "Profile resource shutdown failed without replacing the "
+                    f"original {type(primary_exception).__name__}: "
+                    f"{type(shutdown_exc).__name__}: {shutdown_exc}"
+                )
 
     def _fetch_batch(self):
-        """Get the next collectively available batch, restarting at epoch boundaries."""
+        """Fetch locally and defer failure coordination to the pre-forward boundary."""
+        from dataset.stream import BatchEnvelope
+
+        # The stream signature is coordinated once during setup.  A local
+        # result carries only failure and epoch-boundary state into the
+        # pre-step reduction that already exists before every forward pass;
+        # object collectives stay off the healthy input path.
         data = None
-        is_available = True
-        fetch_error = None
+        restarted_epoch = False
         try:
-            data = next(self._train_data_iter)
-        except StopIteration:
-            if getattr(self, "_resume_sampler", None) is not None:
-                self._resume_sampler.advance_yield_epoch()
             try:
-                self._train_data_iter = iter(self.train_loader)
                 data = next(self._train_data_iter)
             except StopIteration:
-                is_available = False
-            except BaseException as exc:
-                is_available = False
-                fetch_error = f"{type(exc).__name__}: {exc}"
-        except BaseException as exc:
-            is_available = False
-            fetch_error = f"{type(exc).__name__}: {exc}"
-
-        fetch_errors = (
-            [fetch_error]
-            if self.accelerator.num_processes == 1
-            else gather_object([fetch_error])
-        )
-        fetch_errors = [
-            f"rank {rank}: {error}"
-            for rank, error in enumerate(fetch_errors)
-            if error is not None
-        ]
-        if fetch_errors:
-            self._known_divergent = True
-            raise RuntimeError(
-                "training batch fetch failed collectively: " + "; ".join(fetch_errors)
-            )
-
-        if self.accelerator.num_processes == 1:
-            empty_ranks = [] if is_available else [0]
-        else:
-            availability = torch.tensor(
-                [is_available],
-                dtype=torch.bool,
-                device=self.accelerator.device,
-            )
-            availability = self.accelerator.gather(availability)
-            empty_ranks = [
-                rank
-                for rank, available in enumerate(availability.tolist())
-                if not available
-            ]
-        if empty_ranks:
-            raise RuntimeError(
-                "Training data availability check failed: no batch is available on"
-                f" rank(s) {empty_ranks} of {self.accelerator.num_processes};"
-                f" dataset_type={self.dataset_type!r}, train_datas={self.train_datas!r},"
-                f" batch_size_per_process={self.batch_size_per_process},"
-                f" num_workers={self.num_worker}. Check dataset partitioning and"
-                " drop_last settings."
-            )
-        if getattr(self, "_resume_sampler", None) is not None:
-            if not hasattr(self, "_pending_sampler_tokens"):
-                self._pending_sampler_tokens = []
-            self._pending_sampler_tokens.append(
-                self._resume_sampler.stage_batch(self.batch_size_per_process)
-            )
-        from dataset.stream import BatchEnvelope
-        if isinstance(data, BatchEnvelope):
-            token_descriptor = getattr(
-                data.token,
-                "coordination_descriptor",
-                (
-                    data.token.epoch,
-                    data.token.batch_index,
-                    data.token.before_digest,
-                    data.token.after_digest,
-                ),
-            )
-            token_descriptors = (
-                [token_descriptor]
-                if self.accelerator.num_processes == 1
-                else gather_object([token_descriptor])
-            )
-            if any(value != token_descriptors[0] for value in token_descriptors[1:]):
-                self._known_divergent = True
-                raise RuntimeError(
-                    "training stream token differs across ranks: "
-                    + "; ".join(
-                        f"rank {rank}={value!r}"
-                        for rank, value in enumerate(token_descriptors)
-                    )
+                restarted_epoch = True
+                if getattr(self, "_resume_sampler", None) is not None:
+                    self._resume_sampler.advance_yield_epoch()
+                self._train_data_iter = iter(self.train_loader)
+                try:
+                    data = next(self._train_data_iter)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "training data produced no batch after restarting the "
+                        f"epoch; dataset_type={self.dataset_type!r}, "
+                        f"train_datas={self.train_datas!r}, "
+                        f"batch_size_per_process={self.batch_size_per_process}, "
+                        f"num_workers={self.num_worker}"
+                    ) from exc
+            if getattr(self, "_resume_sampler", None) is not None:
+                if not hasattr(self, "_pending_sampler_tokens"):
+                    self._pending_sampler_tokens = []
+                self._pending_sampler_tokens.append(
+                    self._resume_sampler.stage_batch(self.batch_size_per_process)
                 )
+        except BaseException as exc:
+            if isinstance(data, BatchEnvelope):
+                data.release_memory_leases()
+            return _BatchFetchResult(
+                data=None,
+                error=f"{type(exc).__name__}: {exc}",
+                restarted_epoch=restarted_epoch,
+            )
+        if isinstance(data, BatchEnvelope):
             if not hasattr(self, "_pending_stream_tokens"):
                 self._pending_stream_tokens = []
             self._pending_stream_tokens.append(data.token)
+            if not hasattr(self, "_pending_batch_memory_leases"):
+                self._pending_batch_memory_leases = []
+            self._pending_batch_memory_leases.extend(
+                (*data.semantic_memory_leases, *data.host_memory_leases)
+            )
             data = data.data
-        return data
+        return _BatchFetchResult(
+            data=data,
+            restarted_epoch=restarted_epoch,
+        )
+
+    def _release_pending_batch_memory(self):
+        leases = getattr(self, "_pending_batch_memory_leases", [])
+        self._pending_batch_memory_leases = []
+        for lease in leases:
+            lease.release()
 
     def _flush_pipeline_metrics(self, consumer_batches_s):
         dataset = getattr(getattr(self, "train_loader", None), "dataset", None)
         if getattr(dataset, "pipeline_stats", None) is None:
-            return {}, None
+            return {}, {}, None
         local_snapshot = dataset.pipeline_metrics_snapshot()
         snapshots = (
             [local_snapshot]
@@ -4327,11 +4936,20 @@ class BaseTrainer:
         )
         from dataset.telemetry import aggregate_pipeline_snapshots
 
-        metrics = aggregate_pipeline_snapshots(
+        aggregated = aggregate_pipeline_snapshots(
             snapshots,
             consumer_batches_s=consumer_batches_s,
             rows_per_batch=self.batch_size_per_process,
         )
+        epoch = self.state.epoch
+        epoch_changed = epoch != getattr(self, "_pipeline_log_epoch", epoch)
+        self._pipeline_log_epoch = epoch
+        metrics = dict(aggregated.public)
+        high_water = metrics.get("host_memory/high_water_fraction")
+        if high_water == getattr(self, "_logged_pipeline_high_water", None):
+            metrics.pop("host_memory/high_water_fraction", None)
+        elif high_water is not None:
+            self._logged_pipeline_high_water = high_water
         tuning_state_method = getattr(dataset, "pipeline_tuning_state_dict", None)
         current_state = None if tuning_state_method is None else tuning_state_method()
         event = None
@@ -4339,8 +4957,9 @@ class BaseTrainer:
             updated_state = None
             if self.accelerator.is_main_process:
                 updated_state = dataset.pipeline_tuning_update(
-                    metrics,
+                    aggregated.observation,
                     self.state.iteration,
+                    epoch_changed=epoch_changed,
                 )
             if self.accelerator.num_processes > 1:
                 values = [updated_state]
@@ -4356,10 +4975,24 @@ class BaseTrainer:
                 ):
                     event = decisions[-1]
             current_state = tuning_state_method()
-            for name, value in current_state["settings"].items():
-                metrics[f"autotune/{name}"] = float(value)
-            metrics["autotune/frozen"] = float(current_state["frozen"])
-        return metrics, event
+            settings = {
+                name: current_state["settings"][name]
+                for name in (
+                    "decode_workers",
+                    "decode_chunk_batches",
+                    "ready_queue_batches",
+                    "decoded_cache_bytes",
+                )
+            }
+            if settings != getattr(self, "_logged_pipeline_settings", None):
+                metrics.update(
+                    {
+                        f"settings/{name}": float(value)
+                        for name, value in settings.items()
+                    }
+                )
+                self._logged_pipeline_settings = settings
+        return metrics, aggregated.process, event
 
     def _log_metrics(self, loss_dict, aux_dict):
         """Write training metrics to TensorBoard and the JSONL log file (main process only)."""
@@ -4369,14 +5002,15 @@ class BaseTrainer:
         if not self.accelerator.is_main_process:
             return
 
-        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration, st.rows)
+        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration)
         if aux_dict:
-            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration, st.rows)
+            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration)
 
+        now = time.perf_counter()
         iters_per_second = (st.iteration - self._log_last_it) / (
-            time.time() - self._log_last_time
+            now - self._log_last_time
         )
-        elapsed_time = time.time() - self._start_time
+        elapsed_time = self._elapsed_seconds(now)
         running_stat_dict = {
             "epoch": st.epoch,
             "rows": st.rows,
@@ -4395,10 +5029,9 @@ class BaseTrainer:
             "running_stat",
             running_stat_dict,
             st.iteration,
-            st.rows,
         )
         self._log_last_it = st.iteration
-        self._log_last_time = time.time()
+        self._log_last_time = now
 
         json_log_dict = {
             "it": st.iteration,
@@ -4414,11 +5047,11 @@ class BaseTrainer:
         # flush on every process: it clears the profiler's recording buffers
         prof_stats = self.profiler.flush_timings()
         st = self.state
-        now = time.time()
+        now = time.perf_counter()
         iters_per_second = (st.iteration - self._log_last_it) / max(
             1e-12, now - self._log_last_time
         )
-        pipeline_stats, tuning_event = self._flush_pipeline_metrics(
+        pipeline_stats, process_stats, tuning_event = self._flush_pipeline_metrics(
             iters_per_second * self.gradient_accumulation_steps
         )
         if not self.accelerator.is_main_process:
@@ -4426,11 +5059,11 @@ class BaseTrainer:
             self._log_last_time = now
             return
 
-        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration, st.rows)
+        log_value_dict(self.tb_logger, "train", loss_dict, st.iteration)
         if aux_dict:
-            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration, st.rows)
+            log_value_dict(self.tb_logger, "train_aux", aux_dict, st.iteration)
 
-        elapsed_time = now - self._start_time
+        elapsed_time = self._elapsed_seconds(now)
         running_stat_dict = {
             "epoch": st.epoch,
             "rows": st.rows,
@@ -4442,14 +5075,14 @@ class BaseTrainer:
             lr_key = "lr" if name == "main" else f"lr_{name}"
             running_stat_dict[lr_key] = sched.get_last_lr()[0]
         running_stat_dict.update(prof_stats)
-        log_value_dict(self.tb_logger, "running_stat", running_stat_dict, st.iteration, st.rows)
+        running_stat_dict.update(process_stats)
+        log_value_dict(self.tb_logger, "running_stat", running_stat_dict, st.iteration)
         if pipeline_stats:
             log_value_dict(
                 self.tb_logger,
                 "data_pipeline",
                 pipeline_stats,
                 st.iteration,
-                st.rows,
             )
         self._log_last_it = st.iteration
         self._log_last_time = now
@@ -4480,8 +5113,11 @@ class BaseTrainer:
         if not self.accelerator.is_local_main_process:
             return
 
-        iters_per_second = (st.iteration - self._show_last_it) / (time.time() - self._show_last_time)
-        elapsed_time = time.time() - self._start_time
+        now = time.perf_counter()
+        iters_per_second = (st.iteration - self._show_last_it) / (
+            now - self._show_last_time
+        )
+        elapsed_time = self._elapsed_seconds(now)
         eta_time = (self.iterations - st.iteration) / iters_per_second
         print(
             f"Iter: {st.iteration}/{self.iterations} ({st.iteration/self.iterations*100:.2f}%)"
@@ -4492,7 +5128,7 @@ class BaseTrainer:
             flush=True,
         )
         self._show_last_it = st.iteration
-        self._show_last_time = time.time()
+        self._show_last_time = now
 
     def _gather_averaged_metrics(
         self,
@@ -5070,6 +5706,7 @@ class BaseTrainer:
 
         setup_errors = []
         try:
+            self._synchronize_evaluation_buffers()
             for m in self.models.values():
                 m.eval()
             self._reset_vq_eval_stats()
@@ -5191,12 +5828,12 @@ class BaseTrainer:
         val_elapsed_time = time.time() - val_start_time
 
         def log_validation_results():
-            elapsed_time = time.time() - self._start_time
+            elapsed_time = self._elapsed_seconds()
             num_val_entries = total_val_entries
-            log_value_dict(self.tb_logger, "validation", val_loss_dict, st.iteration, st.rows)
+            log_value_dict(self.tb_logger, "validation", val_loss_dict, st.iteration)
             if val_aux_dict:
                 log_value_dict(
-                    self.tb_logger, "validation_aux", val_aux_dict, st.iteration, st.rows
+                    self.tb_logger, "validation_aux", val_aux_dict, st.iteration
                 )
             json_log_dict = {
                 "it": st.iteration,
@@ -5251,6 +5888,7 @@ class BaseTrainer:
         """
         accelerator = self.accelerator
 
+        self._synchronize_evaluation_buffers()
         for m in self.models.values():
             m.eval()
         self._reset_vq_eval_stats()
@@ -5355,3 +5993,6 @@ class BaseTrainer:
             log_dict.update(extra_metadata)
         with open(result_file, "w") as f:
             f.write(json.dumps(log_dict, indent=4) + "\n")
+
+
+_BASE_NOOP_AFTER_STEP = BaseTrainer.on_after_step

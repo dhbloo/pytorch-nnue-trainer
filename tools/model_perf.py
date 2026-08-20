@@ -1,4 +1,4 @@
-"""Shared utilities for model equivalence and performance tools."""
+"""Shared utilities for model performance tools."""
 
 from contextlib import nullcontext
 from math import prod
@@ -406,9 +406,8 @@ def _aux_loss_tensors(aux_losses: dict | None):
 
     Tensor-form entries are already-reduced scalar losses. Tuple-form entries
     ``(loss_type, inputs)`` carry raw head outputs that training turns into
-    weighted losses (trainer/loss/supervised.py); they must be exercised too,
-    or the compiler can DCE the corresponding heads and equivalence checks
-    never compare them.
+    weighted losses (trainer/loss/supervised.py); they must be exercised too so
+    the compiler cannot eliminate the corresponding heads from benchmarks.
     """
     for name, aux_loss in (aux_losses or {}).items():
         if isinstance(aux_loss, torch.Tensor):
@@ -432,22 +431,3 @@ def benchmark_loss(results: dict) -> torch.Tensor:
         else:
             loss = loss + aux_loss.float()
     return loss
-
-
-def clone_state_dict(model) -> dict[str, torch.Tensor]:
-    return {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
-
-
-def collect_results(results: dict, model) -> dict:
-    outputs = {
-        "value": results["value"].detach().cpu().clone(),
-        "policy": results["policy"].detach().cpu().clone(),
-    }
-    for name, aux_loss, _ in _aux_loss_tensors(results.get("aux_losses")):
-        outputs[f"aux_losses.{name}"] = aux_loss.detach().cpu().clone()
-    grads = {
-        name: parameter.grad.detach().cpu().clone()
-        for name, parameter in model.named_parameters()
-        if parameter.grad is not None
-    }
-    return {"outputs": outputs, "grads": grads}

@@ -1,4 +1,5 @@
 from accelerate import PartialState
+from collections.abc import Mapping
 from importlib.metadata import version
 import configargparse
 import yaml
@@ -9,6 +10,13 @@ import torch
 from utils.file_utils import make_dir
 from utils.config_utils import parse_run_provenance
 from trainer import build_trainer
+
+
+def _parse_data_pipeline_mapping(value):
+    parsed = yaml.safe_load(value) if isinstance(value, str) else value
+    if not isinstance(parsed, Mapping):
+        raise ValueError("data_pipeline must be a YAML mapping")
+    return dict(parsed)
 
 
 def collect_run_provenance():
@@ -61,6 +69,12 @@ def parse_args_and_init():
     )
     parser.add("--dataloader_args", type=yaml.safe_load, default={}, help="Extra dataloader arguments")
     parser.add("--data_pipelines", type=yaml.safe_load, default=None, help="Data-pipeline arguments")
+    parser.add(
+        "--data_pipeline",
+        type=_parse_data_pipeline_mapping,
+        default=None,
+        help="Adaptive data-pipeline configuration",
+    )
     parser.add("--num_worker", type=int, default=0, help="Num of dataloader workers")
     parser.add(
         "--cuda_prefetch_batches",
@@ -176,6 +190,9 @@ def parse_args_and_init():
 def train(**kwargs):
     kwargs.pop("config", None)
     kwargs.pop("_provenance", None)
+    data_pipeline = kwargs.pop("data_pipeline", None)
+    if data_pipeline is not None:
+        kwargs["data_pipeline"] = _parse_data_pipeline_mapping(data_pipeline)
     # Pop profile-related keys before constructing trainer
     do_profile = kwargs.pop("profile", False)
     profile_active_iters = kwargs.pop("profile_active_iters", 30)
@@ -185,14 +202,33 @@ def train(**kwargs):
     trainer_type = kwargs.pop("trainer_type", "supervised")
     trainer = build_trainer(trainer_type, **kwargs)
 
-    if do_profile:
-        trainer.profile(
-            warmup=profile_warmup_iters,
-            active=profile_active_iters,
-            profile_memory=profile_memory,
-        )
-    else:
-        trainer.run()
+    primary_exception = None
+    try:
+        if do_profile:
+            trainer.profile(
+                warmup=profile_warmup_iters,
+                active=profile_active_iters,
+                profile_memory=profile_memory,
+            )
+        else:
+            trainer.run()
+    except BaseException as exc:
+        primary_exception = exc
+        raise
+    finally:
+        try:
+            trainer.accelerator.end_training()
+        except BaseException as shutdown_exc:
+            if primary_exception is None:
+                raise
+            try:
+                trainer.accelerator.print(
+                    "Accelerator shutdown failed without replacing the original "
+                    f"{type(primary_exception).__name__}: "
+                    f"{type(shutdown_exc).__name__}: {shutdown_exc}"
+                )
+            except BaseException:
+                pass
 
 
 if __name__ == "__main__":

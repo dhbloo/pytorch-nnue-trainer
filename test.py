@@ -1,4 +1,5 @@
 from collections import OrderedDict
+from collections.abc import Mapping
 
 from accelerate import PartialState
 import configargparse
@@ -25,6 +26,7 @@ _TRAIN_CONFIG_KEYS = frozenset(
         "val_dataset_args",
         "dataloader_args",
         "data_pipelines",
+        "data_pipeline",
         "num_worker",
         "model_type",
         "model_args",
@@ -134,6 +136,12 @@ class _StrictYAMLConfigFileParser(configargparse.YAMLConfigFileParser):
                     raise configargparse.ConfigFileParserException(str(e))
                 continue
             key = _canonicalize_config_key(key)
+            if key == "data_pipeline":
+                if not isinstance(value, Mapping):
+                    raise configargparse.ConfigFileParserException(
+                        "data_pipeline must be a YAML mapping"
+                    )
+                continue
             if isinstance(value, list):
                 config_items[key] = value
             elif value is not None:
