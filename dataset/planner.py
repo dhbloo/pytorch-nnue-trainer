@@ -11,11 +11,13 @@ from .core import (
     DatasetCapabilities,
     DatasetRuntimeContext,
     PipelineStateComposer,
+    PreparedPipelineBatch,
     canonical_pipeline_state_bytes,
 )
 from .packed import (
     PACKED_RESERVOIR_ALGORITHM,
     PackedEnvelopeBatch,
+    PackedReadySnapshot,
     PackedReadyState,
     PackedReservoirState,
     PackedUInt64ReadyBuffer,
@@ -81,6 +83,19 @@ class PlannerState:
     finished: bool
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class _PackedPlannerState:
+    """Small in-memory cursor used while packed batches are queued ahead."""
+
+    epoch: int
+    batch_index: int
+    source_cycle: int
+    source_cursor: dict
+    ready: PackedReadySnapshot
+    source_exhausted: bool
+    finished: bool
+
+
 @dataclass(frozen=True, slots=True)
 class PlannerBatchToken:
     epoch: int
@@ -88,11 +103,12 @@ class PlannerBatchToken:
     before_digest: str
     after_digest: str
     batch: PlannedEnvelopeBatch
-    before_state: PlannerState | None
-    after_state: PlannerState | None
+    before_state: PlannerState | _PackedPlannerState | None
+    after_state: PlannerState | _PackedPlannerState | None
     before_pipeline_blob: bytes
     after_pipeline_blob: bytes
     distributed_policy: str
+    packed_transaction_endpoint: int | None
 
     @property
     def coordination_descriptor(self) -> tuple:
@@ -116,10 +132,11 @@ class PlannerBatchToken:
 class PreparedPlannerCommit:
     before_digest: str
     after_digest: str
-    after_state: PlannerState | None
+    after_state: PlannerState | _PackedPlannerState | None
     after_pipeline_blob: bytes
     token_count: int
     coordination_descriptor: tuple
+    packed_transaction_endpoints: tuple[int, ...]
 
 
 class DatasetPlanner:
@@ -197,7 +214,9 @@ class DatasetPlanner:
         self._source_exhausted = False
         self._finished = False
         self.start_epoch(0)
-        self._committed_state = self.state() if source.capabilities.resumable else None
+        self._committed_state = (
+            self._transaction_state() if source.capabilities.resumable else None
+        )
         self._yield_state = self._committed_state
         self._committed_digest = self._initial_digest(0)
         self._yield_digest = self._committed_digest
@@ -225,7 +244,9 @@ class DatasetPlanner:
         self.config = replace(self.config, shuffle_buffer_size=value)
         self.start_epoch(self.epoch)
         self._committed_state = (
-            self.state() if self.source.capabilities.resumable else None
+            self._transaction_state()
+            if self.source.capabilities.resumable
+            else None
         )
         self._yield_state = self._committed_state
         self._committed_digest = self._initial_digest(self.epoch)
@@ -277,6 +298,58 @@ class DatasetPlanner:
         self._shape_queues.clear()
         self._source_exhausted = False
         self._finished = False
+        self._pending_terminal_packed_state = None
+
+    def _transaction_state(self) -> PlannerState | _PackedPlannerState:
+        if not self._packed_uniform:
+            return self.state()
+        return _PackedPlannerState(
+            epoch=self._epoch,
+            batch_index=self._batch_index,
+            source_cycle=self._source_cycle,
+            source_cursor=self.source.save_cursor(self._source_cursor),
+            ready=self._packed_ready.snapshot(),
+            source_exhausted=self._source_exhausted,
+            finished=self._finished,
+        )
+
+    def _restore_packed_transaction_state(
+        self, state: _PackedPlannerState
+    ) -> None:
+        if not isinstance(state, _PackedPlannerState):
+            raise TypeError("packed planner rollback state is malformed")
+        if hasattr(self.source, "close_cursor"):
+            self.source.close_cursor(self._source_cursor)
+        self._epoch = state.epoch
+        self._batch_index = state.batch_index
+        self._source_cycle = state.source_cycle
+        self._source_cursor = self.source.restore_cursor(state.source_cursor)
+        self._packed_ready.restore_snapshot(state.ready)
+        self._ready.clear()
+        self._shape_queues.clear()
+        self._source_exhausted = state.source_exhausted
+        self._finished = state.finished
+
+    def _materialize_packed_state(
+        self, state: _PackedPlannerState
+    ) -> PlannerState:
+        if not isinstance(state, _PackedPlannerState):
+            raise TypeError("packed planner checkpoint state is malformed")
+        return PlannerState(
+            schema=SOURCE_CURSOR_SCHEMA,
+            algorithm=PLANNER_ALGORITHM,
+            manifest_digest=self._manifest_digest,
+            config=self.config,
+            epoch=state.epoch,
+            batch_index=state.batch_index,
+            source_cycle=state.source_cycle,
+            source_cursor=state.source_cursor,
+            reservoir=self._reservoir.committed_state(),
+            ready=state.ready.state(),
+            shape_queues=(),
+            source_exhausted=state.source_exhausted,
+            finished=state.finished,
+        )
 
     def _new_reservoir(self, source_cycle: int):
         capacity = self.config.shuffle_buffer_size if self.config.shuffle else 1
@@ -363,7 +436,12 @@ class DatasetPlanner:
         pipeline_blob: bytes,
     ) -> str:
         digest = hashlib.sha256()
-        digest.update(b"NNUE-dataset-planner-token-v2\0")
+        packed = isinstance(batch.envelopes, PackedEnvelopeBatch)
+        digest.update(
+            b"NNUE-dataset-planner-packed-token-v3\0"
+            if packed
+            else b"NNUE-dataset-planner-token-v2\0"
+        )
         digest.update(bytes.fromhex(before_digest))
         digest.update(
             struct.pack(
@@ -374,7 +452,19 @@ class DatasetPlanner:
                 len(batch.envelopes),
             )
         )
-        if hasattr(self.source, "update_batch_record_digest"):
+        if packed:
+            # Packed IDs are already determined by the immutable transaction
+            # state and checked FIFO endpoint.  Hashing their full buffer on
+            # every batch only recopies deterministic state; a position chain
+            # plus the terminal real-row count is sufficient to identify the
+            # token while preserving the existing 64-character opaque cursor.
+            real_count = (
+                batch.is_real.count(True)
+                if batch.is_last
+                else len(batch.is_real)
+            )
+            digest.update(struct.pack("<Q", real_count))
+        elif hasattr(self.source, "update_batch_record_digest"):
             self.source.update_batch_record_digest(
                 digest,
                 batch.envelopes,
@@ -771,6 +861,8 @@ class DatasetPlanner:
     def next_transactional_batch(
         self,
     ) -> tuple[PlannedEnvelopeBatch, PlannerBatchToken] | None:
+        if self._packed_uniform:
+            return self._next_packed_transactional_batch()
         before_state = self._yield_state
         before_digest = self._yield_digest
         before_pipeline_blob = self._yield_pipeline_blob
@@ -793,7 +885,57 @@ class DatasetPlanner:
             before_pipeline_blob=before_pipeline_blob,
             after_pipeline_blob=before_pipeline_blob,
             distributed_policy=self.distributed_policy,
+            packed_transaction_endpoint=None,
         )
+        self._yield_digest = after_digest
+        return batch, token
+
+    def _next_packed_transactional_batch(
+        self,
+    ) -> tuple[PlannedEnvelopeBatch, PlannerBatchToken] | None:
+        if self._pending_terminal_packed_state is not None:
+            raise RuntimeError("terminal packed transaction was not finalized")
+        before_state = self._yield_state
+        if not isinstance(before_state, _PackedPlannerState):
+            raise RuntimeError("packed planner yield state is malformed")
+        before_digest = self._yield_digest
+        before_pipeline_blob = self._yield_pipeline_blob
+        transaction_id = self._reservoir.begin_transaction(
+            self.planning_batch_size + SOURCE_CHUNK_SIZE
+        )
+        try:
+            batch = self.next_batch()
+            after_state = self._transaction_state()
+            if not isinstance(after_state, _PackedPlannerState):
+                raise RuntimeError("packed planner produced an object cursor")
+            self._reservoir.seal_transaction(transaction_id)
+            if batch is None:
+                self._pending_terminal_packed_state = (
+                    transaction_id,
+                    after_state,
+                )
+                return None
+            after_digest = self._token_digest(
+                before_digest, batch, before_pipeline_blob
+            )
+            token = PlannerBatchToken(
+                epoch=batch.epoch,
+                batch_index=batch.batch_index,
+                before_digest=before_digest,
+                after_digest=after_digest,
+                batch=batch,
+                before_state=before_state,
+                after_state=after_state,
+                before_pipeline_blob=before_pipeline_blob,
+                after_pipeline_blob=before_pipeline_blob,
+                distributed_policy=self.distributed_policy,
+                packed_transaction_endpoint=transaction_id,
+            )
+        except BaseException:
+            self._reservoir.rollback_transaction(transaction_id)
+            self._restore_packed_transaction_state(before_state)
+            raise
+        self._yield_state = after_state
         self._yield_digest = after_digest
         return batch, token
 
@@ -831,6 +973,43 @@ class DatasetPlanner:
         self._yield_digest = after_digest
         return prepared.data, token
 
+    def prepare_parallel_pipeline_batch(
+        self,
+        batch: PlannedEnvelopeBatch,
+        data: dict,
+        sample_keys: tuple,
+    ) -> PreparedPipelineBatch:
+        composer = self.pipeline_composer
+        if composer is None or not composer.is_parallel_stateless:
+            raise RuntimeError("pipeline chain cannot run in decode workers")
+        return composer.prepare_batch(
+            data,
+            sample_keys=sample_keys,
+            rng_keys=tuple(
+                (batch.epoch, key, occurrence)
+                for occurrence, key in enumerate(sample_keys)
+            ),
+            current_blob=composer.initial_blob,
+        )
+
+    def accept_parallel_pipeline_batch(
+        self,
+        batch: PlannedEnvelopeBatch,
+        token: PlannerBatchToken,
+        prepared: PreparedPipelineBatch,
+    ) -> tuple[dict, PlannerBatchToken]:
+        if batch != token.batch:
+            raise RuntimeError("pipeline batch does not match its planner token")
+        composer = self.pipeline_composer
+        if composer is None or not composer.is_parallel_stateless:
+            raise RuntimeError("pipeline chain cannot run in decode workers")
+        if (
+            token.before_pipeline_blob != composer.initial_blob
+            or prepared.composite_blob != composer.initial_blob
+        ):
+            raise RuntimeError("parallel stateless pipeline changed its state")
+        return prepared.data, token
+
     def finalize_terminal_token(
         self, token: PlannerBatchToken
     ) -> tuple[PlannedEnvelopeBatch, PlannerBatchToken]:
@@ -839,7 +1018,17 @@ class DatasetPlanner:
         if token.after_digest != self._yield_digest:
             raise RuntimeError("terminal planner token is not the latest yielded token")
         batch = replace(token.batch, is_last=True)
-        after_state = self.state() if self.source.capabilities.resumable else None
+        packed_endpoint = token.packed_transaction_endpoint
+        if self._packed_uniform:
+            terminal = self._pending_terminal_packed_state
+            if terminal is None:
+                raise RuntimeError("terminal packed transaction is missing")
+            packed_endpoint, after_state = terminal
+            self._pending_terminal_packed_state = None
+        else:
+            after_state = (
+                self.state() if self.source.capabilities.resumable else None
+            )
         self._yield_state = after_state
         after_digest = self._token_digest(
             token.before_digest, batch, token.after_pipeline_blob
@@ -849,6 +1038,7 @@ class DatasetPlanner:
             after_digest=after_digest,
             batch=batch,
             after_state=after_state,
+            packed_transaction_endpoint=packed_endpoint,
         )
         self._yield_digest = after_digest
         return batch, finalized
@@ -870,7 +1060,14 @@ class DatasetPlanner:
             if self._committed_state is not None
             else tokens[0].batch_index
         )
-        for token in tokens:
+        packed_endpoints = []
+        pending_transaction_ids = (
+            self._reservoir.pending_transaction_ids
+            if self._packed_uniform
+            else ()
+        )
+        pending_transaction_offset = 0
+        for token_index, token in enumerate(tokens):
             if token.before_digest != digest:
                 raise RuntimeError("non-contiguous planner token digest")
             if (token.epoch, token.batch_index) != (
@@ -880,11 +1077,49 @@ class DatasetPlanner:
                 raise RuntimeError("non-contiguous planner batch token")
             if token.before_pipeline_blob != pipeline_blob:
                 raise RuntimeError("planner token pipeline state is non-contiguous")
-            if (
-                self.source.capabilities.resumable
-                and token.before_state != expected_state
-            ):
-                raise RuntimeError("planner token does not start at the committed cursor")
+            if self.source.capabilities.resumable:
+                state_matches = (
+                    token.before_state is expected_state
+                    if self._packed_uniform
+                    else token.before_state == expected_state
+                )
+                if not state_matches:
+                    raise RuntimeError(
+                        "planner token does not start at the committed cursor"
+                    )
+            if self._packed_uniform:
+                endpoint = token.packed_transaction_endpoint
+                if type(endpoint) is not int or endpoint <= 0:
+                    raise RuntimeError(
+                        "packed planner token transaction endpoint is malformed"
+                    )
+                try:
+                    endpoint_offset = pending_transaction_ids.index(
+                        endpoint,
+                        pending_transaction_offset,
+                    )
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "packed planner token transaction is not pending"
+                    ) from exc
+                skipped = endpoint_offset - pending_transaction_offset
+                absorbs_terminal_probe = (
+                    skipped == 1
+                    and token_index == len(tokens) - 1
+                    and token.batch.is_last
+                )
+                if skipped and not absorbs_terminal_probe:
+                    raise RuntimeError(
+                        "packed planner token transactions are non-contiguous"
+                    )
+                pending_transaction_offset = endpoint_offset + 1
+                packed_endpoints.append(endpoint)
+                if not isinstance(token.after_state, _PackedPlannerState):
+                    raise RuntimeError("packed planner token cursor is malformed")
+            elif token.packed_transaction_endpoint is not None:
+                raise RuntimeError(
+                    "object planner token contains a packed transaction"
+                )
             if self.pipeline_composer is not None:
                 self.pipeline_composer._decode_blob(token.after_pipeline_blob)
             elif token.after_pipeline_blob:
@@ -923,11 +1158,20 @@ class DatasetPlanner:
             after_pipeline_blob=pipeline_blob,
             token_count=len(tokens),
             coordination_descriptor=coordination_descriptor,
+            packed_transaction_endpoints=tuple(packed_endpoints),
         )
 
     def commit_prepared(self, candidate: PreparedPlannerCommit) -> None:
         if candidate.before_digest != self._committed_digest:
             raise RuntimeError("prepared planner commit no longer matches state")
+        if self._packed_uniform:
+            if not candidate.packed_transaction_endpoints:
+                raise RuntimeError("prepared packed planner commit has no transaction")
+            self._reservoir.commit_transactions(
+                candidate.packed_transaction_endpoints
+            )
+        elif candidate.packed_transaction_endpoints:
+            raise RuntimeError("object planner commit contains packed transactions")
         self._committed_digest = candidate.after_digest
         self._committed_pipeline_blob = candidate.after_pipeline_blob
         if self.source.capabilities.resumable:
@@ -943,9 +1187,13 @@ class DatasetPlanner:
             raise RuntimeError("cannot advance an unfinished planner epoch")
         if self._yield_digest != self._committed_digest:
             raise RuntimeError("cannot advance with uncommitted planner batches")
+        if self._packed_uniform and self._reservoir.pending_transaction_count:
+            raise RuntimeError("cannot advance with pending packed transactions")
         self.start_epoch(self.epoch + 1)
         self._committed_state = (
-            self.state() if self.source.capabilities.resumable else None
+            self._transaction_state()
+            if self.source.capabilities.resumable
+            else None
         )
         self._yield_state = self._committed_state
         self._committed_digest = self._initial_digest(self.epoch)
@@ -955,7 +1203,14 @@ class DatasetPlanner:
     def rollback_uncommitted(self) -> None:
         if not self.source.capabilities.resumable:
             raise RuntimeError("cannot roll back a non-resumable source")
-        self.restore(self._committed_state)
+        if self._packed_uniform:
+            if not isinstance(self._committed_state, _PackedPlannerState):
+                raise RuntimeError("packed planner committed cursor is malformed")
+            self._reservoir.rollback_uncommitted()
+            self._restore_packed_transaction_state(self._committed_state)
+            self._pending_terminal_packed_state = None
+        else:
+            self.restore(self._committed_state)
         self._yield_state = self._committed_state
         self._yield_digest = self._committed_digest
         self._yield_pipeline_blob = self._committed_pipeline_blob
@@ -963,11 +1218,14 @@ class DatasetPlanner:
     def state_dict(self) -> dict:
         if not self.source.capabilities.resumable:
             raise RuntimeError("dataset source does not support exact resume")
+        committed_state = self._committed_state
+        if self._packed_uniform:
+            committed_state = self._materialize_packed_state(committed_state)
         return {
             "version": 3,
             "planner_algorithm": PLANNER_ALGORITHM,
             "signature": self.signature_state(),
-            "cursor": self._state_to_serializable(self._committed_state),
+            "cursor": self._state_to_serializable(committed_state),
             "cursor_digest": self._committed_digest,
             "pipeline_state": self._committed_pipeline_blob.hex(),
         }
@@ -1198,12 +1456,14 @@ class DatasetPlanner:
         elif pipeline_blob:
             raise RuntimeError("cannot restore pipeline state without pipelines")
         self.restore(cursor)
-        self._committed_state = cursor
-        self._yield_state = cursor
+        transaction_state = self._transaction_state()
+        self._committed_state = transaction_state
+        self._yield_state = transaction_state
         self._committed_digest = digest
         self._yield_digest = digest
         self._committed_pipeline_blob = pipeline_blob
         self._yield_pipeline_blob = pipeline_blob
+        self._pending_terminal_packed_state = None
 
     def signature_state(self) -> dict:
         return {

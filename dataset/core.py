@@ -806,9 +806,10 @@ def _decode_pipeline_value(value: Any) -> Any:
 
 def decode_canonical_pipeline_state(blob: bytes) -> Any:
     value = json.loads(blob.decode("utf-8"))
-    if canonical_pipeline_state_bytes(_decode_pipeline_value(value)) != blob:
+    decoded = _decode_pipeline_value(value)
+    if canonical_pipeline_state_bytes(decoded) != blob:
         raise ValueError("pipeline state is not in canonical form")
-    return _decode_pipeline_value(value)
+    return decoded
 
 
 @dataclass(frozen=True)
@@ -1421,11 +1422,28 @@ class PipelineStateComposer:
 
     def __init__(self, pipelines):
         self.pipelines = tuple(pipelines)
+        parallel_flags = tuple(
+            getattr(pipeline, "parallel_stateless", False) is True
+            for pipeline in self.pipelines
+        )
+        for pipeline, declared_parallel in zip(self.pipelines, parallel_flags):
+            if declared_parallel and hasattr(pipeline, "initial_state"):
+                raise ValueError(
+                    f"pipeline {pipeline.pipeline_id} declares parallel_stateless "
+                    "but also exposes mutable state"
+                )
+            if declared_parallel and not callable(
+                getattr(pipeline, "added_output_row_bytes", None)
+            ):
+                raise ValueError(
+                    f"pipeline {pipeline.pipeline_id} does not describe its output size"
+                )
+        self.is_parallel_stateless = bool(self.pipelines) and all(parallel_flags)
         identifiers = [pipeline.pipeline_id for pipeline in self.pipelines]
         if len(set(identifiers)) != len(identifiers):
             raise ValueError(f"duplicate pipeline identifiers: {identifiers}")
         states = []
-        self._signature_fingerprints = []
+        self._signatures = []
         produced_fields = set()
         for pipeline in self.pipelines:
             if not getattr(pipeline, "pipeline_id", ""):
@@ -1433,7 +1451,7 @@ class PipelineStateComposer:
             if not isinstance(getattr(pipeline, "schema_version", None), int):
                 raise ValueError(f"pipeline {pipeline.pipeline_id} lacks schema_version")
             signature = canonical_pipeline_state_bytes(pipeline.signature_state())
-            self._signature_fingerprints.append(hashlib.sha256(signature).digest())
+            self._signatures.append(signature)
             input_names = {field.name for field in pipeline.input_fields}
             output_names = [field.name for field in pipeline.output_fields]
             if len(set(output_names)) != len(output_names):
@@ -1463,6 +1481,17 @@ class PipelineStateComposer:
             )
         self.initial_blob = canonical_pipeline_state_bytes(states)
 
+    def added_output_row_bytes(self, board_size: tuple[int, int]) -> int:
+        if not self.is_parallel_stateless:
+            raise RuntimeError("pipeline chain is not parallel stateless")
+        total = sum(
+            pipeline.added_output_row_bytes(board_size)
+            for pipeline in self.pipelines
+        )
+        if type(total) is not int or total < 0:
+            raise ValueError("pipeline output size must be a non-negative integer")
+        return total
+
     def _decode_blob(self, blob: bytes):
         values = decode_canonical_pipeline_state(blob)
         if len(values) != len(self.pipelines):
@@ -1478,59 +1507,8 @@ class PipelineStateComposer:
         return states
 
     @staticmethod
-    def _field_value_digest(value) -> bytes:
-        digest = hashlib.sha256()
-
-        def update(item):
-            if isinstance(item, torch.Tensor):
-                array = item.detach().cpu().contiguous().numpy()
-                digest.update(b"tensor\0")
-                digest.update(str(array.dtype).encode("ascii"))
-                digest.update(repr(array.shape).encode("ascii"))
-                digest.update(array.tobytes())
-            elif isinstance(item, np.ndarray):
-                array = np.ascontiguousarray(item)
-                digest.update(b"array\0")
-                digest.update(str(array.dtype).encode("ascii"))
-                digest.update(repr(array.shape).encode("ascii"))
-                if array.dtype.kind == "O":
-                    for nested in array.flat:
-                        update(nested)
-                else:
-                    digest.update(array.tobytes())
-            elif isinstance(item, (list, tuple)):
-                digest.update(type(item).__name__.encode("ascii") + b"\0")
-                digest.update(len(item).to_bytes(8, "little"))
-                for nested in item:
-                    update(nested)
-            elif isinstance(item, dict):
-                digest.update(b"dict\0")
-                for key in sorted(item):
-                    update(key)
-                    update(item[key])
-            elif isinstance(item, (str, bytes, int, float, bool, type(None))):
-                digest.update(type(item).__name__.encode("ascii") + b"\0")
-                digest.update(repr(item).encode("utf-8"))
-            else:
-                digest.update(type(item).__qualname__.encode("utf-8") + b"\0")
-                digest.update(repr(item).encode("utf-8"))
-
-        update(value)
-        return digest.digest()
-
-    @staticmethod
-    def _validate_fields(
-        data, specs, batch_size, stage, *, reject_unknown=False
-    ):
+    def _validate_fields(data, specs, batch_size, stage):
         specs = tuple(specs)
-        if reject_unknown:
-            unknown = sorted(
-                set(data).difference(spec.name for spec in specs)
-            )
-            if unknown:
-                raise ValueError(
-                    f"{stage} contains undeclared field(s): {unknown}"
-                )
         board_sizes = None
         if "board_size" in data:
             raw_board_sizes = (
@@ -1586,19 +1564,34 @@ class PipelineStateComposer:
                         f"{stage} batch-shared field {spec.name!r} must "
                         f"retain leading dimension {batch_size}, got {shape}"
                     )
-                first = value[0]
-                for index in range(1, batch_size):
-                    if isinstance(value, torch.Tensor):
-                        equal = torch.equal(value[index], first)
-                    else:
-                        equal = np.array_equal(
-                            np.asarray(value[index]), np.asarray(first)
+                if batch_size == 1:
+                    equal = True
+                elif isinstance(value, torch.Tensor):
+                    equal = torch.equal(value, value[0].expand_as(value))
+                else:
+                    array = np.asarray(value)
+                    equal = np.array_equal(
+                        array,
+                        np.broadcast_to(array[0], array.shape),
+                    )
+                if not equal:
+                    first = value[0]
+                    mismatched = next(
+                        index
+                        for index in range(1, batch_size)
+                        if not (
+                            torch.equal(value[index], first)
+                            if isinstance(value, torch.Tensor)
+                            else np.array_equal(
+                                np.asarray(value[index]),
+                                np.asarray(first),
+                            )
                         )
-                    if not equal:
-                        raise ValueError(
-                            f"{stage} batch-shared field {spec.name!r} differs "
-                            f"at row {index}"
-                        )
+                    )
+                    raise ValueError(
+                        f"{stage} batch-shared field {spec.name!r} differs "
+                        f"at row {mismatched}"
+                    )
             spatial_axes = []
             for axis in spec.spatial_axes or ():
                 normalized = (
@@ -1714,15 +1707,10 @@ class PipelineStateComposer:
         next_entries = []
         for index, (pipeline, current_state) in enumerate(zip(self.pipelines, states)):
             before_signature = canonical_pipeline_state_bytes(pipeline.signature_state())
-            if hashlib.sha256(before_signature).digest() != self._signature_fingerprints[index]:
+            if before_signature != self._signatures[index]:
                 raise RuntimeError(f"pipeline {pipeline.pipeline_id} signature state mutated")
             input_state_bytes = canonical_pipeline_state_bytes(current_state)
-            isolated_state = decode_canonical_pipeline_state(input_state_bytes)
             before_keys = set(data)
-            before_field_digests = {
-                key: self._field_value_digest(value)
-                for key, value in data.items()
-            }
             self._validate_fields(
                 data,
                 pipeline.input_fields,
@@ -1732,7 +1720,7 @@ class PipelineStateComposer:
             if hasattr(pipeline, "initial_state"):
                 result = pipeline.prepare_batch(
                     data,
-                    current_state=isolated_state,
+                    current_state=current_state,
                     sample_keys=sample_keys,
                     rng_keys=rng_keys,
                 )
@@ -1757,13 +1745,6 @@ class PipelineStateComposer:
             overwritten = before_keys.intersection(output_names)
             undeclared = set(data).difference(before_keys).difference(output_names)
             removed = before_keys.difference(data)
-            mutated = sorted(
-                key
-                for key in before_keys.difference(output_names)
-                if key in data
-                and self._field_value_digest(data[key])
-                != before_field_digests[key]
-            )
             if overwritten:
                 raise ValueError(
                     f"pipeline {pipeline.pipeline_id} overwrote existing fields: "
@@ -1778,18 +1759,13 @@ class PipelineStateComposer:
                 raise ValueError(
                     f"pipeline {pipeline.pipeline_id} removed fields: {sorted(removed)}"
                 )
-            if mutated:
-                raise ValueError(
-                    f"pipeline {pipeline.pipeline_id} mutated undeclared fields: "
-                    f"{mutated}"
-                )
             self._validate_fields(
                 data,
                 pipeline.output_fields,
                 len(sample_keys),
                 f"pipeline {pipeline.pipeline_id} output",
             )
-            if canonical_pipeline_state_bytes(isolated_state) != input_state_bytes:
+            if canonical_pipeline_state_bytes(current_state) != input_state_bytes:
                 raise RuntimeError(f"pipeline {pipeline.pipeline_id} mutated its input state")
             after_signature = canonical_pipeline_state_bytes(pipeline.signature_state())
             if after_signature != before_signature:

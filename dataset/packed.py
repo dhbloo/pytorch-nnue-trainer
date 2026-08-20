@@ -12,6 +12,8 @@ from .shuffle import RESERVOIR_ALGORITHM, ReservoirStats
 
 
 PACKED_RESERVOIR_ALGORITHM = RESERVOIR_ALGORITHM + "-uint64"
+# One normal-path undo entry retains a slot index and the evicted uint64 value.
+PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT = 2 * np.dtype(np.uint64).itemsize
 
 
 def _readonly_uint64(values, *, name: str) -> np.ndarray:
@@ -118,6 +120,46 @@ class PackedReadyState:
         return values
 
 
+@dataclass(frozen=True, slots=True, eq=False)
+class PackedReadySnapshot:
+    """Zero-copy internal snapshot of the chunked packed ready queue."""
+
+    chunks: tuple[np.ndarray, ...]
+    head: int
+    size: int
+
+    def __post_init__(self) -> None:
+        if type(self.head) is not int or type(self.size) is not int:
+            raise TypeError("packed ready snapshot offsets must be integers")
+        if self.head < 0 or self.size < 0:
+            raise ValueError("packed ready snapshot offsets must be non-negative")
+        for chunk in self.chunks:
+            _readonly_uint64(chunk, name="ready snapshot chunk")
+        if not self.chunks:
+            if self.head or self.size:
+                raise ValueError("empty packed ready snapshot has data offsets")
+            return
+        if self.head >= len(self.chunks[0]):
+            raise ValueError("packed ready snapshot head is out of range")
+        available = len(self.chunks[0]) - self.head + sum(
+            len(chunk) for chunk in self.chunks[1:]
+        )
+        if available != self.size:
+            raise ValueError("packed ready snapshot size is inconsistent")
+
+    def state(self) -> PackedReadyState:
+        if not self.size:
+            return PackedReadyState(b"")
+        values = (
+            self.chunks[0][self.head :]
+            if len(self.chunks) == 1
+            else np.concatenate(
+                (self.chunks[0][self.head :], *self.chunks[1:])
+            )
+        )
+        return PackedReadyState(values.astype("<u8", copy=False).tobytes())
+
+
 class PackedUInt64ReadyBuffer:
     """Chunked uint64 FIFO with no per-record Python objects."""
 
@@ -172,16 +214,22 @@ class PackedUInt64ReadyBuffer:
         values.flags.writeable = False
         return values
 
+    def snapshot(self) -> PackedReadySnapshot:
+        """Capture queue position while retaining immutable chunks by reference."""
+
+        return PackedReadySnapshot(tuple(self._chunks), self._head, self._size)
+
+    def restore_snapshot(self, snapshot: PackedReadySnapshot) -> None:
+        """Restore a snapshot without copying its immutable uint64 chunks."""
+
+        if not isinstance(snapshot, PackedReadySnapshot):
+            raise TypeError("snapshot must be a PackedReadySnapshot")
+        self._chunks = deque(snapshot.chunks)
+        self._head = snapshot.head
+        self._size = snapshot.size
+
     def state(self) -> PackedReadyState:
-        if not self._size:
-            return PackedReadyState(b"")
-        chunks = tuple(self._chunks)
-        values = (
-            chunks[0][self._head :]
-            if len(chunks) == 1
-            else np.concatenate((chunks[0][self._head :], *chunks[1:]))
-        )
-        return PackedReadyState(values.astype("<u8", copy=False).tobytes())
+        return self.snapshot().state()
 
     def restore(self, state: PackedReadyState) -> None:
         self.clear()
@@ -227,12 +275,6 @@ class PackedEnvelopeBatch(Sequence):
             and self.identity == other.identity
             and np.array_equal(self.record_ids, other.record_ids)
         )
-
-    def __repr__(self) -> str:
-        return (
-            f"PackedEnvelopeBatch(count={len(self)}, identity={self.identity!r})"
-        )
-
 
 class PackedUInt64ShuffleReservoir:
     """Exact reservoir-v2 storage backed by a native uint64 core."""
@@ -324,6 +366,41 @@ class PackedUInt64ShuffleReservoir:
         emitted.flags.writeable = False
         return emitted
 
+    def begin_transaction(self, expected_replacements: int = 0) -> int:
+        """Begin an ordered transaction, optionally preallocating its journal."""
+
+        return int(self._core.begin_transaction(expected_replacements))
+
+    def seal_transaction(self, transaction_id: int) -> None:
+        """Close the latest transaction so a following one may begin."""
+
+        self._core.seal_transaction(transaction_id)
+
+    def commit_transactions(self, transaction_ids) -> None:
+        """Atomically commit a FIFO sequence of token transaction endpoints."""
+
+        self._core.commit_transactions(tuple(transaction_ids))
+
+    def rollback_uncommitted(self) -> None:
+        """Undo every pending transaction, including an active transaction."""
+
+        self._core.rollback_uncommitted()
+        self._state_cache = None
+
+    def rollback_transaction(self, transaction_id: int) -> None:
+        """Undo only the latest active or sealed transaction."""
+
+        self._core.rollback_transaction(transaction_id)
+        self._state_cache = None
+
+    @property
+    def pending_transaction_count(self) -> int:
+        return int(self._core.pending_transaction_count)
+
+    @property
+    def pending_transaction_ids(self) -> tuple[int, ...]:
+        return tuple(int(value) for value in self._core.pending_transaction_ids)
+
     def state(self) -> PackedReservoirState:
         if self._state_cache is None:
             slots = self._core.slots()
@@ -341,6 +418,31 @@ class PackedUInt64ShuffleReservoir:
                 closed=self._core.closed,
             )
         return self._state_cache
+
+    def committed_state(self) -> PackedReservoirState:
+        """Materialize the state before all currently pending transactions."""
+
+        (
+            slots,
+            rng_counter,
+            offered,
+            emitted,
+            peak_occupancy,
+            closed,
+        ) = self._core.committed_snapshot()
+        return PackedReservoirState(
+            algorithm=PACKED_RESERVOIR_ALGORITHM,
+            seed=self.seed,
+            epoch=self.epoch,
+            stream_key=self.stream_key,
+            capacity=self.capacity,
+            slots_le=slots.astype("<u8", copy=False).tobytes(),
+            rng_counter=int(rng_counter),
+            offered=int(offered),
+            emitted=int(emitted),
+            peak_occupancy=int(peak_occupancy),
+            closed=bool(closed),
+        )
 
     def restore(self, state: PackedReservoirState) -> None:
         state = PackedReservoirState(
