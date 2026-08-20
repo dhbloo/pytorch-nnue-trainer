@@ -248,7 +248,7 @@ class DeviceLoaderWrapper:
 
 
 class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
-    """Device placement with opt-in source-wait and copy-launch metrics."""
+    """Device placement with source-wait and copy-launch measurements."""
 
     def __init__(self, dataloader, device, pipeline_stats, non_blocking=True):
         super().__init__(dataloader, device, non_blocking=non_blocking)
@@ -259,7 +259,6 @@ class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
         from accelerate.utils import send_to_device
         from dataclasses import replace
         from dataset.stream import BatchEnvelope
-        from dataset.telemetry import tensor_bytes
 
         iterator = iter(self.dataloader)
         while True:
@@ -274,7 +273,6 @@ class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
             transfer_start = time.perf_counter_ns()
             if isinstance(batch, BatchEnvelope):
                 converted = default_convert(batch.data)
-                byte_count = tensor_bytes(converted) + tensor_bytes(batch.is_real)
                 batch = replace(
                     batch,
                     data=send_to_device(
@@ -289,7 +287,6 @@ class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
                     ),
                 )
             else:
-                byte_count = tensor_bytes(batch)
                 batch = send_to_device(
                     batch,
                     self.device,
@@ -297,7 +294,6 @@ class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
                 )
             self.pipeline_stats.record_h2d(
                 time.perf_counter_ns() - transfer_start,
-                byte_count,
             )
             yield batch
 
@@ -442,9 +438,11 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
                     batch,
                     data=device_data,
                     is_real=device_mask,
+                    host_memory_leases=(),
                 ),
                 (converted, converted_mask),
                 tuple(cuda_tensors),
+                tuple(batch.host_memory_leases),
             )
         device_batch = _move_to_device_and_collect(
             batch,
@@ -456,6 +454,7 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
             device_batch,
             batch,
             tuple(cuda_tensors),
+            (),
         )
 
     @staticmethod
@@ -503,32 +502,29 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
         retired_hosts = deque()
         timing_records = deque()
         exhausted = False
+        active_device_batch = None
+        active_host_leases = ()
         stats = self.pipeline_stats
-        if stats is not None:
-            from dataset.stream import BatchEnvelope
-            from dataset.telemetry import tensor_bytes
-
-            def batch_bytes(batch):
-                if isinstance(batch, BatchEnvelope):
-                    return tensor_bytes(batch.data) + tensor_bytes(batch.is_real)
-                return tensor_bytes(batch)
 
         def flush_completed_timings():
             if stats is None:
                 return
-            while timing_records and timing_records[0][3].query():
-                copy_start, copy_end, wait_start, wait_end = timing_records.popleft()
-                stats.record_cuda_prefetch(
-                    copy_start.elapsed_time(copy_end),
+            while timing_records and timing_records[0][1].query():
+                wait_start, wait_end = timing_records.popleft()
+                stats.record_cuda_exposed_wait(
                     wait_start.elapsed_time(wait_end),
                 )
 
         def release_completed_hosts():
             while retired_hosts and retired_hosts[0][0].query():
-                retired_hosts.popleft()
+                _event, _owner, leases = retired_hosts.popleft()
+                for lease in leases:
+                    lease.release()
             if len(retired_hosts) >= self.prefetch_batches + 1:
                 retired_hosts[0][0].synchronize()
-                retired_hosts.popleft()
+                _event, _owner, leases = retired_hosts.popleft()
+                for lease in leases:
+                    lease.release()
 
         def enqueue_one():
             nonlocal exhausted
@@ -544,37 +540,46 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
                 stats.record_source_wait(
                     time.perf_counter_ns() - wait_start_ns
                 )
-                byte_count = batch_bytes(host_batch)
                 launch_start_ns = time.perf_counter_ns()
-            with torch.cuda.stream(prefetch_stream):
-                copy_start = (
-                    torch.cuda.Event(enable_timing=True)
-                    if stats is not None
-                    else None
+            device_batch = None
+            host_leases = ()
+            try:
+                with torch.cuda.stream(prefetch_stream):
+                    (
+                        device_batch,
+                        transfer_owner,
+                        cuda_tensors,
+                        host_leases,
+                    ) = self._move_batch(
+                        host_batch,
+                        self.device,
+                        self.non_blocking,
+                    )
+                    copy_end = torch.cuda.Event()
+                    copy_end.record(prefetch_stream)
+                if stats is not None:
+                    stats.record_h2d(
+                        time.perf_counter_ns() - launch_start_ns,
+                    )
+                pending.append(
+                    (
+                        device_batch,
+                        copy_end,
+                        transfer_owner,
+                        cuda_tensors,
+                        host_leases,
+                    )
                 )
-                if copy_start is not None:
-                    copy_start.record(prefetch_stream)
-                device_batch, transfer_owner, cuda_tensors = self._move_batch(
-                    host_batch,
-                    self.device,
-                    self.non_blocking,
-                )
-                copy_end = torch.cuda.Event(enable_timing=stats is not None)
-                copy_end.record(prefetch_stream)
-            if stats is not None:
-                stats.record_h2d(
-                    time.perf_counter_ns() - launch_start_ns,
-                    byte_count,
-                )
-            pending.append(
-                (
-                    device_batch,
-                    copy_start,
-                    copy_end,
-                    transfer_owner,
-                    cuda_tensors,
-                )
-            )
+            except BaseException:
+                from dataset.stream import BatchEnvelope
+
+                if isinstance(device_batch, BatchEnvelope):
+                    device_batch.release_memory_leases()
+                elif isinstance(host_batch, BatchEnvelope):
+                    host_batch.release_memory_leases()
+                for lease in host_leases:
+                    lease.release()
+                raise
             # Do not probe a transactional source beyond its terminal envelope.
             # Leaving its generator suspended lets close() roll back queued but
             # uncommitted lookahead, including at the exact end of an epoch.
@@ -595,11 +600,13 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
                 release_completed_hosts()
                 (
                     device_batch,
-                    copy_start,
                     copy_end,
                     transfer_owner,
                     cuda_tensors,
+                    host_leases,
                 ) = pending.popleft()
+                active_device_batch = device_batch
+                active_host_leases = host_leases
                 current_stream = torch.cuda.current_stream(self.device)
                 if stats is not None:
                     wait_start = torch.cuda.Event(enable_timing=True)
@@ -609,12 +616,15 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
                 if stats is not None:
                     wait_end.record(current_stream)
                     timing_records.append(
-                        (copy_start, copy_end, wait_start, wait_end)
+                        (wait_start, wait_end)
                     )
                     while len(timing_records) > self.MAX_PENDING_TIMINGS:
                         timing_records.popleft()
                 self._record_tensor_streams(cuda_tensors, current_stream)
-                retired_hosts.append((copy_end, transfer_owner))
+                retired_hosts.append(
+                    (copy_end, transfer_owner, active_host_leases)
+                )
+                active_host_leases = ()
                 self.prefetch_audit["max_retired_host_batches"] = max(
                     self.prefetch_audit["max_retired_host_batches"],
                     len(retired_hosts),
@@ -623,9 +633,34 @@ class CudaPrefetchLoaderWrapper(DeviceLoaderWrapper):
                 while len(pending) < self.prefetch_batches and enqueue_one():
                     pass
                 yield device_batch
+                active_device_batch = None
             flush_completed_timings()
         finally:
-            self._synchronize_and_close(prefetch_stream, source)
+            try:
+                self._synchronize_and_close(prefetch_stream, source)
+            finally:
+                from dataset.stream import BatchEnvelope
+
+                if isinstance(active_device_batch, BatchEnvelope):
+                    active_device_batch.release_memory_leases()
+                for lease in active_host_leases:
+                    lease.release()
+                while pending:
+                    (
+                        device_batch,
+                        _copy_end,
+                        _transfer_owner,
+                        _cuda_tensors,
+                        host_leases,
+                    ) = pending.popleft()
+                    if isinstance(device_batch, BatchEnvelope):
+                        device_batch.release_memory_leases()
+                    for lease in host_leases:
+                        lease.release()
+                while retired_hosts:
+                    _event, _owner, leases = retired_hosts.popleft()
+                    for lease in leases:
+                        lease.release()
 
 
 class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
@@ -658,9 +693,19 @@ class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
         self._copy_stream = torch.cuda.Stream(device=self.device)
         self._pipeline_stats = pipeline_stats
         self._slots = None
-        self._schema = None
+        self._data_keys = None
+        self._has_mask = False
+        self._slot_tensors = None
+        self._slot_data = None
+        self._slot_mask = None
 
-    def _resolve_schema(self, data, mask):
+    @staticmethod
+    def _resolve_schema(data, mask):
+        if not (
+            type(data) is dict
+            and all(isinstance(value, torch.Tensor) for value in data.values())
+        ):
+            data = default_convert(data)
         if not (type(data) is dict and all(
             isinstance(value, torch.Tensor) for value in data.values()
         )):
@@ -673,6 +718,43 @@ class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
         return tuple(
             (name, tuple(t.shape), t.dtype) for name, t in entries
         ), entries
+
+    def _resolve_batch_tensors(self, data, mask):
+        is_tensor_dict = (
+            type(data) is dict
+            and all(isinstance(value, torch.Tensor) for value in data.values())
+        )
+        if not is_tensor_dict:
+            data = default_convert(data)
+            if not (
+                type(data) is dict
+                and all(isinstance(value, torch.Tensor) for value in data.values())
+            ):
+                raise RuntimeError(
+                    "batch keys or value types changed after static-slot initialization"
+                )
+        if len(data) != len(self._data_keys):
+            raise RuntimeError(
+                "batch keys or value types changed after static-slot initialization"
+            )
+        try:
+            tensors = tuple(data[name] for name in self._data_keys)
+        except KeyError as exc:
+            raise RuntimeError(
+                "batch keys or value types changed after static-slot initialization"
+            ) from exc
+        if (mask is not None) != self._has_mask:
+            raise RuntimeError("batch mask presence changed after initialization")
+        if self._has_mask:
+            tensors += (torch.as_tensor(mask),)
+        if any(
+            tensor.shape != slot.shape or tensor.dtype != slot.dtype
+            for slot, tensor in zip(self._slot_tensors, tensors)
+        ):
+            raise RuntimeError(
+                "batch shapes or dtypes changed after static-slot initialization"
+            )
+        return tensors
 
     def _build_slots(self, entries):
         slots = {}
@@ -689,8 +771,6 @@ class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
         from dataclasses import replace
 
         from dataset.stream import BatchEnvelope
-        from dataset.telemetry import tensor_bytes
-
         source = iter(self.dataloader)
         compute_stream = torch.cuda.current_stream(self.device)
         # Ordered behind whatever is enqueued on the compute stream right now:
@@ -713,38 +793,45 @@ class StaticSlotLoaderWrapper(DeviceLoaderWrapper):
                     data, mask = host_batch.data, host_batch.is_real
                 else:
                     data, mask = host_batch, None
-                schema, entries = self._resolve_schema(data, mask)
                 if self._slots is None:
-                    self._schema = schema
+                    schema, entries = self._resolve_schema(data, mask)
                     self._slots = self._build_slots(entries)
-                elif schema != self._schema:
-                    raise RuntimeError(
-                        "batch schema changed mid-run; static input slots "
-                        "require constant keys/shapes/dtypes"
+                    self._has_mask = mask is not None
+                    data_entry_count = len(entries) - int(self._has_mask)
+                    self._data_keys = tuple(
+                        name for name, _tensor in entries[:data_entry_count]
                     )
+                    self._slot_data = {
+                        name: self._slots[name]
+                        for name in self._data_keys
+                    }
+                    self._slot_mask = self._slots.get("__is_real")
+                    self._slot_tensors = tuple(
+                        self._slots[name] for name, _shape, _dtype in schema
+                    )
+                    batch_tensors = tuple(tensor for _name, tensor in entries)
+                else:
+                    batch_tensors = self._resolve_batch_tensors(data, mask)
                 copy_start = time.perf_counter_ns()
                 with torch.cuda.stream(self._copy_stream):
                     self._copy_stream.wait_event(read_done)
-                    for name, tensor in entries:
-                        self._slots[name].copy_(tensor, non_blocking=self.non_blocking)
+                    for slot, tensor in zip(self._slot_tensors, batch_tensors):
+                        slot.copy_(tensor, non_blocking=self.non_blocking)
                     ready = torch.cuda.Event()
                     ready.record(self._copy_stream)
                 if self._pipeline_stats is not None:
                     self._pipeline_stats.record_h2d(
                         time.perf_counter_ns() - copy_start,
-                        tensor_bytes(dict(entries)),
                     )
                 compute_stream.wait_event(ready)
-                slot_data = {
-                    name: self._slots[name]
-                    for name, _shape, _dtype in schema
-                    if name != "__is_real"
-                }
-                slot_mask = self._slots.get("__is_real")
                 if isinstance(host_batch, BatchEnvelope):
-                    yield replace(host_batch, data=slot_data, is_real=slot_mask)
+                    yield replace(
+                        host_batch,
+                        data=self._slot_data,
+                        is_real=self._slot_mask,
+                    )
                 else:
-                    yield slot_data
+                    yield self._slot_data
                 # The consumer has enqueued this step's work by the time it
                 # asks for the next batch; the event lands behind forward and
                 # backward on the compute stream, so the next slot refill is
@@ -1020,6 +1107,20 @@ def build_data_loader(
         and capabilities.yields_batches
     )
     if built_in_stream:
+        adaptive_pipeline = getattr(dataset, "adaptive_pipeline", None)
+        if adaptive_pipeline is not None:
+            adaptive_conflicts = []
+            if shuffle_buffer_size is not None:
+                adaptive_conflicts.append("shuffle_buffer_size")
+            if "pin_memory" in kwargs:
+                adaptive_conflicts.append("pin_memory")
+            if adaptive_conflicts:
+                raise ValueError(
+                    "adaptive data pipeline rejects loader option(s): "
+                    + ", ".join(adaptive_conflicts)
+                    + "; configure shuffle_window_size on the dataset and let "
+                    "the adaptive runtime select pinning"
+                )
         forbidden = sorted(
             key
             for key in ("sampler", "batch_sampler", "generator", "worker_init_fn")
@@ -1221,10 +1322,10 @@ def cross_entropy_with_softlabel(
 
     if input.ndim > 1:
         # Cross-entropy Loss
-        input = input.view(input.shape[0], -1)
-        target = target.view(target.shape[0], -1)
+        input = torch.flatten(input, start_dim=1)
+        target = torch.flatten(target, start_dim=1)
         if weight is not None:
-            target = target * weight.view(weight.shape[0], -1)
+            target = target * torch.flatten(weight, start_dim=1)
 
         logprobs = F.log_softmax(input, dim=1)
         if focal_gamma > 0.0:

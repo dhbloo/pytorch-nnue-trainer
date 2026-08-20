@@ -4,7 +4,8 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from torch.utils.data.dataset import IterableDataset
 
-from .core import DatasetCapabilities
+from .core import DatasetCapabilities, PreparedPipelineBatch
+from .host_memory import HostMemoryBudget, HostMemoryCategory
 from .stream import BatchEnvelope
 
 
@@ -55,7 +56,12 @@ class SourceBatchDataset:
         finalize_batch=None,
         prefetch_workers: int = 0,
         prefetch_batches: int = 32,
+        prefetch_chunk_batches: int | None = None,
         finalize_in_prefetch: bool = False,
+        host_memory_budget: HostMemoryBudget | None = None,
+        output_batch_bytes: int = 0,
+        planner_token_bytes: int = 0,
+        output_is_pinned: bool = False,
     ):
         self.planner = planner
         self.source = source
@@ -64,10 +70,39 @@ class SourceBatchDataset:
             raise ValueError("prefetch_workers must be a non-negative integer")
         if type(prefetch_batches) is not int or prefetch_batches <= 0:
             raise ValueError("prefetch_batches must be a positive integer")
+        if prefetch_chunk_batches is not None and (
+            type(prefetch_chunk_batches) is not int
+            or prefetch_chunk_batches <= 0
+        ):
+            raise ValueError(
+                "prefetch_chunk_batches must be null or a positive integer"
+            )
+        if (
+            prefetch_chunk_batches is not None
+            and prefetch_chunk_batches > prefetch_batches
+        ):
+            raise ValueError(
+                "prefetch_chunk_batches cannot exceed prefetch_batches"
+            )
         if type(finalize_in_prefetch) is not bool:
             raise ValueError("finalize_in_prefetch must be a boolean")
+        if host_memory_budget is not None and not isinstance(
+            host_memory_budget, HostMemoryBudget
+        ):
+            raise TypeError("host_memory_budget must be a HostMemoryBudget or null")
+        for name, value in (
+            ("output_batch_bytes", output_batch_bytes),
+            ("planner_token_bytes", planner_token_bytes),
+        ):
+            if type(value) is not int or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        if type(output_is_pinned) is not bool:
+            raise ValueError("output_is_pinned must be a boolean")
+        composer = planner.pipeline_composer
         pipeline_prefetch_disabled = (
-            prefetch_workers > 0 and planner.pipeline_composer is not None
+            prefetch_workers > 0
+            and composer is not None
+            and not composer.is_parallel_stateless
         )
         effective_prefetch_workers = (
             0 if pipeline_prefetch_disabled else prefetch_workers
@@ -83,10 +118,111 @@ class SourceBatchDataset:
         )
         self.prefetch_workers = prefetch_workers
         self.prefetch_batches = prefetch_batches
+        self.prefetch_chunk_batches = prefetch_chunk_batches
         self._effective_prefetch_workers = effective_prefetch_workers
         self._finalize_in_prefetch = bool(
             finalize_in_prefetch and effective_prefetch_workers > 0
         )
+        self.host_memory_budget = host_memory_budget
+        self.output_batch_bytes = output_batch_bytes
+        self.planner_token_bytes = planner_token_bytes
+        self.output_is_pinned = output_is_pinned
+
+    @property
+    def active_prefetch_workers(self) -> int:
+        return self._effective_prefetch_workers
+
+    @property
+    def maximum_prefetch_workers(self) -> int:
+        return self._effective_prefetch_workers
+
+    @property
+    def active_prefetch_batches(self) -> int:
+        return self.prefetch_batches
+
+    @property
+    def active_prefetch_chunk_batches(self) -> int:
+        if self.prefetch_chunk_batches is not None:
+            return self.prefetch_chunk_batches
+        return max(
+            1,
+            self.active_prefetch_batches
+            // max(2, self.active_prefetch_workers),
+        )
+
+    def _try_reserve_batch_memory(self):
+        budget = self.host_memory_budget
+        if budget is None:
+            return ()
+        reservations = []
+        try:
+            if self.planner_token_bytes:
+                reservation = budget.try_reserve(
+                    HostMemoryCategory.SEMANTIC_FIXED,
+                    self.planner_token_bytes,
+                    label="queued planner token",
+                )
+                if reservation is None:
+                    return None
+                reservations.append(reservation)
+            if self.output_batch_bytes:
+                reservation = budget.try_reserve(
+                    (
+                        HostMemoryCategory.PINNED
+                        if self.output_is_pinned
+                        else HostMemoryCategory.READY_PAGEABLE
+                    ),
+                    self.output_batch_bytes,
+                    label="queued materialized batch",
+                )
+                if reservation is None:
+                    for held in reservations:
+                        held.release()
+                    return None
+                reservations.append(reservation)
+            return tuple(reservations)
+        except BaseException:
+            for reservation in reservations:
+                reservation.release()
+            raise
+
+    @staticmethod
+    def _release_reservations(reservations) -> None:
+        for reservation in reservations:
+            reservation.release()
+
+    @staticmethod
+    def _lease_reservations(reservations):
+        leases = []
+        try:
+            for reservation in reservations:
+                leases.append(reservation.acquire_lease())
+            for reservation in reservations:
+                reservation.retire()
+        except BaseException:
+            for lease in leases:
+                lease.release()
+            for reservation in reservations:
+                reservation.release()
+            raise
+        semantic = tuple(
+            lease
+            for lease in leases
+            if lease.category is HostMemoryCategory.SEMANTIC_FIXED
+        )
+        host = tuple(
+            lease
+            for lease in leases
+            if lease.category is not HostMemoryCategory.SEMANTIC_FIXED
+        )
+        return semantic, host
+
+    def _run_decode_batches(self, batches):
+        return self._decode_batches(batches)
+
+    @staticmethod
+    def _await_prefetch(future):
+        return future.result()
 
     def _decode_batch(self, batch):
         envelopes, mask = self.planner.local_slice(batch)
@@ -119,7 +255,9 @@ class SourceBatchDataset:
                     materialized, local_batches
                 )
             )
-            return self._finalize_prefetched(decoded)
+            return self._finalize_prefetched(
+                self._prepare_prefetched_pipelines(batches, decoded)
+            )
         if hasattr(self.source, "materialize_batches"):
             data_batches = tuple(self.source.materialize_batches(envelope_batches))
             if len(data_batches) != len(batches):
@@ -139,18 +277,56 @@ class SourceBatchDataset:
             )
             for data, (envelopes, mask) in zip(data_batches, local_batches)
         )
-        return self._finalize_prefetched(decoded)
+        return self._finalize_prefetched(
+            self._prepare_prefetched_pipelines(batches, decoded)
+        )
+
+    def _prepare_prefetched_pipelines(self, batches, decoded_batches):
+        composer = self.planner.pipeline_composer
+        if composer is None or not composer.is_parallel_stateless:
+            return decoded_batches
+        return tuple(
+            (
+                self.planner.prepare_parallel_pipeline_batch(
+                    batch,
+                    data,
+                    sample_keys,
+                ),
+                mask,
+                sample_keys,
+            )
+            for batch, (data, mask, sample_keys) in zip(batches, decoded_batches)
+        )
 
     def _finalize_prefetched(self, decoded_batches):
         if not self._finalize_in_prefetch:
             return decoded_batches
-        return tuple(
-            (self.finalize_batch(data), mask, sample_keys)
-            for data, mask, sample_keys in decoded_batches
-        )
+        finalized = []
+        for data, mask, sample_keys in decoded_batches:
+            if isinstance(data, PreparedPipelineBatch):
+                data = PreparedPipelineBatch(
+                    self.finalize_batch(data.data),
+                    data.composite_blob,
+                )
+            else:
+                data = self.finalize_batch(data)
+            finalized.append((data, mask, sample_keys))
+        return tuple(finalized)
 
     def _finalize(self, batch, token, decoded):
         data, mask, sample_keys = decoded
+        if isinstance(data, PreparedPipelineBatch):
+            if not self._finalize_in_prefetch:
+                data = PreparedPipelineBatch(
+                    self.finalize_batch(data.data),
+                    data.composite_blob,
+                )
+            data, token = self.planner.accept_parallel_pipeline_batch(
+                batch,
+                token,
+                data,
+            )
+            return data, token, mask, sample_keys
         if not self._finalize_in_prefetch:
             data = self.finalize_batch(data)
         data, token = self.planner.prepare_pipeline_batch(
@@ -181,19 +357,47 @@ class SourceBatchDataset:
                 return
             current = following
 
-    def _publish(self, batch, token, decoded):
-        data, token, mask, sample_keys = self._finalize(
-            batch,
+    def _publish(self, batch, token, decoded, reservations=()):
+        try:
+            data, token, mask, sample_keys = self._finalize(
+                batch,
+                token,
+                decoded,
+            )
+        except BaseException:
+            self._release_reservations(reservations)
+            raise
+        return self._publish_finalized(
+            data,
             token,
-            decoded,
+            mask,
+            sample_keys,
+            reservations,
         )
-        if self.planner.runtime_context.mode != "train":
-            self.planner.commit_batch(token)
+
+    def _publish_finalized(
+        self,
+        data,
+        token,
+        mask,
+        sample_keys,
+        reservations=(),
+    ):
+        semantic_leases, host_leases = self._lease_reservations(reservations)
+        try:
+            if self.planner.runtime_context.mode != "train":
+                self.planner.commit_batch(token)
+        except BaseException:
+            for lease in (*semantic_leases, *host_leases):
+                lease.release()
+            raise
         return BatchEnvelope(
             data=data,
             token=token,
             is_real=mask,
             sample_keys=sample_keys,
+            semantic_memory_leases=semantic_leases,
+            host_memory_leases=host_leases,
         )
 
     def _iter_synchronous(self):
@@ -205,21 +409,34 @@ class SourceBatchDataset:
             )
         while current is not None:
             batch, token = current
-            decoded = self._decode_batch(batch)
-            data, token, mask, sample_keys = self._finalize(
-                batch,
-                token,
-                decoded,
-            )
+            reservations = self._try_reserve_batch_memory()
+            if reservations is None:
+                raise RuntimeError(
+                    "host-data memory budget cannot admit one synchronous batch"
+                )
+            try:
+                decoded = self._decode_batch(batch)
+                data, token, mask, sample_keys = self._finalize(
+                    batch,
+                    token,
+                    decoded,
+                )
+            except BaseException:
+                self._release_reservations(reservations)
+                raise
             if batch.is_last:
                 following = None
             else:
                 following = self.planner.next_transactional_batch()
                 if following is None:
                     batch, token = self.planner.finalize_terminal_token(token)
-            if self.planner.runtime_context.mode != "train":
-                self.planner.commit_batch(token)
-            yield BatchEnvelope(data, token, mask, sample_keys)
+            yield self._publish_finalized(
+                data,
+                token,
+                mask,
+                sample_keys,
+                reservations,
+            )
             if batch.is_last:
                 return
             current = following
@@ -229,51 +446,107 @@ class SourceBatchDataset:
         pending = deque()
         pending_batches = 0
         exhausted = False
-        chunk_size = max(
-            1,
-            self.prefetch_batches // max(2, self._effective_prefetch_workers),
-        )
+        active_reservation_batches = deque()
 
         def submit_chunk(executor):
             nonlocal exhausted, pending_batches
-            if exhausted or pending_batches >= self.prefetch_batches:
-                return
+            limit = self.active_prefetch_batches
+            if exhausted or pending_batches >= limit:
+                return False
             items = []
-            capacity = self.prefetch_batches - pending_batches
-            for _ in range(min(chunk_size, capacity)):
+            reservation_batches = []
+            capacity = limit - pending_batches
+            chunk_size = min(self.active_prefetch_chunk_batches, capacity)
+            for _ in range(chunk_size):
+                reservations = self._try_reserve_batch_memory()
+                if reservations is None:
+                    break
                 try:
                     items.append(next(planned))
                 except StopIteration:
+                    self._release_reservations(reservations)
                     exhausted = True
                     break
+                except BaseException:
+                    self._release_reservations(reservations)
+                    for held in reservation_batches:
+                        self._release_reservations(held)
+                    raise
+                reservation_batches.append(reservations)
             if not items:
-                return
+                return False
+            try:
+                future = executor.submit(
+                    self._run_decode_batches,
+                    tuple(batch for batch, _ in items),
+                )
+            except BaseException:
+                for reservations in reservation_batches:
+                    self._release_reservations(reservations)
+                raise
             pending.append(
                 (
                     tuple(items),
-                    executor.submit(
-                        self._decode_batches,
-                        tuple(batch for batch, _ in items),
-                    ),
+                    future,
+                    tuple(reservation_batches),
                 )
             )
             pending_batches += len(items)
+            return True
 
-        with ThreadPoolExecutor(
-            max_workers=self._effective_prefetch_workers
-        ) as executor:
-            while pending_batches < self.prefetch_batches and not exhausted:
-                submit_chunk(executor)
+        try:
+            with ThreadPoolExecutor(
+                max_workers=self.maximum_prefetch_workers
+            ) as executor:
+                while pending_batches < self.active_prefetch_batches and not exhausted:
+                    if not submit_chunk(executor):
+                        break
+                if not pending and not exhausted:
+                    raise RuntimeError(
+                        "host-data memory budget cannot admit one prefetched batch"
+                    )
+                while pending:
+                    items, future, reservation_batches = pending.popleft()
+                    try:
+                        decoded_batches = self._await_prefetch(future)
+                    except BaseException:
+                        for reservations in reservation_batches:
+                            self._release_reservations(reservations)
+                        raise
+                    if len(decoded_batches) != len(items):
+                        for reservations in reservation_batches:
+                            self._release_reservations(reservations)
+                        raise RuntimeError("prefetch worker changed the batch count")
+                    active_reservation_batches.extend(reservation_batches)
+                    for (batch, token), decoded in zip(items, decoded_batches):
+                        reservations = active_reservation_batches.popleft()
+                        pending_batches -= 1
+                        envelope = self._publish(
+                            batch,
+                            token,
+                            decoded,
+                            reservations,
+                        )
+                        yield envelope
+                    while (
+                        pending_batches < self.active_prefetch_batches
+                        and not exhausted
+                    ):
+                        if not submit_chunk(executor):
+                            break
+                if not exhausted:
+                    raise RuntimeError(
+                        "host-data memory budget stalled the ordered prefetch queue"
+                    )
+        finally:
+            while active_reservation_batches:
+                self._release_reservations(
+                    active_reservation_batches.popleft()
+                )
             while pending:
-                items, future = pending.popleft()
-                decoded_batches = future.result()
-                if len(decoded_batches) != len(items):
-                    raise RuntimeError("prefetch worker changed the batch count")
-                for (batch, token), decoded in zip(items, decoded_batches):
-                    pending_batches -= 1
-                    yield self._publish(batch, token, decoded)
-                while pending_batches < self.prefetch_batches and not exhausted:
-                    submit_chunk(executor)
+                _items, _future, reservation_batches = pending.popleft()
+                for reservations in reservation_batches:
+                    self._release_reservations(reservations)
 
     def __iter__(self):
         if self.planner.finished:

@@ -7,6 +7,7 @@ from dataset.core import FieldSpec
 class LineEncodingPipeline(BasePipeline):
     pipeline_id = "line_encoding"
     schema_version = 1
+    parallel_stateless = True
     input_fields = (
         FieldSpec("board_input", True, "per_sample", (-2, -1), 0, "stack", ("b", "i", "u"), "plain"),
     )
@@ -33,6 +34,10 @@ class LineEncodingPipeline(BasePipeline):
 
     def signature_state(self):
         return {"line_length": self.line_length, "raw_code": self.raw_code}
+
+    def added_output_row_bytes(self, board_size):
+        height, width = board_size
+        return 16 * height * width + 8
 
     def process(self, data):
         from line_encoding_cpp import transform_board_to_line_encoding

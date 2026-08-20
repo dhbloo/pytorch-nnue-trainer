@@ -9,6 +9,7 @@ from .source_dataset import PlannedBatchDataset, SourceBatchDataset
 from .stream import reject_duplicate_physical_files
 
 
+@DATASETS.register("sparse_numpy")
 @DATASETS.register("iterative_sparse_numpy")
 class IterativeSparseNumpyDataset(PlannedBatchDataset):
     FILE_EXTS = [".npz"]

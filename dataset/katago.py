@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 import hashlib
-import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import get_worker_info
 from utils.data_utils import *
@@ -600,6 +600,11 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.batch_pipelines = tuple(batch_pipelines)
+        self._pipeline_composer = (
+            PipelineStateComposer(self.batch_pipelines)
+            if self.batch_pipelines
+            else None
+        )
         self.extra_kwargs = {
             "fixed_board_size": fixed_board_size,
             "has_pass_move": has_pass_move,
@@ -653,16 +658,11 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
             shuffle=self.shuffle,
             sample_rate=self.sample_rate,
         )
-        composer = (
-            PipelineStateComposer(self.batch_pipelines)
-            if self.batch_pipelines
-            else None
-        )
         self._partitioned_stream = DatasetPlanner(
             self._record_source,
             runtime_context,
             planner_config,
-            pipeline_composer=composer,
+            pipeline_composer=self._pipeline_composer,
         )
         return self._partitioned_stream
 
@@ -741,7 +741,7 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         prefetch_batches: int = 32,
         pin_memory: bool | None = None,
         observability=False,
-        autotune=False,
+        adaptive_pipeline=None,
         shuffle_window_size: int = 32768,
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
@@ -774,9 +774,90 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         self.prefetch_batches = prefetch_batches
         self.pin_memory = torch.cuda.is_available() if pin_memory is None else pin_memory
         self.observability = observability
-        self.autotune = autotune
+        self.adaptive_pipeline = adaptive_pipeline
+        if (
+            adaptive_pipeline is not None
+            and self._pipeline_composer is not None
+            and not self._pipeline_composer.is_parallel_stateless
+        ):
+            raise ValueError(
+                "adaptive_pipeline requires parallel-stateless batch pipelines"
+            )
         self.has_pass_move = self.extra_kwargs.get("has_pass_move", False)
         self._record_decoder = None
+        self._adaptive_pipeline_runtime = None
+        self._node_decoded_cache_catalog = None
+
+    def _node_decoded_cache_is_supported(self):
+        if self.adaptive_pipeline is None:
+            return False
+        if self.adaptive_pipeline.node_decoded_cache is None:
+            return False
+        if self.adaptive_pipeline.config.adaptation == "manual":
+            return False
+        return all(
+            self.extra_kwargs.get(option) is None
+            for option in (
+                "filter_stm",
+                "filter_condition",
+                "board_input_channels",
+                "stm_input_channel",
+                "value_target_channels",
+            )
+        )
+
+    def prepare_node_decoded_cache(self):
+        """Build this run's node-local immutable cache on the node leader."""
+
+        if not self._node_decoded_cache_is_supported():
+            return
+        paths = reject_duplicate_physical_files(self.file_list)
+        cache = self.adaptive_pipeline.node_decoded_cache
+        cache.prepare(
+            paths,
+            workers=self.adaptive_pipeline.resources.per_rank_cpu_limit,
+        )
+
+    def activate_node_decoded_cache(self):
+        """Install the collectively prepared source-to-mmap catalog."""
+
+        if not self._node_decoded_cache_is_supported():
+            return
+        paths = reject_duplicate_physical_files(self.file_list)
+        self._node_decoded_cache_catalog = (
+            self.adaptive_pipeline.node_decoded_cache.catalog(paths)
+        )
+
+    def node_decoded_cache_ready(self):
+        if not self._node_decoded_cache_is_supported():
+            return False
+        return self.adaptive_pipeline.node_decoded_cache.is_ready()
+
+    def set_node_decoded_cache_enabled(self, enabled):
+        """Apply one globally coordinated cache availability decision."""
+
+        if type(enabled) is not bool:
+            raise TypeError("node decoded-cache enablement must be a boolean")
+        if enabled:
+            self.activate_node_decoded_cache()
+            return
+        self._node_decoded_cache_catalog = None
+        cache = (
+            None
+            if self.adaptive_pipeline is None
+            else self.adaptive_pipeline.node_decoded_cache
+        )
+        if cache is not None:
+            cache.cleanup()
+
+    def cleanup_node_decoded_cache(self):
+        cache = (
+            None
+            if self.adaptive_pipeline is None
+            else self.adaptive_pipeline.node_decoded_cache
+        )
+        if cache is not None:
+            cache.cleanup()
 
     def _finalize_planned_batch(self, data):
         if self.pin_memory:
@@ -786,6 +867,22 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             }
         return data
 
+    def _adaptive_runtime_manifests(self, manifests):
+        if self._pipeline_composer is None:
+            return manifests
+        return [
+            {
+                **manifest,
+                "output_row_bytes": (
+                    manifest["output_row_bytes"]
+                    + self._pipeline_composer.added_output_row_bytes(
+                        manifest["board_size"]
+                    )
+                ),
+            }
+            for manifest in manifests
+        ]
+
     def _build_partitioned_stream(self):
         runtime_context = getattr(self, "runtime_context", None)
         if runtime_context is None:
@@ -793,16 +890,23 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                 "batched_processed_katago_numpy requires a DatasetRuntimeContext"
             )
         paths = reject_duplicate_physical_files(self.file_list)
-        telemetry_enabled = any(
-            value is not None and value is not False
-            for value in (self.observability, self.autotune)
+        adaptive_enabled = self.adaptive_pipeline is not None
+        if adaptive_enabled:
+            from .pipeline_runtime import AdaptivePipelineRuntimeSpec
+
+            if not isinstance(
+                self.adaptive_pipeline,
+                AdaptivePipelineRuntimeSpec,
+            ):
+                raise TypeError(
+                    "adaptive_pipeline must be AdaptivePipelineRuntimeSpec"
+                )
+        telemetry_enabled = adaptive_enabled or (
+            self.observability is not None and self.observability is not False
         )
         stats = None
-        observability_config = None
-        autotune_config = None
         if telemetry_enabled:
             from .telemetry import (
-                PipelineAutotuneConfig,
                 PipelineObservabilityConfig,
                 PipelineStats,
             )
@@ -810,35 +914,9 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             observability_config = PipelineObservabilityConfig.parse(
                 self.observability
             )
-            autotune_config = PipelineAutotuneConfig.parse(self.autotune)
-            telemetry_enabled = observability_config.enabled or autotune_config.enabled
+            telemetry_enabled = adaptive_enabled or observability_config.enabled
             if telemetry_enabled:
                 stats = PipelineStats()
-            if autotune_config.enabled:
-                if self.prefetch_threads <= 0:
-                    raise ValueError(
-                        "pipeline autotuning requires prefetch_threads to be positive"
-                    )
-                if self.batch_pipelines:
-                    raise ValueError(
-                        "pipeline autotuning does not support stateful batch pipelines"
-                    )
-                if (
-                    autotune_config.respect_explicit
-                    and getattr(self, "_explicit_prefetch_threads", False)
-                    and self.prefetch_threads > autotune_config.max_prefetch_threads
-                ):
-                    raise ValueError(
-                        "explicit prefetch_threads exceeds autotune.max_prefetch_threads"
-                    )
-                if (
-                    autotune_config.respect_explicit
-                    and getattr(self, "_explicit_prefetch_batches", False)
-                    and self.prefetch_batches > autotune_config.max_prefetch_batches
-                ):
-                    raise ValueError(
-                        "explicit prefetch_batches exceeds autotune.max_prefetch_batches"
-                    )
         decoder_kwargs, symmetry, planner_config = self._processed_stream_options()
         decoder_cls = ProcessedNpzDecoder
         if telemetry_enabled:
@@ -853,32 +931,92 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             apply_symmetry=symmetry,
             **decoder_kwargs,
         )
-        # On one process, two workers overlap NPZ loading, filtering, and file
-        # identity hashing. Keep distributed startup serialized per rank to
-        # avoid multiplying storage I/O.
-        manifest_workers = min(
-            2 if runtime_context.world_size == 1 else 1,
-            self.prefetch_threads,
-            len(paths),
-        )
-        manifest_start = time.perf_counter_ns() if telemetry_enabled else None
-        manifests = self._inspect_processed_manifests(
-            self._record_decoder,
-            paths,
-            manifest_workers,
-        )
-        if telemetry_enabled:
-            stats.record_manifest(
-                time.perf_counter_ns() - manifest_start,
-                len(manifests),
-                sum(int(manifest["logical_row_count"]) for manifest in manifests),
+        if self._node_decoded_cache_catalog is not None:
+            self._record_decoder.configure_mapped_shards(
+                self._node_decoded_cache_catalog
             )
-        self._install_processed_planner(
-            runtime_context,
-            self._record_decoder,
-            manifests,
-            planner_config,
+        bootstrap_memory_budget = None
+        if adaptive_enabled:
+            from .host_memory import HostMemoryBudget
+
+            bootstrap_memory_budget = HostMemoryBudget(
+                self.adaptive_pipeline.resources.per_rank_host_budget_bytes
+            )
+            self._record_decoder.configure_cache(
+                entries=1,
+                byte_capacity=bootstrap_memory_budget.total_bytes,
+                host_memory_budget=bootstrap_memory_budget,
+                file_size_catalog=(),
+            )
+        # On one process, two workers overlap NPZ loading, filtering, and file
+        # identity hashing. Adaptive inspection stays serial because transformed
+        # files share the same one-file bootstrap hard-memory allowance.
+        manifest_workers = (
+            1
+            if adaptive_enabled
+            else min(
+                2 if runtime_context.world_size == 1 else 1,
+                self.prefetch_threads,
+                len(paths),
+            )
         )
+        try:
+            manifests = self._inspect_processed_manifests(
+                self._record_decoder,
+                paths,
+                manifest_workers,
+            )
+        except BaseException:
+            if adaptive_enabled:
+                self._record_decoder.close()
+            raise
+        adaptive_runtime = None
+        if adaptive_enabled:
+            from .pipeline_runtime import AdaptivePipelineRuntime
+
+            try:
+                adaptive_runtime = AdaptivePipelineRuntime(
+                    self.adaptive_pipeline,
+                    self._adaptive_runtime_manifests(manifests),
+                    local_batch_size=runtime_context.local_batch_size,
+                    global_batch_size=runtime_context.global_batch_size,
+                    shuffle=planner_config.shuffle,
+                    shuffle_window_size=planner_config.shuffle_buffer_size,
+                    memory_budget=bootstrap_memory_budget,
+                    shared_decoded_cache=(
+                        self._node_decoded_cache_catalog is not None
+                    ),
+                )
+                settings = adaptive_runtime.settings
+                self.pin_memory = settings.pin_memory
+                self._record_decoder.configure_cache(
+                    entries=max(1, len(manifests)),
+                    byte_capacity=settings.decoded_cache_bytes,
+                    host_memory_budget=adaptive_runtime.memory_budget,
+                    file_size_catalog=manifests,
+                )
+                adaptive_runtime.reserve_semantic_floor()
+            except BaseException:
+                try:
+                    self._record_decoder.close()
+                finally:
+                    if adaptive_runtime is not None:
+                        adaptive_runtime.close()
+                raise
+        try:
+            self._install_processed_planner(
+                runtime_context,
+                self._record_decoder,
+                manifests,
+                planner_config,
+            )
+        except BaseException:
+            if adaptive_runtime is not None:
+                try:
+                    self._record_decoder.close()
+                finally:
+                    adaptive_runtime.close()
+            raise
         adapter_cls = SourceBatchDataset
         adapter_kwargs = {}
         if telemetry_enabled:
@@ -886,76 +1024,55 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
 
             adapter_cls = ObservedSourceBatchDataset
             adapter_kwargs["pipeline_stats"] = stats
-        if autotune_config is not None and autotune_config.enabled:
-            from .telemetry import PipelineAutotuner, build_tuning_keys
-
-            pipeline_signatures = [
-                pipeline.signature_state() for pipeline in self.batch_pipelines
-            ]
-            exact_key, compatible_key = build_tuning_keys(
-                source_manifest=self._record_source.manifest_state(),
-                batch_size=runtime_context.local_batch_size,
-                world_size=runtime_context.world_size,
-                pin_memory=self.pin_memory,
-                pipeline_signatures=pipeline_signatures,
-                cache_budget_bytes=autotune_config.host_cache_budget_bytes,
-                tuning_contract={
-                    "initial_prefetch_threads": self.prefetch_threads,
-                    "initial_prefetch_batches": self.prefetch_batches,
-                    "max_prefetch_threads": autotune_config.max_prefetch_threads,
-                    "max_prefetch_batches": autotune_config.max_prefetch_batches,
-                    "cuda_prefetch_batches": int(
-                        getattr(self, "_cuda_prefetch_batches", 0)
-                    ),
-                    "respect_explicit": autotune_config.respect_explicit,
-                    "explicit_prefetch_threads": getattr(
-                        self, "_explicit_prefetch_threads", False
-                    ),
-                    "explicit_prefetch_batches": getattr(
-                        self, "_explicit_prefetch_batches", False
-                    ),
-                },
-            )
-            locked = set()
-            if autotune_config.respect_explicit:
-                if getattr(self, "_explicit_prefetch_threads", False):
-                    locked.add("prefetch_threads")
-                if getattr(self, "_explicit_prefetch_batches", False):
-                    locked.add("prefetch_batches")
-            controller = PipelineAutotuner(
-                autotune_config,
-                initial_workers=max(1, self.prefetch_threads),
-                initial_prefetch_batches=self.prefetch_batches,
-                initial_cache_entries=self._record_decoder._array_cache_capacity,
-                initial_cache_bytes=self._record_decoder._array_cache_byte_capacity,
-                exact_key=exact_key,
-                compatible_key=compatible_key,
-                locked_options=locked,
-            )
-            self._record_decoder.configure_cache(
-                entries=controller.settings["cache_entries"],
-                byte_capacity=controller.settings["cache_bytes"],
-            )
-            adapter_kwargs.update(
-                {
-                    "autotuner": controller,
-                    "maximum_prefetch_workers": autotune_config.max_prefetch_threads,
-                }
-            )
-            effective_workers = controller.settings["prefetch_threads"]
-            effective_batches = controller.settings["prefetch_batches"]
+        if adaptive_runtime is not None:
+            settings = adaptive_runtime.settings
+            adapter_kwargs["adaptive_runtime"] = adaptive_runtime
+            effective_workers = settings.decode_workers
+            effective_batches = settings.ready_queue_batches
+            effective_chunk_batches = settings.decode_chunk_batches
         else:
             effective_workers = self.prefetch_threads
             effective_batches = self.prefetch_batches
-        self._planned_decoder = adapter_cls(
-            self._partitioned_stream,
-            self._record_source,
-            finalize_batch=self._finalize_planned_batch,
-            prefetch_workers=effective_workers,
-            prefetch_batches=effective_batches,
-            finalize_in_prefetch=True,
-            **adapter_kwargs,
-        )
+            effective_chunk_batches = None
+        try:
+            self._planned_decoder = adapter_cls(
+                self._partitioned_stream,
+                self._record_source,
+                finalize_batch=self._finalize_planned_batch,
+                prefetch_workers=effective_workers,
+                prefetch_batches=effective_batches,
+                prefetch_chunk_batches=effective_chunk_batches,
+                finalize_in_prefetch=True,
+                host_memory_budget=(
+                    None
+                    if adaptive_runtime is None
+                    else adaptive_runtime.memory_budget
+                ),
+                output_batch_bytes=(
+                    0
+                    if adaptive_runtime is None
+                    else adaptive_runtime.output_batch_bytes
+                ),
+                planner_token_bytes=(
+                    0
+                    if adaptive_runtime is None
+                    else adaptive_runtime.planner_token_bytes
+                ),
+                output_is_pinned=(
+                    False
+                    if adaptive_runtime is None
+                    else adaptive_runtime.settings.pin_memory
+                ),
+                **adapter_kwargs,
+            )
+        except BaseException:
+            if adaptive_runtime is not None:
+                try:
+                    self._record_decoder.close()
+                finally:
+                    adaptive_runtime.close()
+            raise
+        self._adaptive_pipeline_runtime = adaptive_runtime
         if telemetry_enabled:
             self.pipeline_stats = stats
         return self._partitioned_stream
@@ -963,16 +1080,46 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
     def pipeline_metrics_snapshot(self):
         if not hasattr(self._planned_decoder, "pipeline_metrics_snapshot"):
             return None
-        return self._planned_decoder.pipeline_metrics_snapshot()
+        metrics = self._planned_decoder.pipeline_metrics_snapshot()
+        runtime = self._adaptive_pipeline_runtime
+        if runtime is not None and metrics is not None:
+            memory = runtime.memory_snapshot()
+            total_bytes = memory["total_bytes"]
+            metrics = replace(
+                metrics,
+                host_memory_used_fraction=memory["used_bytes"] / total_bytes,
+                host_memory_high_water_fraction=(
+                    memory["high_water_bytes"] / total_bytes
+                ),
+                host_memory_backpressure_events=memory["backpressure_events"],
+            )
+        return metrics
 
-    def attach_pipeline_run_dir(self, rundir):
-        if hasattr(self._planned_decoder, "attach_pipeline_run_dir"):
-            self._planned_decoder.attach_pipeline_run_dir(rundir)
+    def close(self):
+        decoder = self._record_decoder
+        runtime = self._adaptive_pipeline_runtime
+        self._adaptive_pipeline_runtime = None
+        try:
+            if decoder is not None and hasattr(decoder, "close"):
+                decoder.close()
+        finally:
+            if runtime is not None:
+                runtime.close()
 
-    def pipeline_tuning_update(self, metrics, iteration):
+    def pipeline_tuning_update(
+        self,
+        metrics,
+        iteration,
+        *,
+        epoch_changed=False,
+    ):
         if not hasattr(self._planned_decoder, "pipeline_tuning_update"):
             return None
-        return self._planned_decoder.pipeline_tuning_update(metrics, iteration)
+        return self._planned_decoder.pipeline_tuning_update(
+            metrics,
+            iteration,
+            epoch_changed=epoch_changed,
+        )
 
     def pipeline_tuning_state_dict(self):
         if not hasattr(self._planned_decoder, "pipeline_tuning_state_dict"):
@@ -982,7 +1129,7 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
     def load_pipeline_tuning_state_dict(self, state):
         if not hasattr(self._planned_decoder, "load_pipeline_tuning_state_dict"):
             if state is not None:
-                raise ValueError("pipeline autotuning is disabled")
+                raise ValueError("adaptive data pipeline is disabled")
             return
         self._planned_decoder.load_pipeline_tuning_state_dict(state)
 

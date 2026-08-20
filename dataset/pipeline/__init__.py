@@ -16,9 +16,15 @@ class BasePipeline(ABC):
     schema_version = 1
     input_fields = ()
     output_fields = ()
+    parallel_stateless = False
 
     def signature_state(self) -> dict:
         raise TypeError(f"opaque pipeline {type(self).__name__} has no signature_state")
+
+    def added_output_row_bytes(self, board_size: tuple[int, int]) -> int:
+        raise TypeError(
+            f"pipeline {type(self).__name__} does not describe its output size"
+        )
 
     @abstractmethod
     def process(self, data: dict) -> dict:
@@ -121,6 +127,18 @@ def build_data_pipeline(pipeline_args) -> list[BasePipeline]:
             raise ValueError(f"unknown dataset pipeline {pipeline_type!r}")
         pipelines.append(PIPELINES[pipeline_type](**pipeline_kwargs))
     return pipelines
+
+
+def supports_parallel_stateless_pipeline(pipeline_args) -> bool:
+    """Return whether configured batch transforms may run in decode workers."""
+    if not pipeline_args:
+        return True
+    for pipeline_type in pipeline_args:
+        if pipeline_type not in PIPELINES:
+            raise ValueError(f"unknown dataset pipeline {pipeline_type!r}")
+        if getattr(PIPELINES[pipeline_type], "parallel_stateless", False) is not True:
+            return False
+    return True
 
 
 def warp_dataset_with_pipeline(dataset, pipeline_args):

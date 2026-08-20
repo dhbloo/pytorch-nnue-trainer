@@ -63,6 +63,8 @@ class BatchEnvelope:
     token: object
     is_real: np.ndarray
     sample_keys: Sequence
+    semantic_memory_leases: tuple = ()
+    host_memory_leases: tuple = ()
 
     def __getitem__(self, key):
         return self.data[key]
@@ -78,6 +80,12 @@ class BatchEnvelope:
 
     def keys(self):
         return self.data.keys()
+
+    def release_memory_leases(self) -> None:
+        """Release all attached logical host-memory charges idempotently."""
+
+        for lease in (*self.semantic_memory_leases, *self.host_memory_leases):
+            lease.release()
 
 
 def _cursor_digest(epoch: int, batch_index: int) -> str:

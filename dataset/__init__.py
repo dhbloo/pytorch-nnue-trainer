@@ -364,6 +364,7 @@ def build_dataset(
     fixed_board_size: None | int | tuple[int, int] = None,
     shuffle: bool=False,
     pipeline_args: None | dict = None,
+    adaptive_pipeline=None,
     **kwargs,
 ) -> Dataset | IterableDataset:
     if not isinstance(runtime_context, DatasetRuntimeContext):
@@ -371,10 +372,28 @@ def build_dataset(
     if dataset_type not in DATASETS:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     dataset_cls = DATASETS[dataset_type]
+    if (
+        adaptive_pipeline is not None
+        and dataset_type != "batched_processed_katago_numpy"
+    ):
+        raise ValueError(
+            "adaptive_pipeline currently supports only "
+            "batched_processed_katago_numpy"
+        )
     explicit_shuffle_window_size = "shuffle_window_size" in kwargs
     explicit_pin_memory = "pin_memory" in kwargs
-    explicit_prefetch_threads = "prefetch_threads" in kwargs
-    explicit_prefetch_batches = "prefetch_batches" in kwargs
+    if adaptive_pipeline is not None:
+        legacy_pipeline_options = {
+            "prefetch_threads",
+            "prefetch_batches",
+            "pin_memory",
+        }
+        conflicts = sorted(legacy_pipeline_options.intersection(kwargs))
+        if conflicts:
+            raise ValueError(
+                "adaptive_pipeline cannot be combined with legacy option(s): "
+                + ", ".join(conflicts)
+            )
 
     common_keys = {
         "rules", "boardsizes", "fixed_side_input", "fixed_board_size",
@@ -401,10 +420,14 @@ def build_dataset(
             "has_pass_move", "filter_stm", "filter_condition",
             "board_input_channels", "stm_input_channel", "value_target_channels",
             "prefetch_threads", "prefetch_batches", "pin_memory",
-            "observability", "autotune",
+            "observability",
             "shuffle_window_size", "shuffle_buffer_bytes", "steps_per_epoch",
         },
         "iterative_sparse_numpy": {
+            "drop_extra", "shuffle_window_size", "shuffle_buffer_bytes",
+            "steps_per_epoch",
+        },
+        "sparse_numpy": {
             "drop_extra", "shuffle_window_size", "shuffle_buffer_bytes",
             "steps_per_epoch",
         },
@@ -500,6 +523,14 @@ def build_dataset(
                 )
             kwargs["batch_pipelines"] = batch_pipelines
             pipeline_args = None
+    if adaptive_pipeline is not None:
+        from .pipeline_runtime import AdaptivePipelineRuntimeSpec
+
+        if not isinstance(adaptive_pipeline, AdaptivePipelineRuntimeSpec):
+            raise TypeError(
+                "adaptive_pipeline must be AdaptivePipelineRuntimeSpec or null"
+            )
+        kwargs["adaptive_pipeline"] = adaptive_pipeline
     if dataset_cls in {MultiDataset, MultiIterativeDataset}:
         kwargs["runtime_context"] = runtime_context
 
@@ -515,8 +546,6 @@ def build_dataset(
     dataset.runtime_context = runtime_context
     dataset._explicit_shuffle_window_size = explicit_shuffle_window_size
     dataset._explicit_pin_memory = explicit_pin_memory
-    dataset._explicit_prefetch_threads = explicit_prefetch_threads
-    dataset._explicit_prefetch_batches = explicit_prefetch_batches
 
     if pipeline_args is not None:
         dataset = warp_dataset_with_pipeline(dataset, pipeline_args)

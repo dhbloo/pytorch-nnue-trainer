@@ -33,10 +33,6 @@ class SourceCapabilities:
     def random_access(self) -> bool:
         return self.access_mode == "random"
 
-    @property
-    def sequential_access(self) -> bool:
-        return self.access_mode == "sequential"
-
 
 @dataclass(frozen=True, slots=True)
 class RecordEnvelope:
