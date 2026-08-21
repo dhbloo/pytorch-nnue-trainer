@@ -12,13 +12,13 @@ This repository holds the training code for NNUE and various CNN models that can
 
 ### Setup
 
-Install all dependencies and build the C++ extensions with a single command from the repository root:
+Activate the target Python environment, then install the dependencies and C++ extensions into it from the repository root:
 
 ```bash
-pip install .
+python -m pip install .
 ```
 
-This installs the required packages (PyTorch 2.3+, accelerate, etc.) and compiles the pybind11 extensions used by the dataset pipelines: `line_encoding_cpp` (fast line encoding; necessary to train LineNet or export MixNet9 or later models) and `forbidden_point_cpp` (forbidden points for Renju rule training).
+This installs the required packages (PyTorch 2.3+, accelerate, etc.) and the pybind11 extensions used by the dataset pipelines: `dataset_planner_cpp`, `line_encoding_cpp`, and `forbidden_point_cpp`.
 
 Optional packages not installed by default:
 
