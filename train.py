@@ -8,7 +8,7 @@ import subprocess
 import torch
 
 from utils.file_utils import make_dir
-from utils.config_utils import parse_run_provenance
+from utils.config_utils import parse_optimizer_args, parse_run_provenance
 from trainer import build_trainer
 
 
@@ -96,7 +96,7 @@ def parse_args_and_init():
         help="Decay for EMA weight checkpoints",
     )
     parser.add("--optim_type", default="adamw", help="Optimizer type")
-    parser.add("--optim_args", type=yaml.safe_load, default={}, help="Extra optimizer arguments")
+    parser.add("--optim_args", type=parse_optimizer_args, default={}, help="Extra optimizer arguments")
     parser.add("--lr_scheduler_type", default="constant", help="LR scheduler type")
     parser.add("--lr_scheduler_args", type=yaml.safe_load, default={}, help="Extra LR scheduler arguments")
     parser.add("--loss_type", default="KL+KL", help="Loss type")

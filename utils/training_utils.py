@@ -142,6 +142,15 @@ def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
     muon_args.update(kwargs.pop("muon_args", {}))
     adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
     adamw_args.update(kwargs.pop("adamw_args", {}))
+    # ChainedOptimizer copies its scheduler-controlled LR to both children on
+    # every step. Reject a separate child LR instead of silently ignoring it.
+    for name, args in (("muon_args", muon_args), ("adamw_args", adamw_args)):
+        if "lr" in args and args["lr"] != lr:
+            raise ValueError(
+                f"muon-adamw uses one shared learning_rate ({lr}); "
+                f"optim_args.{name}.lr={args['lr']} would be overwritten on step. "
+                "Set learning_rate at the top level instead."
+            )
     # Muon routes biases and normalization parameters to AdamW.  ResNets contain
     # many such small tensors, which is exactly the case where torch's fused
     # kernel is pure fixed cost: its per-thread double-precision bias correction
