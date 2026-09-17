@@ -140,8 +140,11 @@ class MultiDataset(Dataset):
         raise IndexError("Index out of range")
 
 
+from .mixed_runtime import AdaptiveMultiMixin
+
+
 @DATASETS.register("iterative_multi")
-class MultiIterativeDataset(PlannedBatchDataset):
+class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
     """MultiDataset combines all iterative datasets into one dataset."""
 
     def __init__(
@@ -162,6 +165,7 @@ class MultiIterativeDataset(PlannedBatchDataset):
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
         runtime_context: DatasetRuntimeContext | None = None,
+        adaptive_pipeline=None,
     ) -> None:
         super().__init__()
         self.batch_pipelines = tuple(batch_pipelines)
@@ -197,6 +201,7 @@ class MultiIterativeDataset(PlannedBatchDataset):
         )
         if not self.datasets:
             raise ValueError("iterative_multi requires at least one child dataset")
+        self._init_adaptive_multi(adaptive_pipeline)
         # check if all datasets have __iter__ method
         if not all(hasattr(dataset, "__iter__") for dataset in self.datasets):
             raise TypeError("all iterative_multi children must be iterable")
@@ -293,6 +298,7 @@ class MultiIterativeDataset(PlannedBatchDataset):
         ]
         if child_paths:
             reject_duplicate_physical_files(child_paths)
+        self._configure_adaptive_children()
         child_sources = []
         for child, dataset in enumerate(self.datasets):
             if not hasattr(dataset, "_build_partitioned_stream"):
@@ -317,7 +323,9 @@ class MultiIterativeDataset(PlannedBatchDataset):
                 if planner is not None and hasattr(planner, "close"):
                     planner.close()
         weights = self._integer_ratio_weights()
-        self._record_source = CompositeRecordSource(
+        from .packed_composite import PackedCompositeRecordSource
+        source_cls = PackedCompositeRecordSource if self.adaptive_pipeline is not None else CompositeRecordSource
+        self._record_source = source_cls(
             child_sources,
             self.child_ids,
             weights,
@@ -343,6 +351,7 @@ class MultiIterativeDataset(PlannedBatchDataset):
             self._partitioned_stream,
             self._record_source,
         )
+        self._install_adaptive_multi()
         self.composite_audit = {
             "weights": weights,
             "schedule": self._record_source.schedule,
@@ -374,11 +383,11 @@ def build_dataset(
     dataset_cls = DATASETS[dataset_type]
     if (
         adaptive_pipeline is not None
-        and dataset_type != "batched_processed_katago_numpy"
+        and dataset_type not in {"batched_processed_katago_numpy", "iterative_multi"}
     ):
         raise ValueError(
             "adaptive_pipeline currently supports only "
-            "batched_processed_katago_numpy"
+            "batched_processed_katago_numpy or compatible iterative_multi"
         )
     explicit_shuffle_window_size = "shuffle_window_size" in kwargs
     explicit_pin_memory = "pin_memory" in kwargs

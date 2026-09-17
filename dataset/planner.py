@@ -29,6 +29,7 @@ from .source import RecordEnvelope, RecordSource, SOURCE_CURSOR_SCHEMA
 
 PLANNER_ALGORITHM = "dataset-planner-v2"
 SOURCE_CHUNK_SIZE = 1024
+PACKED_MIXED_SOURCE_CHUNK_SIZE = 16 * SOURCE_CHUNK_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,7 +79,7 @@ class PlannerState:
     source_cursor: dict
     reservoir: ReservoirState[RecordEnvelope] | PackedReservoirState
     ready: tuple[RecordEnvelope, ...] | PackedReadyState
-    shape_queues: tuple[tuple[int, tuple[RecordEnvelope, ...]], ...]
+    shape_queues: tuple[tuple[int, tuple[RecordEnvelope, ...] | PackedReadyState], ...]
     source_exhausted: bool
     finished: bool
 
@@ -92,6 +93,7 @@ class _PackedPlannerState:
     source_cycle: int
     source_cursor: dict
     ready: PackedReadySnapshot
+    shape_queues: tuple[tuple[int, PackedReadySnapshot], ...]
     source_exhausted: bool
     finished: bool
 
@@ -197,11 +199,19 @@ class DatasetPlanner:
             if isinstance(shape_codes, dict) and len(shape_codes) == 1
             else None
         )
-        self._packed_uniform = (
-            self._uniform_shape_code is not None
+        self._packed = (
+            (
+                self._uniform_shape_code is not None
+                or callable(getattr(source, "shape_codes_for_record_ids", None))
+            )
             and not self._rank_sharded
             and callable(getattr(source, "next_packed_records", None))
             and callable(getattr(source, "envelopes_from_record_ids", None))
+        )
+        self._packed_source_chunk_size = (
+            PACKED_MIXED_SOURCE_CHUNK_SIZE
+            if self._packed and self._uniform_shape_code is None
+            else SOURCE_CHUNK_SIZE
         )
         self._epoch = 0
         self._batch_index = 0
@@ -210,6 +220,7 @@ class DatasetPlanner:
         self._reservoir = None
         self._ready: deque[RecordEnvelope] = deque()
         self._packed_ready = PackedUInt64ReadyBuffer()
+        self._packed_shape_queues = {}
         self._shape_queues: dict[int, list[RecordEnvelope]] = {}
         self._source_exhausted = False
         self._finished = False
@@ -296,12 +307,13 @@ class DatasetPlanner:
         self._ready.clear()
         self._packed_ready.clear()
         self._shape_queues.clear()
+        self._packed_shape_queues.clear()
         self._source_exhausted = False
         self._finished = False
         self._pending_terminal_packed_state = None
 
     def _transaction_state(self) -> PlannerState | _PackedPlannerState:
-        if not self._packed_uniform:
+        if not self._packed:
             return self.state()
         return _PackedPlannerState(
             epoch=self._epoch,
@@ -309,6 +321,11 @@ class DatasetPlanner:
             source_cycle=self._source_cycle,
             source_cursor=self.source.save_cursor(self._source_cursor),
             ready=self._packed_ready.snapshot(),
+            shape_queues=tuple(
+                (shape, queue.snapshot())
+                for shape, queue in sorted(self._packed_shape_queues.items())
+                if queue
+            ),
             source_exhausted=self._source_exhausted,
             finished=self._finished,
         )
@@ -327,6 +344,11 @@ class DatasetPlanner:
         self._packed_ready.restore_snapshot(state.ready)
         self._ready.clear()
         self._shape_queues.clear()
+        self._packed_shape_queues.clear()
+        for shape, snapshot in state.shape_queues:
+            queue = PackedUInt64ReadyBuffer()
+            queue.restore_snapshot(snapshot)
+            self._packed_shape_queues[shape] = queue
         self._source_exhausted = state.source_exhausted
         self._finished = state.finished
 
@@ -346,7 +368,9 @@ class DatasetPlanner:
             source_cursor=state.source_cursor,
             reservoir=self._reservoir.committed_state(),
             ready=state.ready.state(),
-            shape_queues=(),
+            shape_queues=tuple(
+                (shape, queue.state()) for shape, queue in state.shape_queues
+            ),
             source_exhausted=state.source_exhausted,
             finished=state.finished,
         )
@@ -358,7 +382,7 @@ class DatasetPlanner:
             if source_cycle == 0
             else (self._manifest_digest, "source-cycle", source_cycle)
         )
-        if self._packed_uniform:
+        if self._packed:
             return PackedUInt64ShuffleReservoir(
                 capacity,
                 seed=self.runtime_context.seed,
@@ -374,7 +398,7 @@ class DatasetPlanner:
         )
 
     def _ready_count(self) -> int:
-        return len(self._packed_ready) if self._packed_uniform else len(self._ready)
+        return len(self._packed_ready) if self._packed else len(self._ready)
 
     def _clear_ready(self) -> None:
         self._packed_ready.clear()
@@ -411,6 +435,7 @@ class DatasetPlanner:
             self._reservoir.drain()
         self._clear_ready()
         self._shape_queues.clear()
+        self._packed_shape_queues.clear()
         self._source_exhausted = True
         self._finished = True
 
@@ -488,7 +513,7 @@ class DatasetPlanner:
         return self._ready.popleft() if self._ready else None
 
     def _refill_ready(self) -> None:
-        if self._packed_uniform:
+        if self._packed:
             self._refill_packed_ready()
             return
         while not self._ready and not self._source_exhausted:
@@ -530,7 +555,7 @@ class DatasetPlanner:
         while not self._packed_ready and not self._source_exhausted:
             block, self._source_cursor = self.source.next_packed_records(
                 self._source_cursor,
-                SOURCE_CHUNK_SIZE,
+                self._packed_source_chunk_size,
             )
             if not len(block):
                 self._packed_ready.extend(self._reservoir.drain())
@@ -539,8 +564,8 @@ class DatasetPlanner:
             self._packed_ready.extend(self._reservoir.offer_block(block))
 
     def _next_uniform_batch(self) -> PlannedEnvelopeBatch | None:
-        if self._packed_uniform:
-            return self._next_packed_uniform_batch()
+        if self._packed:
+            return self._next_packed_batch()
         batch_size = self.planning_batch_size
         envelopes = []
         empty_cycles = 0
@@ -599,7 +624,7 @@ class DatasetPlanner:
             is_last=False,
         )
 
-    def _next_packed_uniform_batch(self) -> PlannedEnvelopeBatch | None:
+    def _next_packed_batch(self) -> PlannedEnvelopeBatch | None:
         batch_size = self.planning_batch_size
         parts = []
         count = 0
@@ -652,6 +677,67 @@ class DatasetPlanner:
         queue.append(envelope)
         return queue
 
+    def _next_packed_mixed_batch(self):
+        """Bucket fixed-width IDs in the same first-full order as object records."""
+        batch_size = self.planning_batch_size
+        while True:
+            self._refill_packed_ready()
+            if not self._packed_ready:
+                if self.runtime_context.mode == "train":
+                    self._packed_shape_queues.clear()
+                    self._finished = True
+                    return None
+                nonempty = sorted(shape for shape, q in self._packed_shape_queues.items() if q)
+                if not nonempty:
+                    self._finished = True
+                    return None
+                shape = nonempty[0]
+                queue = self._packed_shape_queues.pop(shape)
+                values = queue.pop(len(queue))
+                real_count = len(values)
+                values = np.resize(values, batch_size)
+                is_last = not any(self._packed_shape_queues.values())
+                self._finished = is_last
+                return self._make_batch(
+                    PackedEnvelopeBatch(
+                        values, self.source.envelopes_from_record_ids, self._manifest_digest
+                    ),
+                    (True,) * real_count + (False,) * (batch_size - real_count),
+                    is_last=is_last,
+                )
+            # Inspect a bounded prefix; pop only through the first completed bucket.
+            snapshot = self._packed_ready.snapshot()
+            values = self._packed_ready.pop(min(len(self._packed_ready), batch_size))
+            self._packed_ready.restore_snapshot(snapshot)
+            shapes = self.source.shape_codes_for_record_ids(values)
+            take = len(values)
+            completed = None
+            for shape in np.unique(shapes):
+                shape = int(shape)
+                queue = self._packed_shape_queues.setdefault(shape, PackedUInt64ReadyBuffer())
+                if len(self._packed_shape_queues) > self.config.max_shape_queues:
+                    raise RuntimeError("source exceeds the configured shape queue limit")
+                positions = np.flatnonzero(shapes == shape)
+                needed = batch_size - len(queue)
+                if len(positions) >= needed and int(positions[needed - 1]) < take:
+                    take = int(positions[needed - 1]) + 1
+                    completed = shape
+            values = self._packed_ready.pop(take)
+            shapes = shapes[:take]
+            for shape in np.unique(shapes):
+                self._packed_shape_queues[int(shape)].extend(
+                    np.ascontiguousarray(values[shapes == shape])
+                )
+            if completed is not None:
+                values = self._packed_shape_queues.pop(completed).pop(batch_size)
+                return self._make_batch(
+                    PackedEnvelopeBatch(
+                        values, self.source.envelopes_from_record_ids, self._manifest_digest
+                    ),
+                    (True,) * batch_size,
+                    is_last=False,
+                )
+
     def _make_batch(
         self,
         envelopes: tuple[RecordEnvelope, ...] | PackedEnvelopeBatch,
@@ -680,6 +766,8 @@ class DatasetPlanner:
             return None
         if self._uniform_shape_code is not None:
             return self._next_uniform_batch()
+        if self._packed:
+            return self._next_packed_mixed_batch()
         batch_size = self.planning_batch_size
         empty_cycles = 0
         while True:
@@ -704,6 +792,7 @@ class DatasetPlanner:
                     continue
                 if self.runtime_context.mode == "train":
                     self._shape_queues.clear()
+                    self._packed_shape_queues.clear()
                     self._finished = True
                     return None
                 nonempty = sorted(
@@ -771,13 +860,20 @@ class DatasetPlanner:
             reservoir=self._reservoir.state(),
             ready=(
                 self._packed_ready.state()
-                if self._packed_uniform
+                if self._packed
                 else tuple(self._ready)
             ),
-            shape_queues=tuple(
-                (shape, tuple(queue))
-                for shape, queue in sorted(self._shape_queues.items())
-                if queue
+            shape_queues=(
+                tuple(
+                    (shape, queue.state())
+                    for shape, queue in sorted(self._packed_shape_queues.items())
+                    if queue
+                )
+                if self._packed else tuple(
+                    (shape, tuple(queue))
+                    for shape, queue in sorted(self._shape_queues.items())
+                    if queue
+                )
             ),
             source_exhausted=self._source_exhausted,
             finished=self._finished,
@@ -807,11 +903,11 @@ class DatasetPlanner:
         if type(state.source_exhausted) is not bool or type(state.finished) is not bool:
             raise ValueError("planner state contains a malformed lifecycle flag")
         packed_state = isinstance(state.reservoir, PackedReservoirState)
-        if packed_state != self._packed_uniform:
+        if packed_state != self._packed:
             raise ValueError("planner packed storage contract changed")
-        if self._packed_uniform and not isinstance(state.ready, PackedReadyState):
+        if self._packed and not isinstance(state.ready, PackedReadyState):
             raise ValueError("planner packed ready state is malformed")
-        if not self._packed_uniform and not isinstance(state.ready, tuple):
+        if not self._packed and not isinstance(state.ready, tuple):
             raise ValueError("planner object ready state is malformed")
         if state.source_exhausted != state.reservoir.closed:
             raise ValueError("planner and reservoir exhaustion state disagree")
@@ -831,7 +927,7 @@ class DatasetPlanner:
             for _, queue in state.shape_queues
         ):
             raise ValueError("planner state contains an invalid shape queue")
-        if any(
+        if not self._packed and any(
             envelope.shape_code != shape
             for shape, queue in state.shape_queues
             for envelope in queue
@@ -848,20 +944,29 @@ class DatasetPlanner:
         self._source_cursor = self.source.restore_cursor(state.source_cursor)
         self._reservoir = self._new_reservoir(self._source_cycle)
         self._reservoir.restore(state.reservoir)
-        if self._packed_uniform:
+        if self._packed:
             self._packed_ready.restore(state.ready)
         else:
             self._ready.extend(state.ready)
-        self._shape_queues.update(
-            (shape, list(queue)) for shape, queue in state.shape_queues
-        )
+        if self._packed:
+            for shape, saved in state.shape_queues:
+                queue = PackedUInt64ReadyBuffer()
+                queue.restore(saved)
+                values = np.frombuffer(saved.record_ids_le, dtype="<u8")
+                if np.any(self.source.shape_codes_for_record_ids(values) != shape):
+                    raise ValueError("packed shape queue contains a mismatched record")
+                self._packed_shape_queues[shape] = queue
+        else:
+            self._shape_queues.update(
+                (shape, list(queue)) for shape, queue in state.shape_queues
+            )
         self._source_exhausted = state.source_exhausted
         self._finished = state.finished
 
     def next_transactional_batch(
         self,
     ) -> tuple[PlannedEnvelopeBatch, PlannerBatchToken] | None:
-        if self._packed_uniform:
+        if self._packed:
             return self._next_packed_transactional_batch()
         before_state = self._yield_state
         before_digest = self._yield_digest
@@ -901,7 +1006,8 @@ class DatasetPlanner:
         before_digest = self._yield_digest
         before_pipeline_blob = self._yield_pipeline_blob
         transaction_id = self._reservoir.begin_transaction(
-            self.planning_batch_size + SOURCE_CHUNK_SIZE
+            self.planning_batch_size * max(1, len(self.source.shape_codes))
+            + self._packed_source_chunk_size
         )
         try:
             batch = self.next_batch()
@@ -1019,7 +1125,7 @@ class DatasetPlanner:
             raise RuntimeError("terminal planner token is not the latest yielded token")
         batch = replace(token.batch, is_last=True)
         packed_endpoint = token.packed_transaction_endpoint
-        if self._packed_uniform:
+        if self._packed:
             terminal = self._pending_terminal_packed_state
             if terminal is None:
                 raise RuntimeError("terminal packed transaction is missing")
@@ -1063,7 +1169,7 @@ class DatasetPlanner:
         packed_endpoints = []
         pending_transaction_ids = (
             self._reservoir.pending_transaction_ids
-            if self._packed_uniform
+            if self._packed
             else ()
         )
         pending_transaction_offset = 0
@@ -1080,14 +1186,14 @@ class DatasetPlanner:
             if self.source.capabilities.resumable:
                 state_matches = (
                     token.before_state is expected_state
-                    if self._packed_uniform
+                    if self._packed
                     else token.before_state == expected_state
                 )
                 if not state_matches:
                     raise RuntimeError(
                         "planner token does not start at the committed cursor"
                     )
-            if self._packed_uniform:
+            if self._packed:
                 endpoint = token.packed_transaction_endpoint
                 if type(endpoint) is not int or endpoint <= 0:
                     raise RuntimeError(
@@ -1164,7 +1270,7 @@ class DatasetPlanner:
     def commit_prepared(self, candidate: PreparedPlannerCommit) -> None:
         if candidate.before_digest != self._committed_digest:
             raise RuntimeError("prepared planner commit no longer matches state")
-        if self._packed_uniform:
+        if self._packed:
             if not candidate.packed_transaction_endpoints:
                 raise RuntimeError("prepared packed planner commit has no transaction")
             self._reservoir.commit_transactions(
@@ -1187,7 +1293,7 @@ class DatasetPlanner:
             raise RuntimeError("cannot advance an unfinished planner epoch")
         if self._yield_digest != self._committed_digest:
             raise RuntimeError("cannot advance with uncommitted planner batches")
-        if self._packed_uniform and self._reservoir.pending_transaction_count:
+        if self._packed and self._reservoir.pending_transaction_count:
             raise RuntimeError("cannot advance with pending packed transactions")
         self.start_epoch(self.epoch + 1)
         self._committed_state = (
@@ -1203,7 +1309,7 @@ class DatasetPlanner:
     def rollback_uncommitted(self) -> None:
         if not self.source.capabilities.resumable:
             raise RuntimeError("cannot roll back a non-resumable source")
-        if self._packed_uniform:
+        if self._packed:
             if not isinstance(self._committed_state, _PackedPlannerState):
                 raise RuntimeError("packed planner committed cursor is malformed")
             self._reservoir.rollback_uncommitted()
@@ -1219,7 +1325,7 @@ class DatasetPlanner:
         if not self.source.capabilities.resumable:
             raise RuntimeError("dataset source does not support exact resume")
         committed_state = self._committed_state
-        if self._packed_uniform:
+        if self._packed:
             committed_state = self._materialize_packed_state(committed_state)
         return {
             "version": 3,
@@ -1308,7 +1414,10 @@ class DatasetPlanner:
                     "closed": reservoir.closed,
                 },
                 "ready_ids_le": state.ready.record_ids_le.hex(),
-                "shape_queues": [],
+                "shape_queues": [
+                    [shape, queue.record_ids_le.hex()]
+                    for shape, queue in state.shape_queues
+                ],
                 "source_exhausted": state.source_exhausted,
                 "finished": state.finished,
             }
@@ -1351,10 +1460,6 @@ class DatasetPlanner:
         try:
             reservoir = state["reservoir"]
             if reservoir["algorithm"] == PACKED_RESERVOIR_ALGORITHM:
-                if state["shape_queues"] != []:
-                    raise ValueError(
-                        "packed planner state cannot contain shape queues"
-                    )
                 reservoir_state = PackedReservoirState(
                     algorithm=str(reservoir["algorithm"]),
                     seed=int(reservoir["seed"]),
@@ -1381,7 +1486,10 @@ class DatasetPlanner:
                     ready=PackedReadyState(
                         bytes.fromhex(state["ready_ids_le"])
                     ),
-                    shape_queues=(),
+                    shape_queues=tuple(
+                        (int(shape), PackedReadyState(bytes.fromhex(values)))
+                        for shape, values in state["shape_queues"]
+                    ),
                     source_exhausted=state["source_exhausted"],
                     finished=state["finished"],
                 )

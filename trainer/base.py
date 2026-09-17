@@ -787,10 +787,10 @@ class BaseTrainer:
             raise ValueError(
                 "data_pipeline requires parallel-stateless data_pipelines"
             )
-        if self.dataset_type != "batched_processed_katago_numpy":
+        if self.dataset_type not in {"batched_processed_katago_numpy", "iterative_multi"}:
             raise ValueError(
                 "data_pipeline currently supports only "
-                "dataset_type='batched_processed_katago_numpy'"
+                "batched_processed_katago_numpy or compatible iterative_multi"
             )
         if self.num_worker != 0:
             raise ValueError(
@@ -3801,11 +3801,12 @@ class BaseTrainer:
                 # force inductor into per-tensor stabilization copies, while
                 # one persistent slot set replays the graph against fixed
                 # input pointers with a single hidden H2D per tensor.
-                # Operational escape hatch: if the static-slot handoff ever
-                # misbehaves with a future dataset shape, one environment
-                # variable restores the deep-lookahead prefetcher without a
-                # code change.
-                if os.environ.get("NNUE_FORCE_CUDA_PREFETCH"):
+                # Mixed-board streams require shape-flexible device buffers.
+                # Keep fixed slots for uniform streams and retain the existing
+                # operational override for the lookahead implementation.
+                source = getattr(dataloader.dataset, "_record_source", None)
+                mixed_shapes = len(getattr(source, "shape_codes", {})) > 1
+                if mixed_shapes or os.environ.get("NNUE_FORCE_CUDA_PREFETCH"):
                     return CudaPrefetchLoaderWrapper(
                         dataloader,
                         self.accelerator.device,

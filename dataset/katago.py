@@ -970,6 +970,7 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             if adaptive_enabled:
                 self._record_decoder.close()
             raise
+        self._record_manifests = manifests
         adaptive_runtime = None
         if adaptive_enabled:
             from .pipeline_runtime import AdaptivePipelineRuntime

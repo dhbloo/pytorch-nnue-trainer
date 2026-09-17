@@ -296,7 +296,7 @@ the legacy `prefetch_threads` setting.
 ## Adaptive resource control
 
 The primary resource interface is the top-level singular `data_pipeline` mapping. It is separate from
-`data_pipelines`, the older list of semantic batch transforms. The adaptive interface currently supports only
+`data_pipelines`, the older list of semantic batch transforms. The adaptive interface supports
 `dataset_type: batched_processed_katago_numpy` and requires `num_worker: 0`. It can compose `data_pipelines`
 whose registered transforms declare themselves parallel and stateless; other semantic transforms remain on the
 compatibility path and are rejected when adaptive control is explicitly requested.
@@ -306,6 +306,25 @@ requirements hold and no fixed `prefetch_threads`, `prefetch_batches`, `pin_memo
 present. Existing fixed configurations, nonzero loader-worker configurations, and semantic `data_pipelines` remain
 on their compatibility path. Supplying an explicit `data_pipeline` mapping is strict: incompatible options are
 reported as configuration errors instead of silently disabling adaptation.
+
+For `iterative_multi`, opt in explicitly with `data_pipeline: {}` and keep
+`num_worker: 0`. This path supports dense, unfiltered
+`batched_processed_katago_numpy` children, each with one explicit board size,
+and no composite batch transforms. It retains the record-level `blend_ratio`,
+`sample_rate`, and `sync_length` semantics. Packed record IDs are shuffled and
+bucketed by shape before the global batch is partitioned across ranks; each
+rank therefore receives the same board size at each step. Queued shape buckets
+and source cursors are included in exact checkpoint/rollback state.
+
+The mixed path prepares one shared decoded cache over all child files, and uses
+one parent memory budget, bounded parallel decoding, pinning, and telemetry.
+It does not allocate an independent adaptive budget for every child. Keep
+`dataloader_args.batch_by_boardsize: true` for mixed sizes. With
+`cuda_prefetch_batches: 1`, mixed shapes automatically select the existing
+shape-flexible CUDA lookahead loader; uniform streams retain static input slots.
+Mixed datasets without an explicit adaptive mapping retain
+the generic compatibility path. Old generic planner checkpoints cannot be
+resumed into the packed mixed path; start a new run when enabling it.
 
 ### Portable resource resolution
 

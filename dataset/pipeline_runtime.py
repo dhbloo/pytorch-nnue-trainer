@@ -27,7 +27,7 @@ from .pipeline_controller import (
     PipelineSettings,
 )
 from .pipeline_topology import DistributedPipelineResources
-from .planner import SOURCE_CHUNK_SIZE
+from .planner import SOURCE_CHUNK_SIZE, PACKED_MIXED_SOURCE_CHUNK_SIZE
 
 
 ADAPTIVE_PIPELINE_RUNTIME_SCHEMA = "adaptive-pipeline-runtime-v5"
@@ -133,7 +133,13 @@ class AdaptivePipelineRuntime:
         shuffle_window_size: int,
         memory_budget: HostMemoryBudget | None = None,
         shared_decoded_cache: bool = False,
+        packed_mixed_shapes: int = 0,
+        minimum_cache_bytes: int = 0,
     ) -> None:
+        if type(packed_mixed_shapes) is not int or packed_mixed_shapes < 0:
+            raise ValueError("packed_mixed_shapes must be a non-negative integer")
+        if type(minimum_cache_bytes) is not int or minimum_cache_bytes < 0:
+            raise ValueError("minimum_cache_bytes must be a non-negative integer")
         if not isinstance(spec, AdaptivePipelineRuntimeSpec):
             raise TypeError("spec must be AdaptivePipelineRuntimeSpec")
         if not manifests:
@@ -215,9 +221,15 @@ class AdaptivePipelineRuntime:
                 board_sizes = []
                 break
             board_sizes.append(tuple(int(value) for value in board_size))
-        packed_uniform = bool(board_sizes) and len(set(board_sizes)) == 1
+        packed_uniform = bool(packed_mixed_shapes) or (
+            bool(board_sizes) and len(set(board_sizes)) == 1
+        )
+        source_chunk_size = (
+            PACKED_MIXED_SOURCE_CHUNK_SIZE
+            if packed_mixed_shapes > 1 else SOURCE_CHUNK_SIZE
+        )
         packed_journal_bytes = (
-            (global_batch_size + SOURCE_CHUNK_SIZE)
+            (global_batch_size * max(1, packed_mixed_shapes) + source_chunk_size)
             * PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT
         )
         planner_token_bytes = (
@@ -225,6 +237,10 @@ class AdaptivePipelineRuntime:
             if packed_uniform
             else reservoir_bytes + planned_batch_bytes
         )
+        # Mixed shape queues retain at most one global batch per shape.
+        # Snapshot arrays are immutable and shared until consumed.
+        shape_queue_bytes = packed_mixed_shapes * global_batch_size * _PACKED_RECORD_ID_BYTES
+        planner_token_bytes += shape_queue_bytes
         queued_batch_bytes = output_batch_bytes + planner_token_bytes
         # Packed transactions retain deltas per queued batch. At the terminal
         # drain, rollback temporarily retains the live reservoir allocation,
@@ -237,6 +253,8 @@ class AdaptivePipelineRuntime:
             else 2 * reservoir_bytes + planned_batch_bytes
         )
 
+        fixed_semantic_floor_bytes += 2 * shape_queue_bytes
+
         resources = spec.resources
         total_decoded_bytes = sum(positive_decoded_sizes)
         total_logical_rows = sum(
@@ -248,7 +266,7 @@ class AdaptivePipelineRuntime:
         lookahead_rows = global_batch_size * initial_queue_batches
         if shuffle:
             lookahead_rows += shuffle_window_size
-        initial_cache_bytes = max(positive_decoded_sizes)
+        initial_cache_bytes = max(max(positive_decoded_sizes), minimum_cache_bytes)
         if total_logical_rows > 0:
             working_fraction = min(
                 1.0,
@@ -267,7 +285,7 @@ class AdaptivePipelineRuntime:
             local_rank_count=resources.local_rank_count,
             per_rank_host_budget_bytes=resources.per_rank_host_budget_bytes,
             per_rank_cpu_limit=resources.per_rank_cpu_limit,
-            largest_decoded_file_bytes=max(positive_decoded_sizes),
+            largest_decoded_file_bytes=max(max(positive_decoded_sizes), minimum_cache_bytes),
             output_batch_bytes=output_batch_bytes,
             fixed_semantic_floor_bytes=fixed_semantic_floor_bytes,
             planner_token_bytes_per_queued_batch=planner_token_bytes,
