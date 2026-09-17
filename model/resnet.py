@@ -230,6 +230,10 @@ class ResNetv2(nn.Module):
         feature = self.conv_trunk(feature)
         return self.output_head(feature)
 
+    def muon_hidden_modules(self):
+        """Keep input projection and output classifiers on the companion AdamW."""
+        return (self.conv_trunk,)
+
     @property
     def name(self):
         b, f = self.model_size

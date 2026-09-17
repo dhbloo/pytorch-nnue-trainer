@@ -25,13 +25,19 @@ class OutputHeadV0(nn.Module):
         self.policy_head = Conv2dBlock(dim_feature, 1, ks=1, st=1, activation="none", bias=False)
 
     def forward(self, feature: torch.Tensor, mask: None | torch.Tensor = None):
-        # value head
-        if mask is not None:
-            mask_sum = torch.sum(mask, dim=(2, 3), keepdim=False)
-            value = torch.sum(feature * mask, dim=(2, 3), keepdim=False) / mask_sum
-        else:
-            value = torch.mean(feature, dim=(2, 3))
-        value = self.value_head(value)
+        # Large shared logits can erase class differences in reduced precision.
+        # Keep pooling and the small value classifier in FP32, including when
+        # the convolutional trunk runs under autocast or has half-type weights.
+        with torch.autocast(device_type=feature.device.type, enabled=False):
+            if mask is not None:
+                mask = mask.float()
+                mask_sum = torch.sum(mask, dim=(2, 3), keepdim=False)
+                value = torch.sum(feature.float() * mask, dim=(2, 3)) / mask_sum
+            else:
+                value = torch.mean(feature, dim=(2, 3), dtype=torch.float32)
+            # This small dot product also avoids TF32 GEMM downcasting when
+            # the global float32 matmul policy favors tensor-core throughput.
+            value = (value.unsqueeze(1) * self.value_head.fc.weight.float()).sum(dim=-1)
 
         # policy head
         policy = self.policy_head(feature)

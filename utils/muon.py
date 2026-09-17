@@ -37,30 +37,31 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int, use_baddbmm: bool, use_bf
     """
     # batched Muon implementation by @scottjmaddox, and put into practice in the record by @YouJiacheng
     assert G.ndim >= 2
-    a, b, c = (3.4445, -4.7750, 2.0315)
-    X = G.bfloat16() if use_bf16 else G.float()
-    if G.size(-2) > G.size(-1):
-        X = X.mT
+    # The trainer may call optimizer.step() inside its forward autocast scope.
+    # Input casts alone cannot prevent autocast from downcasting these matmuls.
+    with torch.autocast(device_type=G.device.type, enabled=False):
+        a, b, c = (3.4445, -4.7750, 2.0315)
+        X = G.bfloat16() if use_bf16 else G.float()
+        if G.size(-2) > G.size(-1):
+            X = X.mT
 
-    # Ensure spectral norm is at most 1
-    X = F.normalize(X, p=2.0, dim=(-2, -1), eps=1e-7)
+        # Ensure spectral norm is at most 1.
+        X = F.normalize(X, p=2.0, dim=(-2, -1), eps=1e-7)
 
-    # Perform the NS iterations
-    if use_baddbmm:
-        for _ in range(steps):
-            A = X @ X.mT
-            B = torch.baddbmm(A, A, A, beta=b, alpha=c)
-            X = torch.baddbmm(X, B, X, beta=a, alpha=1)
-    else:
-        for _ in range(steps):
-            A = X @ X.mT
-            # quintic computation strategy adapted from suggestion by @jxbz, @leloykun, and @YouJiacheng
-            B = b * A + c * A @ A
-            X = a * X + B @ X
+        if use_baddbmm:
+            for _ in range(steps):
+                A = X @ X.mT
+                B = torch.baddbmm(A, A, A, beta=b, alpha=c)
+                X = torch.baddbmm(X, B, X, beta=a, alpha=1)
+        else:
+            for _ in range(steps):
+                A = X @ X.mT
+                B = b * A + c * A @ A
+                X = a * X + B @ X
 
-    if G.size(-2) > G.size(-1):
-        X = X.mT
-    return X.to(G)
+        if G.size(-2) > G.size(-1):
+            X = X.mT
+        return X.to(G)
 
 
 class Muon(torch.optim.Optimizer):
@@ -173,16 +174,22 @@ class Muon(torch.optim.Optimizer):
 
 def get_params_for_muon(model: Module) -> list[Parameter]:
     """
-    Filter parameters of a module into two groups: those that can be optimized by Muon,
-    and those that should be optimized by a standard optimizer.
+    Select matrix parameters for Muon, respecting model-defined hidden modules.
     Args:
         model: The model to filter parameters for.
     Returns:
-        A dict of named parameters that should be optimized with muon.
+        A list of trainable matrix parameters. Models may expose
+        ``muon_hidden_modules()`` to exclude their input and output boundaries;
+        other models retain the generic matrix selection.
     """
     muon_params = []
 
+    select_hidden = getattr(model, "muon_hidden_modules", None)
+    roots = select_hidden() if callable(select_hidden) else (model,)
+    modules = {module for root in roots for module in root.modules()}
     for module in model.modules():
+        if module not in modules:
+            continue
         for name, param in module.named_parameters(recurse=False):
             if not param.requires_grad:
                 continue

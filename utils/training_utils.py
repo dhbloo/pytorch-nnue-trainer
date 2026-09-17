@@ -163,7 +163,8 @@ def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
             adamw_args["fused"] = True
     spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
     spec_adamw = OptimizerSpec(adamw_class, adamw_args, None)
-    specs = [spec_muon, spec_adamw]
+    # A zero-block or frozen-trunk model has only AdamW-eligible parameters.
+    specs = [spec_muon, spec_adamw] if muon_params_id_set else [spec_adamw]
     callback = None
     if kwargs.pop("verbose", False):
         callback = lambda p, spec_idx: print(
