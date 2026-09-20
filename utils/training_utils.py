@@ -35,6 +35,26 @@ need module structure (e.g. muon's per-parameter routing).
 """
 
 
+def _print_once(message: str) -> None:
+    """Print from one process only; optimizer factories run on every rank."""
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        if torch.distributed.get_rank() != 0:
+            return
+    print(message)
+
+
+def _homogeneous_grads(parameters):
+    """Gradients of *parameters* if they share one (device, dtype), else None."""
+    grads = [p.grad for p in parameters if p.grad is not None]
+    if not grads:
+        return []
+    first_device, first_dtype = grads[0].device, grads[0].dtype
+    for grad in grads[1:]:
+        if grad.device != first_device or grad.dtype != first_dtype:
+            return None
+    return grads
+
+
 def clip_grad_norm(parameters, max_norm: float, norm_type: float = 2.0):
     """Streamlined gradient clipping for the single-(device, dtype) case.
 
@@ -46,22 +66,37 @@ def clip_grad_norm(parameters, max_norm: float, norm_type: float = 2.0):
     microseconds per step on high-latency hosts.  Parameters spanning
     multiple devices or dtypes fall back to the stock implementation.
     """
-    grads = [p.grad for p in parameters if p.grad is not None]
+    grads = _homogeneous_grads(parameters)
+    if grads is None:
+        return torch.nn.utils.clip_grad_norm_(parameters, max_norm, norm_type=norm_type)
     if not grads:
         # Mirrors torch.nn.utils._get_total_norm on the empty-grads path.
         return torch.tensor(0.0)
-    first_device, first_dtype = grads[0].device, grads[0].dtype
-    for grad in grads[1:]:
-        if grad.device != first_device or grad.dtype != first_dtype:
-            return torch.nn.utils.clip_grad_norm_(
-                parameters, max_norm, norm_type=norm_type
-            )
     norms = torch._foreach_norm(grads, norm_type)
     total_norm = torch.linalg.vector_norm(torch.stack(norms), norm_type)
     clip_coef = float(max_norm) / (total_norm + 1e-6)
     clip_coef_clamped = torch.clamp(clip_coef, max=1.0)
     torch._foreach_mul_(grads, clip_coef_clamped)
     return total_norm
+
+
+def total_grad_norm(parameters, norm_type: float = 2.0):
+    """Total gradient norm of *parameters*, leaving the gradients untouched.
+
+    Same value as ``clip_grad_norm(parameters, inf)`` but without that call's
+    scaling pass: with an infinite ``max_norm`` the coefficient clamps to 1.0,
+    so the stock implementation still rewrites every gradient, and a non-finite
+    norm still propagates into all of them.
+    """
+    grads = _homogeneous_grads(parameters)
+    if grads is None:
+        return torch.nn.utils.get_total_norm(
+            [p.grad for p in parameters if p.grad is not None], norm_type=norm_type
+        )
+    if not grads:
+        return torch.tensor(0.0)
+    norms = torch._foreach_norm(grads, norm_type)
+    return torch.linalg.vector_norm(torch.stack(norms), norm_type)
 
 
 # Keywords for which MultiTensorAdamW is the better implementation. Anything
@@ -127,19 +162,27 @@ def _make_sgd_nesterov(parameters, model, lr, weight_decay, **kwargs):
 
 @OPTIMIZERS.register("muon-adamw")
 def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
-    from utils.muon import Muon, get_params_for_muon
+    from utils.muon import Muon, partition_params_for_muon
     from utils.chained_optimizer import ChainedOptimizer, OptimizerSpec
 
     models = model if isinstance(model, (list, tuple)) else [model]
     params_id_to_name = {}
-    muon_params_id_set = set()
     for m in models:
         params_id_to_name.update({id(p): name for name, p in m.named_parameters()})
-        muon_params_id_set.update(id(p) for p in get_params_for_muon(m))
     # Default Muon's weight_decay to 1e-2 only when unset; a configured value
     # (including 0.0) must be respected, not floored.
     muon_args = {"weight_decay": 1e-2 if weight_decay is None else weight_decay}
     muon_args.update(kwargs.pop("muon_args", {}))
+    # Routing and clipping are this factory's concern: Muon does not accept
+    # these constructor arguments, so they are consumed here. Anything else in
+    # muon_args reaches Muon.__init__, where an unknown key raises TypeError.
+    clip_muon_gradients = bool(muon_args.pop("clip_gradients", False))
+    muon_params, excluded_names = partition_params_for_muon(
+        models, muon_args.pop("exclude_keys", None)
+    )
+    muon_params_id_set = {id(param) for param in muon_params}
+    if excluded_names:
+        _print_once(f"Muon exclude_keys routed to AdamW: {excluded_names}")
     adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
     adamw_args.update(kwargs.pop("adamw_args", {}))
     # ChainedOptimizer copies its scheduler-controlled LR to both children on
@@ -161,7 +204,12 @@ def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
         adamw_class = optim.AdamW
         if "fused" not in adamw_args and "foreach" not in adamw_args and torch.cuda.is_available():
             adamw_args["fused"] = True
-    spec_muon = OptimizerSpec(Muon, muon_args, lambda param: id(param) in muon_params_id_set)
+    spec_muon = OptimizerSpec(
+        Muon,
+        muon_args,
+        lambda param: id(param) in muon_params_id_set,
+        clip_gradients=clip_muon_gradients,
+    )
     spec_adamw = OptimizerSpec(adamw_class, adamw_args, None)
     specs = [spec_muon, spec_adamw]
     callback = None

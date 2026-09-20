@@ -14,6 +14,10 @@ class OptimizerSpec:
     class_type: type[Optimizer]
     init_args: dict[str, Any]
     param_filter: Callable[[Tensor], bool] | None
+    # When False, the trainer still measures this child's gradients in the
+    # logged total norm but does not scale them, for children whose update is
+    # invariant to ||G|| and would otherwise shrink the other children's steps.
+    clip_gradients: bool = True
 
 
 class ChainedOptimizer(Optimizer):
@@ -66,6 +70,23 @@ class ChainedOptimizer(Optimizer):
             optimizer_args.update(spec.init_args)
             optimizer = spec.class_type(selected_params, **optimizer_args)
             self.optimizers.append(optimizer)
+
+    def parameters_excluded_from_grad_clip(self) -> list[Tensor]:
+        """Parameters whose gradients the trainer must not scale.
+
+        Children with ``OptimizerSpec.clip_gradients=False`` contribute all of
+        their parameters. Reporting the exclusions rather than the inclusions
+        keeps parameters this optimizer does not own out of the decision, and
+        follows the live child param groups, including groups added after
+        construction.
+        """
+        params: list[Tensor] = []
+        for spec, optimizer in zip(self.optimizer_specs, self.optimizers):
+            if spec.clip_gradients:
+                continue
+            for group in optimizer.param_groups:
+                params.extend(group["params"])
+        return params
 
     def state_dict(self) -> dict[str, Any]:
         return {

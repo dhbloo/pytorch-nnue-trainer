@@ -12,6 +12,7 @@ from accelerate import (
     DistributedDataParallelKwargs,
 )
 from accelerate.data_loader import BatchSamplerShard
+from accelerate.optimizer import AcceleratedOptimizer
 from accelerate.utils import (
     DistributedType,
     DynamoBackend,
@@ -69,6 +70,7 @@ from utils.training_utils import (
     StaticSlotLoaderWrapper,
     ResumableSampler,
     clip_grad_norm,
+    total_grad_norm,
 )
 from utils.misc_utils import (
     seed_everything,
@@ -3749,6 +3751,7 @@ class BaseTrainer:
             )
         self._setup_weight_clipping()
         self._setup_ema()
+        self._warmup_muon_kernels()
 
     def _configure_evaluation_buffer_syncs(self):
         """Defer DDP broadcasts for models whose buffers only affect evaluation."""
@@ -3930,30 +3933,127 @@ class BaseTrainer:
         self._last_replica_check_iteration = self.state.iteration
         return True
 
+    def _unwrap_optimizer(self, optimizer):
+        """Return the inner optimizer under Accelerate's wrapper, if any."""
+        while isinstance(optimizer, AcceleratedOptimizer):
+            optimizer = optimizer.optimizer
+        return optimizer
+
+    def _iter_child_optimizers(self):
+        """Yield unwrapped leaf optimizers, expanding ``ChainedOptimizer``."""
+        from utils.chained_optimizer import ChainedOptimizer
+
+        for optimizer in self.optimizers.values():
+            inner = self._unwrap_optimizer(optimizer)
+            if isinstance(inner, ChainedOptimizer):
+                yield from inner.optimizers
+            else:
+                yield inner
+
+    def _warmup_muon_kernels(self):
+        """Pre-tune optional Triton Gram-NS kernels after the model is on GPU."""
+        from utils.muon import Muon
+
+        # Each group carries its own ns_steps / reset_iterations, so warm them
+        # separately instead of autotuning every shape with the last group's.
+        requests = []
+        for optimizer in self._iter_child_optimizers():
+            if not isinstance(optimizer, Muon):
+                continue
+            for group in optimizer.param_groups:
+                if not group.get("use_fused_kernels"):
+                    continue
+                if group.get("ns_backend", "newtonschulz") != "gram":
+                    continue
+                params = [p for p in group["params"] if p.requires_grad and p.is_cuda]
+                if params:
+                    requests.append((params, group))
+        if not requests:
+            return
+        from utils.gram_ns import gram_ns_shape_groups, warmup_gram_ns
+
+        warmed = 0
+        for params, group in requests:
+            shapes = gram_ns_shape_groups(params)
+            warmup_gram_ns(
+                shapes,
+                params[0].device,
+                steps=group["ns_steps"],
+                reset_iterations=group.get("reset_iterations", (2,)),
+            )
+            warmed += len(shapes)
+        self.accelerator.print(f"Warmed {warmed} Gram-NS Triton shape group(s)")
+
+    def _parameters_for_grad_clip(self, parameters):
+        """Parameters that may be scaled by ``clip_grad_norm`` / ``clip_grad_value``.
+
+        ``ChainedOptimizer`` can opt a child out (Muon). The logged total norm
+        still uses ``parameters``; only this subset is scaled, and it is
+        clipped against its own L2 norm rather than the global one. Parameters
+        no optimizer opts out of stay clipped, including ones no optimizer owns.
+        """
+        excluded_ids = set()
+        for optimizer in self.optimizers.values():
+            inner = self._unwrap_optimizer(optimizer)
+            getter = getattr(inner, "parameters_excluded_from_grad_clip", None)
+            if callable(getter):
+                excluded_ids.update(id(parameter) for parameter in getter())
+        if not excluded_ids:
+            return list(parameters)
+        return [
+            parameter
+            for parameter in parameters
+            if id(parameter) not in excluded_ids
+        ]
+
     def _clip_gradients(self, parameters=None):
         """Measure gradient norm and apply configured clipping."""
         if parameters is None:
             parameters = list(self._all_trained_parameters())
         else:
             parameters = list(parameters)
+        clip_parameters = self._parameters_for_grad_clip(parameters)
+        # ``clip_parameters`` is a filtered sublist, so a length change is an
+        # exact test for "some parameter opted out".
+        measure_only = len(clip_parameters) != len(parameters)
         max_norm = (
             self.clip_grad_norm
             if self.clip_grad_norm is not None
             else float("inf")
         )
-        if self.accelerator.num_processes == 1:
-            grad_norm = clip_grad_norm(parameters, max_norm=max_norm)
+        replicated = self.accelerator.distributed_type in (
+            DistributedType.NO,
+            DistributedType.MULTI_CPU,
+            DistributedType.MULTI_GPU,
+        )
+        if measure_only and not replicated:
+            raise ValueError(
+                "Selective gradient clipping requires single-device or DDP training; "
+                "set muon_args.clip_gradients=true for this distributed backend."
+            )
+        if replicated:
+            # Unscale exactly once before measuring or clipping. Calling multiple
+            # Accelerate clipping helpers would unscale the same FP16 step twice.
+            self.accelerator.unscale_gradients()
+            if measure_only or self.clip_grad_norm is None:
+                grad_norm = total_grad_norm(parameters)
+                if self.clip_grad_norm is not None and clip_parameters:
+                    clip_grad_norm(clip_parameters, max_norm=max_norm)
+            else:
+                grad_norm = clip_grad_norm(parameters, max_norm=max_norm)
+            if self.clip_grad_value is not None and clip_parameters:
+                torch.nn.utils.clip_grad_value_(
+                    clip_parameters, clip_value=self.clip_grad_value
+                )
         else:
-            # Accelerate's wrapper routes FSDP/DeepSpeed/Megatron-LM clipping
+            # Keep plugin-owned norm reduction for unfiltered parameter lists.
             grad_norm = self.accelerator.clip_grad_norm_(
-                parameters,
-                max_norm=max_norm,
+                parameters, max_norm=max_norm
             )
-        if self.clip_grad_value is not None:
-            self.accelerator.clip_grad_value_(
-                parameters,
-                clip_value=self.clip_grad_value,
-            )
+            if self.clip_grad_value is not None and clip_parameters:
+                self.accelerator.clip_grad_value_(
+                    clip_parameters, clip_value=self.clip_grad_value
+                )
         if isinstance(grad_norm, numbers.Real) and not isinstance(grad_norm, bool):
             grad_norm = torch.as_tensor(
                 grad_norm,
