@@ -1,3 +1,12 @@
+"""ResNet trunks and their configuration factories.
+
+Every model here takes the same optional trunk-exit and head arguments:
+``final_norm`` / ``final_activation`` (see :func:`_build_final_layers`) and the
+head flags ``value_bias`` / ``value_gap_norm``. All four default to off so that
+existing checkpoints keep a matching parameter layout; ``final_norm="bn"`` adds
+affine gamma/beta while ``"bn-noaffine"`` normalizes without those keys.
+"""
+
 import torch
 import torch.nn as nn
 
@@ -5,6 +14,7 @@ from . import MODELS
 from .input import build_input_plane
 from .layers.activation import build_activation_layer
 from .layers.convolution import Conv2dBlock
+from .layers.normalization import build_norm2d_layer
 from .head import build_head
 
 
@@ -12,6 +22,28 @@ def _configure_channels_last_parameters(module: nn.Module, enabled: bool) -> Non
     """Keep convolution parameters and gradients in their compiled native layout."""
     if enabled:
         module.to(memory_format=torch.channels_last)
+
+
+def _build_final_layers(final_norm, final_activation, dim_feature):
+    """Optional trunk-exit norm/activation. ``none`` adds no checkpoint keys.
+
+    ``final_norm`` goes through ``build_norm2d_layer``, so a mask-unaware choice
+    such as ``"bn"`` folds padded positions into its statistics; masked trunks
+    want ``"maskbn"``. An activation that is nonzero at 0 (``sigmoid``) likewise
+    breaks the "masked positions are zero" invariant the output head relies on.
+    """
+    return (
+        build_norm2d_layer(final_norm, dim_feature),
+        build_activation_layer(final_activation),
+    )
+
+
+def _apply_final_layers(feature, norm, activation, mask=None):
+    if norm is not None:
+        feature = norm(feature, mask=mask)
+    if activation is not None:
+        feature = activation(feature)
+    return feature
 
 
 class ResBlock(nn.Module):
@@ -125,6 +157,10 @@ class ResNet(nn.Module):
         trunk_padding=1,
         trunk_norm="bn",
         trunk_activation="relu",
+        final_norm="none",
+        final_activation="none",
+        value_bias=False,
+        value_gap_norm="none",
         use_channel_last=True,
     ):
         super().__init__()
@@ -154,13 +190,19 @@ class ResNet(nn.Module):
             )
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
-        self.output_head = build_head(head_type, dim_feature)
+        self.final_norm, self.final_activation = _build_final_layers(
+            final_norm, final_activation, dim_feature
+        )
+        self.output_head = build_head(
+            head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm
+        )
         _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
         input_plane = self.input_plane(data)
         feature = self.conv_input(input_plane)
         feature = self.conv_trunk(feature)
+        feature = _apply_final_layers(feature, self.final_norm, self.final_activation)
         return self.output_head(feature)
 
     @property
@@ -191,6 +233,10 @@ class ResNetv2(nn.Module):
         trunk_norm1="bn",
         trunk_norm2="bn",
         trunk_activation="relu",
+        final_norm="none",
+        final_activation="none",
+        value_bias=False,
+        value_gap_norm="none",
         use_channel_last=True,
     ):
         super().__init__()
@@ -221,13 +267,19 @@ class ResNetv2(nn.Module):
             )
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
-        self.output_head = build_head(head_type, dim_feature)
+        self.final_norm, self.final_activation = _build_final_layers(
+            final_norm, final_activation, dim_feature
+        )
+        self.output_head = build_head(
+            head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm
+        )
         _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
         input_plane = self.input_plane(data)
         feature = self.conv_input(input_plane)
         feature = self.conv_trunk(feature)
+        feature = _apply_final_layers(feature, self.final_norm, self.final_activation)
         return self.output_head(feature)
 
     @property
@@ -259,6 +311,10 @@ class ResNetv3(nn.Module):
         trunk_norm1="maskbn-noaffine",
         trunk_norm2="maskbn",
         trunk_activation="relu",
+        final_norm="none",
+        final_activation="none",
+        value_bias=False,
+        value_gap_norm="none",
         drop_mask=False,
         use_channel_last=False,
     ):
@@ -291,7 +347,12 @@ class ResNetv3(nn.Module):
                 activation_first=False,
             )
             self.conv_trunk.append(block)
-        self.output_head = build_head(head_type, dim_feature)
+        self.final_norm, self.final_activation = _build_final_layers(
+            final_norm, final_activation, dim_feature
+        )
+        self.output_head = build_head(
+            head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm
+        )
         _configure_channels_last_parameters(self, use_channel_last)
 
     def forward(self, data):
@@ -303,12 +364,14 @@ class ResNetv3(nn.Module):
             x = self.conv_input(input_plane)
             for conv_block in self.conv_trunk:
                 x = conv_block(x)
+            x = _apply_final_layers(x, self.final_norm, self.final_activation)
             return self.output_head(x)
         else:
             input_plane, mask_plane = self.input_plane(data)
             x, mask = self.conv_input(input_plane, mask_plane)
             for conv_block in self.conv_trunk:
                 x, mask = conv_block(x, mask)
+            x = _apply_final_layers(x, self.final_norm, self.final_activation, mask)
             return self.output_head(x, mask)
 
     @property

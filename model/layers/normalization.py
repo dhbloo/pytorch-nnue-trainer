@@ -269,11 +269,29 @@ class MaskNorm(nn.Module):
         return x
 
 
+def build_norm1d_layer(norm: str, num_features: int):
+    """Build a 1D normalization layer from a string identifier.
+
+    Options:
+        "bn" - Batch normalization (BatchNorm1d) with affine gamma/beta
+        "bn-noaffine" - BatchNorm1d without affine parameters
+        "none" - No normalization (returns None)
+    """
+    if norm in (None, "none"):
+        return None
+    if norm == "bn":
+        return nn.BatchNorm1d(num_features)
+    if norm == "bn-noaffine":
+        return nn.BatchNorm1d(num_features, affine=False)
+    raise ValueError(f"Unsupported 1D normalization: {norm!r}")
+
+
 def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
     """Build a 2D normalization layer from a string identifier.
 
     Options:
-        "bn" - Batch normalization (BatchNorm2d)
+        "bn" - Batch normalization (BatchNorm2d) with affine gamma/beta
+        "bn-noaffine" - BatchNorm2d without affine parameters (normalize only)
         "gn" - Group normalization, requires norm_groups parameter
         "gn-{N}" - Group normalization with N groups parsed from the string (e.g., "gn-8")
         "ln" - Local layer normalization (channel-wise)
@@ -286,6 +304,8 @@ def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
     assert isinstance(num_features, int)
     if norm == "bn":
         return BatchNorm(num_features)
+    elif norm == "bn-noaffine":
+        return BatchNorm(num_features, affine=False)
     elif norm == "gn":
         assert isinstance(norm_groups, int)
         return GroupNorm(norm_groups, num_features)
