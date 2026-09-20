@@ -237,21 +237,23 @@ class Muon(torch.optim.Optimizer):
         return captured(stacked)
 
     def _run_newton_schulz(self, stacked: Tensor, group) -> Tensor:
-        backend = group.get("ns_backend", "newtonschulz")
-        steps = group["ns_steps"]
-        if backend == "gram":
-            from utils.gram_ns import gram_newton_schulz, gram_ns_triton
+        # Keep the backend precision independent of the training autocast context.
+        with torch.autocast(device_type=stacked.device.type, enabled=False):
+            backend = group.get("ns_backend", "newtonschulz")
+            steps = group["ns_steps"]
+            if backend == "gram":
+                from utils.gram_ns import gram_newton_schulz, gram_ns_triton
 
-            reset = group.get("reset_iterations", (2,))
-            if group.get("use_fused_kernels") and stacked.is_cuda:
-                return gram_ns_triton(stacked, steps=steps, reset_iterations=reset)
-            return gram_newton_schulz(stacked, steps=steps, reset_iterations=reset)
-        return zeropower_via_newtonschulz5(
-            stacked,
-            steps=steps,
-            use_baddbmm=group.get("use_baddbmm", True),
-            use_bf16=self._use_bf16_for(stacked, group),
-        )
+                reset = group.get("reset_iterations", (2,))
+                if group.get("use_fused_kernels") and stacked.is_cuda:
+                    return gram_ns_triton(stacked, steps=steps, reset_iterations=reset)
+                return gram_newton_schulz(stacked, steps=steps, reset_iterations=reset)
+            return zeropower_via_newtonschulz5(
+                stacked,
+                steps=steps,
+                use_baddbmm=group.get("use_baddbmm", True),
+                use_bf16=self._use_bf16_for(stacked, group),
+            )
 
     @torch.no_grad()
     def step(self, closure=None):
