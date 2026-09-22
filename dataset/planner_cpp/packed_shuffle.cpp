@@ -2,15 +2,85 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <chrono>
 #include <cstdint>
 #include <deque>
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace py = pybind11;
+
+py::array_t<uint64_t> counter_permutation(py::ssize_t length, py::object base)
+{
+    if (length < 0)
+        throw std::invalid_argument("permutation length must be non-negative");
+    py::array_t<uint64_t> output(length);
+    auto values = output.mutable_unchecked<1>();
+    for (py::ssize_t i = 0; i < length; ++i)
+        values(i) = static_cast<uint64_t>(i);
+
+    const py::str copy_name("copy"), update_name("update"), digest_name("digest");
+    uint64_t counter = 0;
+    for (py::ssize_t i = length - 1; i > 0; --i)
+    {
+        const uint64_t upper = static_cast<uint64_t>(i) + 1;
+        const uint64_t remainder = (uint64_t(0) - upper) % upper;
+        const uint64_t limit = uint64_t(0) - remainder;
+        uint64_t value;
+        do
+        {
+            if (counter >= (uint64_t(1) << 63))
+                throw std::runtime_error("permutation RNG counter is outside [0, 2**63)");
+            {
+                // Reuse Python's preseeded BLAKE2 implementation and its exact
+                // counter encoding; only the loop and permutation storage move
+                // to native code. No independent RNG implementation is needed.
+                char suffix[8];
+                for (int byte = 0; byte < 8; ++byte)
+                    suffix[byte] = static_cast<char>((counter >> (8 * byte)) & 0xff);
+                auto hash = py::reinterpret_steal<py::object>(
+                    PyObject_CallMethodNoArgs(base.ptr(), copy_name.ptr()));
+                if (!hash)
+                    throw py::error_already_set();
+                py::bytes encoded_counter(suffix, 8);
+                auto updated = py::reinterpret_steal<py::object>(
+                    PyObject_CallMethodOneArg(hash.ptr(), update_name.ptr(), encoded_counter.ptr()));
+                if (!updated)
+                    throw py::error_already_set();
+                auto digest = py::reinterpret_steal<py::object>(
+                    PyObject_CallMethodNoArgs(hash.ptr(), digest_name.ptr()));
+                if (!digest)
+                    throw py::error_already_set();
+                if (!PyBytes_Check(digest.ptr()) || PyBytes_GET_SIZE(digest.ptr()) < 8)
+                    throw std::invalid_argument("permutation digest must contain at least eight bytes");
+                const auto *bytes = reinterpret_cast<const unsigned char *>(PyBytes_AS_STRING(digest.ptr()));
+                value = 0;
+                for (int byte = 0; byte < 8; ++byte)
+                    value |= static_cast<uint64_t>(bytes[byte]) << (8 * byte);
+            }
+            ++counter;
+            if ((counter & 16383) == 0)
+            {
+                // C-backed hash calls do not run the interpreter's thread
+                // handoff checks. Bound GIL ownership even on rejection runs.
+                {
+                    py::gil_scoped_release release;
+                    // A bare yield can immediately reacquire the GIL before
+                    // a waiting decoder thread is scheduled.
+                    std::this_thread::sleep_for(std::chrono::microseconds(1));
+                }
+                if (PyErr_CheckSignals() != 0)
+                    throw py::error_already_set();
+            }
+        } while (remainder != 0 && value >= limit);
+        std::swap(values(i), values(value % upper));
+    }
+    return output;
+}
 
 class PackedUInt64Reservoir
 {
@@ -440,6 +510,7 @@ private:
 PYBIND11_MODULE(dataset_planner_cpp, module)
 {
     module.doc() = "Packed native dataset planner primitives";
+    module.def("counter_permutation", &counter_permutation);
     py::class_<PackedUInt64Reservoir>(module, "PackedUInt64Reservoir")
         .def(py::init<uint64_t, uint64_t>())
         .def("offer", &PackedUInt64Reservoir::offer)

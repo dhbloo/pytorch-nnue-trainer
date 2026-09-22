@@ -158,6 +158,11 @@ record is emitted.
 Packed reservoir checkpoints own immutable little-endian ID bytes and the exact RNG counter. Generic checkpoints
 serialize bounded envelopes and source-owned payload state.
 
+Packed reservoir draining builds its permutation in native code, preserving the
+same counter-based hash draws and sample order. It avoids a Python integer list
+and per-element interpreter loop, and periodically releases the GIL so decoder
+threads can continue while the permutation is built.
+
 ### Shape-aware global batches
 
 The planner forms batches by `shape_code` before taking rank-local slices. Uniform sources bypass shape queues.

@@ -7,7 +7,7 @@ import operator
 
 import numpy as np
 
-from .core import deterministic_permutation, rng_u64
+from .core import _counter_rng_base, rng_u64
 from .shuffle import RESERVOIR_ALGORITHM, ReservoirStats
 
 
@@ -294,7 +294,7 @@ class PackedUInt64ShuffleReservoir:
         if type(stream_key) is not tuple:
             raise TypeError("packed reservoir stream_key must be a tuple")
         try:
-            from dataset_planner_cpp import PackedUInt64Reservoir
+            from dataset_planner_cpp import PackedUInt64Reservoir, counter_permutation
         except ImportError as exc:
             raise RuntimeError(
                 "dataset_planner_cpp is required; run `python setup.py build_ext --inplace`"
@@ -310,6 +310,7 @@ class PackedUInt64ShuffleReservoir:
             (RESERVOIR_ALGORITHM, self.epoch, self.stream_key),
         )
         self._core = PackedUInt64Reservoir(capacity, self._rng_base)
+        self._drain_permutation = counter_permutation
         self._state_cache: PackedReservoirState | None = None
 
     def __len__(self) -> int:
@@ -346,9 +347,9 @@ class PackedUInt64ShuffleReservoir:
     def drain(self) -> np.ndarray:
         if self.closed:
             return np.empty(0, dtype=np.uint64)
-        order = np.asarray(
-            deterministic_permutation(
-                len(self),
+        order = self._drain_permutation(
+            len(self),
+            _counter_rng_base(
                 self.seed,
                 "shuffle_reservoir_drain",
                 (
@@ -359,7 +360,6 @@ class PackedUInt64ShuffleReservoir:
                     self._core.rng_counter,
                 ),
             ),
-            dtype=np.uint64,
         )
         emitted = self._core.drain(order)
         self._state_cache = None
