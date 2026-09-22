@@ -422,10 +422,20 @@ bucketed by shape before the global batch is partitioned across ranks; each
 rank therefore receives the same board size at each step. Queued shape buckets
 and source cursors are included in exact checkpoint/rollback state.
 
+Mixed processed-NPZ batches retain packed IDs through decoding. Requests are
+grouped by child across each bounded prefetch chunk, decoded as arrays, and
+scattered back into the original batch positions. Sample keys remain lazy;
+rule labels and deterministic child transforms follow the same row routing.
+This avoids reconstructing per-row envelopes and dictionaries for numeric
+mixed batches. The generic mixed path also combines compatible numeric child
+arrays directly; tensor and variable-length fields retain compatibility
+collation. Field schemas and batch-shared values are still checked.
 
 The mixed path prepares one shared decoded cache over all child files, and uses
 one parent memory budget, bounded parallel decoding, pinning, and telemetry.
-It does not allocate an independent adaptive budget for every child. Keep
+Its output reservations include the temporary coexistence of child decode
+arrays and merged output, plus routing and lazy-key metadata. It does not
+allocate an independent adaptive budget for every child. Keep
 `dataloader_args.batch_by_boardsize: true` for mixed sizes. With
 `cuda_prefetch_batches: 1`, mixed shapes automatically select the existing
 shape-flexible CUDA lookahead loader; uniform streams retain static input slots.

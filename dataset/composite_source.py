@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 import numpy as np
 
-from .core import canonical_pipeline_state_bytes
+from .core import FIELD_SPECS, canonical_pipeline_state_bytes, validate_field_dict
 from .mixing import MixingConfig
 from .source import RecordEnvelope, SourceCapabilities
 from .stream import collate_sample_dicts
@@ -15,6 +15,53 @@ from .stream import collate_sample_dicts
 COMPOSITE_SOURCE_SCHEMA = "composite-record-source-v4"
 COMPOSITE_ENVELOPE_OVERHEAD_BYTES = 128
 MIXING_BLOCK_ROWS = 1024
+
+
+def _merge_child_batches(groups, size):
+    """Scatter decoded child arrays once, retaining the shared field contract."""
+    if not groups:
+        raise ValueError("cannot materialize an empty composite batch")
+    first = groups[0][1]
+    for positions, data in groups:
+        if data.keys() != first.keys():
+            raise ValueError("decoded children have inconsistent field schemas")
+        if len(data["board_size"]) != len(positions):
+            raise ValueError("decoded child changed the batch row count")
+
+    # Keep the generic contract for tensor and ragged/list-valued sources.
+    if any(
+        not isinstance(value, np.ndarray) or value.dtype.kind == "O" or value.ndim < 2
+        for _, data in groups for value in data.values()
+    ):
+        samples = [None] * size
+        for positions, data in groups:
+            for row, position in enumerate(positions):
+                samples[int(position)] = {key: value[row] for key, value in data.items()}
+        return collate_sample_dicts(samples, validate_core_fields=True)
+
+    for _, data in groups:
+        validate_field_dict(data, batched=True)
+    for key, value in first.items():
+        for _, data in groups[1:]:
+            if data[key].shape[1:] != value.shape[1:]:
+                raise ValueError(f"field {key!r} has incompatible child shapes")
+            if FIELD_SPECS[key].scope == "batch_shared" and not np.array_equal(
+                data[key][0], value[0]
+            ):
+                raise ValueError(f"batch-shared field {key!r} differs between children")
+    if len(groups) == 1:
+        return first
+    output = {
+        key: np.empty(
+            (size, *value.shape[1:]),
+            dtype=np.result_type(*(data[key].dtype for _, data in groups)),
+        )
+        for key, value in first.items()
+    }
+    for positions, data in groups:
+        for key, value in data.items():
+            output[key][positions] = value
+    return output
 
 
 @dataclass(frozen=True, slots=True)
@@ -417,21 +464,15 @@ class CompositeRecordSource:
                 raise RuntimeError("composite envelope identity is inconsistent")
             grouped[payload.child_index].append((output_index, payload.envelope))
 
-        samples = [None] * len(envelopes)
+        groups = []
         for child, routed in enumerate(grouped):
             if not routed:
                 continue
             child_batch = self.child_sources[child].materialize_batch(
                 tuple(envelope for _, envelope in routed)
             )
-            for child_row, (output_index, _) in enumerate(routed):
-                samples[output_index] = {
-                    key: value[child_row]
-                    for key, value in child_batch.items()
-                }
-        if any(sample is None for sample in samples):
-            raise RuntimeError("composite materialization left an unrouted row")
-        return collate_sample_dicts(samples, validate_core_fields=True)
+            groups.append((np.asarray([index for index, _ in routed], dtype=np.intp), child_batch))
+        return _merge_child_batches(groups, len(envelopes))
 
     def _save_child_envelope(self, child: int, envelope: RecordEnvelope) -> dict:
         source = self.child_sources[child]

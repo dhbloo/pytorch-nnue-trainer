@@ -38,6 +38,8 @@ _READY_BATCH_METADATA_BYTES_PER_ROW = (
     2 * struct.calcsize("P") + _BATCH_MASK_BYTES
 )
 _PINNED_FINALIZATION_COPY_COUNT = 2
+# Child IDs, gather positions, child-key arrays and lazy output-key lookups.
+_COMPOSITE_ROUTING_BYTES_PER_ROW = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,10 +200,18 @@ class AdaptivePipelineRuntime:
         output_copy_count = (
             _PINNED_FINALIZATION_COPY_COUNT if planned_pin_memory else 1
         )
+        if packed_mixed_shapes:
+            # Child decode chunks coexist with their scattered composite output.
+            # Routing indices and lazy keys also outlive child materialization.
+            output_copy_count += 1
+        composite_metadata_bytes = (
+            _COMPOSITE_ROUTING_BYTES_PER_ROW if packed_mixed_shapes else 0
+        )
         output_batch_bytes = (
             (
                 max(positive_output_sizes) * output_copy_count
                 + _READY_BATCH_METADATA_BYTES_PER_ROW
+                + composite_metadata_bytes
             )
             * local_batch_size
         )

@@ -1,11 +1,12 @@
 """Fixed-width record routing for mixed, uniform-shape processed NPZ sources."""
 
 import hashlib
+import operator
 from collections.abc import Sequence
 
 import numpy as np
 
-from .composite_source import CompositeRecordSource
+from .composite_source import CompositeRecordSource, _merge_child_batches
 from .core import canonical_pipeline_state_bytes
 from .npz_source import DenseNpzSource
 from .packed import PackedEnvelopeBatch, PackedRecordBlock
@@ -24,6 +25,32 @@ class _CompositeSampleKeys(Sequence):
             return tuple(self[i] for i in range(*index.indices(len(self))))
         return ("composite", self.child_id, self.keys[index])
 
+
+class _MixedCompositeSampleKeys(Sequence):
+    """Resolve keys lazily without recreating source envelopes or row tuples."""
+
+    def __init__(self, groups, size):
+        self.keys = tuple(keys for _, keys in groups)
+        self.groups = np.empty(size, dtype=np.uint16)
+        self.rows = np.empty(size, dtype=np.intp)
+        for group, (positions, keys) in enumerate(groups):
+            if len(positions) != len(keys):
+                raise RuntimeError("decoded child changed the sample key count")
+            self.groups[positions] = group
+            self.rows[positions] = np.arange(len(positions))
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[i] for i in range(*index.indices(len(self))))
+        index = operator.index(index)
+        if index < 0:
+            index += len(self)
+        if not 0 <= index < len(self):
+            raise IndexError("composite sample key index out of range")
+        return self.keys[int(self.groups[index])][int(self.rows[index])]
 
 
 class PackedCompositeRecordSource(CompositeRecordSource):
@@ -164,38 +191,66 @@ class PackedCompositeRecordSource(CompositeRecordSource):
             output.append(self._wrap(child, envelope))
         return tuple(output)
 
-    def _child_batch(self, envelopes):
+    def _child_batches(self, envelopes):
         if envelopes.identity != self._identity:
             raise RuntimeError("packed composite batch belongs to a different source")
         children = envelopes.record_ids >> np.uint64(self._child_shift)
-        child = int(children[0])
-        if not 0 <= child < len(self.child_sources) or np.any(children != child):
-            return None
-        source = self.child_sources[child]
-        values = np.ascontiguousarray(envelopes.record_ids & np.uint64(self._row_mask))
-        return child, PackedEnvelopeBatch(
-            values, source.envelopes_from_record_ids, self._child_identities[child]
-        )
+        if not len(children):
+            raise ValueError("cannot materialize an empty composite batch")
+        if np.any(children >= len(self.child_sources)):
+            raise ValueError("invalid packed composite child")
+        unique = np.unique(children)
+        for child in unique:
+            child = int(child)
+            positions = np.flatnonzero(children == child)
+            values = (
+                envelopes.record_ids if len(unique) == 1 else envelopes.record_ids[positions]
+            ) & np.uint64(self._row_mask)
+            source = self.child_sources[child]
+            yield child, positions, PackedEnvelopeBatch(
+                values, source.envelopes_from_record_ids, self._child_identities[child]
+            )
 
     def materialize_batch_with_keys(self, envelopes):
-        routed = (
-            self._child_batch(envelopes)
-            if isinstance(envelopes, PackedEnvelopeBatch)
-            else None
-        )
-        if routed is None:
+        if not isinstance(envelopes, PackedEnvelopeBatch):
             return super().materialize_batch(envelopes), tuple(e.record_key for e in envelopes)
-        child, batch = routed
-        data, keys = self.child_sources[child].materialize_batch_with_keys(batch)
-        # Child decoding already applies its deterministic symmetry. Composite
-        # batch transforms need the composite identity, not a child-only key.
-        return data, _CompositeSampleKeys(self.child_ids[child], keys)
+        return self.materialize_batches_with_keys((envelopes,))[0]
 
     def materialize_batch(self, envelopes):
         return self.materialize_batch_with_keys(envelopes)[0]
 
     def materialize_batches_with_keys(self, batches):
-        return [self.materialize_batch_with_keys(batch) for batch in batches]
+        if not all(isinstance(batch, PackedEnvelopeBatch) for batch in batches):
+            return [self.materialize_batch_with_keys(batch) for batch in batches]
+        requests = [[] for _ in self.child_sources]
+        for index, batch in enumerate(batches):
+            for child, positions, routed in self._child_batches(batch):
+                requests[child].append((index, positions, routed))
+        data_groups = [[] for _ in batches]
+        key_groups = [[] for _ in batches]
+        for child, group in enumerate(requests):
+            if not group:
+                continue
+            source = self.child_sources[child]
+            routed = tuple(batch for _, _, batch in group)
+            decoded = (
+                (source.materialize_batch_with_keys(routed[0]),)
+                if len(routed) == 1 else source.materialize_batches_with_keys(routed)
+            )
+            if len(decoded) != len(group):
+                raise RuntimeError("decoded child changed the batch count")
+            for (index, positions, _), (data, keys) in zip(group, decoded):
+                if len(keys) != len(positions):
+                    raise RuntimeError("decoded child changed the sample key count")
+                data_groups[index].append((positions, data))
+                key_groups[index].append((positions, _CompositeSampleKeys(self.child_ids[child], keys)))
+        return [
+            (
+                data[0][1] if len(data) == 1 else _merge_child_batches(data, len(batch)),
+                keys[0][1] if len(keys) == 1 else _MixedCompositeSampleKeys(keys, len(batch)),
+            )
+            for batch, data, keys in zip(batches, data_groups, key_groups)
+        ]
 
     def save_cursor(self, cursor):
         pending = cursor.pending
