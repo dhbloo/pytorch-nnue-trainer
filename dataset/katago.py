@@ -83,9 +83,11 @@ class KatagoNumpyDataset(Dataset):
         filter_condition: str | None = None,
         shuffle: bool = False,
         value_td_level: int = 0,
+        rule: str | None = None,
     ):
         super().__init__()
         self.file_list = file_list
+        self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.fixed_board_size = fixed_board_size
@@ -96,6 +98,10 @@ class KatagoNumpyDataset(Dataset):
         self.filter_condition = filter_condition
         self.value_td_level = value_td_level
         self._sample_root_digest = _dataset_content_digest(self.file_list)
+        if self.rule_index is not None:
+            self._sample_root_digest = hashlib.sha256(
+                self._sample_root_digest + b"rule-index" + bytes([self.rule_index])
+            ).digest()
         self._active_epoch = 0
         if filter_stm is not None and not isinstance(filter_stm, int):
             raise TypeError("filter_stm must be an integer")
@@ -223,6 +229,8 @@ class KatagoNumpyDataset(Dataset):
             "stm_input": stm_input,
             "value_target": value_target,
             "policy_target": policy_target,
+            **({"rule_index": np.full((len(board_size), 1), self.rule_index, dtype=np.int64)}
+               if self.rule_index is not None else {}),
         }, len(board_size)
 
     def __len__(self):
@@ -285,15 +293,18 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
         shuffle_window_size: int = 32768,
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
+        rule: str | None = None,
     ):
         super().__init__()
         self.file_list = file_list
+        self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.batch_pipelines = tuple(batch_pipelines)
         self.extra_kwargs = {
+            **({"rule": rule} if rule is not None else {}),
             "fixed_board_size": fixed_board_size,
             "has_pass_move": has_pass_move,
             "apply_symmetry": apply_symmetry,
@@ -415,15 +426,21 @@ class ProcessedKatagoNumpyDataset(Dataset):
         stm_input_channel: int | None = None,
         value_target_channels: list[int] | None = None,
         shuffle: bool = False,
+        rule: str | None = None,
     ):
         super().__init__()
         self.file_list = file_list
+        self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.fixed_board_size = fixed_board_size
         self.has_pass_move = has_pass_move
         self.apply_symmetry = apply_symmetry
         self._sample_root_digest = _dataset_content_digest(self.file_list)
+        if self.rule_index is not None:
+            self._sample_root_digest = hashlib.sha256(
+                self._sample_root_digest + b"rule-index" + bytes([self.rule_index])
+            ).digest()
         self._active_epoch = 0
 
         self.data_dict = {
@@ -530,6 +547,8 @@ class ProcessedKatagoNumpyDataset(Dataset):
             "stm_input": stm_input,
             "value_target": value_target,
             "policy_target": policy_target,
+            **({"rule_index": np.array([self.rule_index], dtype=np.int64)}
+               if self.rule_index is not None else {}),
         }
 
     def __len__(self):
@@ -592,9 +611,11 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
         shuffle_window_size: int = 32768,
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
+        rule: str | None = None,
     ):
         super().__init__()
         self.file_list = file_list
+        self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.boardsizes = boardsizes
         self.fixed_side_input = fixed_side_input
         self.shuffle = shuffle
@@ -606,6 +627,7 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
             else None
         )
         self.extra_kwargs = {
+            "rule": rule,
             "fixed_board_size": fixed_board_size,
             "has_pass_move": has_pass_move,
             "apply_symmetry": apply_symmetry,
@@ -745,11 +767,13 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         shuffle_window_size: int = 32768,
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
+        rule: str | None = None,
     ):
         super().__init__(
             file_list=file_list,
             boardsizes=boardsizes,
             rules=rules,
+            rule=rule,
             fixed_side_input=fixed_side_input,
             fixed_board_size=fixed_board_size,
             has_pass_move=has_pass_move,

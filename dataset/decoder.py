@@ -15,7 +15,7 @@ try:
 except ImportError:  # NumPy < 2.0
     from numpy.lib.format import _read_array_header as _read_npy_array_header
 
-from utils.data_utils import post_process_batch, post_process_data
+from utils.data_utils import Rule, post_process_batch, post_process_data
 
 from .core import (
     DatasetRuntimeContext,
@@ -60,8 +60,10 @@ class ProcessedNpzDecoder:
         board_input_channels: list[int] | None = None,
         stm_input_channel: int | None = None,
         value_target_channels: list[int] | None = None,
+        rule: str | None = None,
     ):
         self.boardsizes = frozenset(boardsizes)
+        self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.runtime_context = runtime_context
         self.fixed_side_input = bool(fixed_side_input)
         self.fixed_board_size = fixed_board_size
@@ -264,6 +266,7 @@ class ProcessedNpzDecoder:
             "board_input_channels": self.board_input_channels,
             "stm_input_channel": self.stm_input_channel,
             "value_target_channels": self.value_target_channels,
+            **({"rule_index": self.rule_index} if self.rule_index is not None else {}),
             "record_identity": "file-sha256-plus-logical-row-v2",
             "symmetry_rng": "processed-splitmix-v1",
         }
@@ -537,6 +540,7 @@ class ProcessedNpzDecoder:
             + stm_input_elements * np.dtype(np.float32).itemsize
             + value_target_elements * np.dtype(np.float32).itemsize
             + policy_target_elements * np.dtype(np.float32).itemsize
+            + (np.dtype(np.int64).itemsize if self.rule_index is not None else 0)
         )
 
     def _mmap_stored_arrays(self, canonical: str):
@@ -1027,6 +1031,8 @@ class ProcessedNpzDecoder:
                 "stm_input": stm_input,
                 "value_target": value_target,
                 "policy_target": policy_target,
+                **({"rule_index": np.array([self.rule_index], dtype=np.int64)}
+                   if self.rule_index is not None else {}),
             },
             fixed_side_input=self.fixed_side_input,
             fixed_board_size=self.fixed_board_size,
@@ -1035,6 +1041,8 @@ class ProcessedNpzDecoder:
         )
 
     def _post_process_vectorized(self, data: dict, refs) -> dict:
+        if self.rule_index is not None:
+            data["rule_index"] = np.full((len(refs), 1), self.rule_index, dtype=np.int64)
         # SourceBatchDataset validates every batched field before yielding.
         # Avoid repeating the same schema walk when no transform needs it.
         if not self.fixed_side_input and not self.apply_symmetry:

@@ -21,11 +21,15 @@ dataset_args:
       dataset_type: iterative_katago_numpy
       data_paths:
       - data/gomoku/f15
+      boardsizes: 15
+      rule: freestyle
       sample_rate: 1.0
     f20:
       dataset_type: iterative_processed_katago_numpy
       data_paths:
       - data/gomoku/f20
+      boardsizes: 20
+      rule: freestyle
       sample_rate: 1.0
 
   sample_rate: 1.0

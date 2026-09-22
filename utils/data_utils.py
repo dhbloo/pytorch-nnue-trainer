@@ -18,6 +18,18 @@ class Rule(Enum):
     STANDARD = 1
     RENJU = 4
 
+    @classmethod
+    def from_string(cls, name: str) -> "Rule":
+        """Parse a canonical rule name without changing the binary rule values."""
+        if not isinstance(name, str):
+            raise TypeError("rule must be a string")
+        for rule in cls:
+            if str(rule) == name:
+                return rule
+        raise ValueError(
+            f"Unknown rule {name!r}; expected freestyle, standard, or renju"
+        )
+
     @property
     def index(self) -> int:
         Indices = [0, 1, None, None, 2]

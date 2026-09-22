@@ -654,3 +654,24 @@ path, offset, row, or subrecord logic remains behind the source interface; it mu
 - Source-specific physical details stay behind `RecordSource`.
 - Dense uniform NPZ has the strongest production performance coverage; other formats retain the same semantic
   and memory contracts but should be profiled on their representative real data before performance claims.
+
+## Rule annotations for NPZ sources
+
+Raw and processed KataGo NPZ datasets accept an optional `rule` declaration:
+`freestyle`, `standard`, or `renju`. `Rule.from_string` in `utils/data_utils.py`
+uses the existing stable training indices `0`, `1`, and `2`. These indices are
+not the binary format's enum values (Renju's enum value is `4`). The declaration
+applies to every sample in that source; it does not infer or validate game rules
+from board positions, filenames, or stored targets.
+
+When declared, the loader adds `rule_index` with sample shape `(1,)` and NumPy
+`int64` dtype. Batches have shape `(B, 1)` and become `torch.int64` tensors during
+normal loader conversion. Scalar, vectorized, packed, and cached decode paths
+retain the annotation through shuffling, augmentation, and distributed slicing.
+Changing the declaration changes source identity for exact resume. Omitting it
+preserves the previous output and identity. A composite rejects children that
+mix annotated and unannotated output schemas, even with different board sizes.
+
+The singular `rule` annotates a source. The existing plural `rules` option does
+not create NPZ annotations and must not be used as a replacement. Models receive
+`rule_index` in the batch dictionary.

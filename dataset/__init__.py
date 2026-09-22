@@ -65,6 +65,24 @@ def _read_multi_dataset(
             dataset = dataset_cls(file_list=flist, **resolved_args)
         datasets.append(dataset)
     
+    def emits_rule_index(dataset):
+        # Pipeline and evaluation wrappers preserve the underlying fields.
+        wrapped = getattr(dataset, "dataset", None)
+        if wrapped is not None:
+            return emits_rule_index(wrapped)
+        children = getattr(dataset, "datasets", None)
+        if children is not None:
+            return all(emits_rule_index(child) for child in children)
+        if isinstance(dataset, (DATASETS["simple_binary"], DATASETS["packed_binary"])):
+            return not dataset.drop_extra
+        return getattr(dataset, "rule_index", None) is not None
+
+    labelled = [emits_rule_index(dataset) for dataset in datasets]
+    if any(labelled) and not all(labelled):
+        raise ValueError(
+            "mixed datasets must either all provide rule_index or all omit it; "
+            "set rule on every NPZ child when using rule annotations"
+        )
     return datasets, blend_ratios
 
 
@@ -410,22 +428,27 @@ def build_dataset(
     }
     format_keys = {
         "katago_numpy": {
+            "rule",
             "has_pass_move", "filter_stm", "filter_condition", "value_td_level",
         },
         "iterative_katago_numpy": {
+            "rule",
             "has_pass_move", "filter_stm", "filter_condition", "value_td_level",
             "shuffle_window_size", "shuffle_buffer_bytes", "steps_per_epoch",
         },
         "processed_katago_numpy": {
+            "rule",
             "has_pass_move", "filter_stm", "filter_condition",
             "board_input_channels", "stm_input_channel", "value_target_channels",
         },
         "iterative_processed_katago_numpy": {
+            "rule",
             "has_pass_move", "filter_stm", "filter_condition",
             "board_input_channels", "stm_input_channel", "value_target_channels",
             "shuffle_window_size", "shuffle_buffer_bytes", "steps_per_epoch",
         },
         "batched_processed_katago_numpy": {
+            "rule",
             "has_pass_move", "filter_stm", "filter_condition",
             "board_input_channels", "stm_input_channel", "value_target_channels",
             "prefetch_threads", "prefetch_batches", "pin_memory",
