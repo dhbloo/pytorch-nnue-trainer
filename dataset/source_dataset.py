@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from torch.utils.data.dataset import IterableDataset
 
 from .core import DatasetCapabilities, PreparedPipelineBatch
@@ -62,6 +63,7 @@ class SourceBatchDataset:
         output_batch_bytes: int = 0,
         planner_token_bytes: int = 0,
         output_is_pinned: bool = False,
+        epoch_lookahead_bytes: int = 0,
     ):
         self.planner = planner
         self.source = source
@@ -93,6 +95,7 @@ class SourceBatchDataset:
         for name, value in (
             ("output_batch_bytes", output_batch_bytes),
             ("planner_token_bytes", planner_token_bytes),
+            ("epoch_lookahead_bytes", epoch_lookahead_bytes),
         ):
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
@@ -127,6 +130,10 @@ class SourceBatchDataset:
         self.output_batch_bytes = output_batch_bytes
         self.planner_token_bytes = planner_token_bytes
         self.output_is_pinned = output_is_pinned
+        self.epoch_lookahead_bytes = epoch_lookahead_bytes
+        self._prefetch_iterator = None
+        self._next_epoch_planner = None
+        self._iteration_active = False
 
     @property
     def active_prefetch_workers(self) -> int:
@@ -239,6 +246,13 @@ class SourceBatchDataset:
         return tuple(envelope.record_key for envelope in envelopes)
 
     def _decode_batches(self, batches):
+        if any(batch.epoch != batches[0].epoch for batch in batches):
+            raise RuntimeError("one decode chunk cannot span epochs")
+        context = getattr(self.source, "materialization_epoch", None)
+        with context(batches[0].epoch) if context is not None else nullcontext():
+            return self._materialize_batches(batches)
+
+    def _materialize_batches(self, batches):
         local_batches = [self.planner.local_slice(batch) for batch in batches]
         envelope_batches = tuple(envelopes for envelopes, _ in local_batches)
         if hasattr(self.source, "materialize_batches_with_keys"):
@@ -337,21 +351,29 @@ class SourceBatchDataset:
         )
         return data, token, mask, sample_keys
 
-    def _planned_transactions(self):
-        current = self.planner.next_transactional_batch()
+    def _planner_for_epoch(self, epoch):
+        if self.planner.epoch == epoch:
+            return self.planner
+        if self._next_epoch_planner is not None and self._next_epoch_planner.epoch == epoch:
+            return self._next_epoch_planner
+        raise RuntimeError("prefetch plan no longer owns its epoch")
+
+    def _planned_transactions(self, epoch):
+        current = self._planner_for_epoch(epoch).next_transactional_batch()
         if current is None:
             raise RuntimeError(
                 "stream epoch produced no global batch; reduce the batch size "
                 "or increase the sampling rate"
             )
         while current is not None:
+            planner = self._planner_for_epoch(epoch)
             batch, token = current
             if batch.is_last:
                 following = None
             else:
-                following = self.planner.next_transactional_batch()
+                following = planner.next_transactional_batch()
                 if following is None:
-                    batch, token = self.planner.finalize_terminal_token(token)
+                    batch, token = planner.finalize_terminal_token(token)
             yield batch, token
             if batch.is_last:
                 return
@@ -442,63 +464,90 @@ class SourceBatchDataset:
             current = following
 
     def _iter_prefetched(self):
-        planned = iter(self._planned_transactions())
+        planning_epoch = self.planner.epoch
+        planned = iter(self._planned_transactions(planning_epoch))
         pending = deque()
         pending_batches = 0
         exhausted = False
         active_reservation_batches = deque()
+        staged_items = []
+        staged_reservations = []
 
-        def submit_chunk(executor):
-            nonlocal exhausted, pending_batches
-            limit = self.active_prefetch_batches
-            if exhausted or pending_batches >= limit:
+        def flush_chunk(executor):
+            if not staged_items:
                 return False
-            items = []
-            reservation_batches = []
+            future = executor.submit(
+                self._run_decode_batches,
+                tuple(batch for batch, _ in staged_items),
+            )
+            pending.append((tuple(staged_items), future, tuple(staged_reservations)))
+            staged_items.clear()
+            staged_reservations.clear()
+            return True
+
+        def submit_chunk(executor, planning_budget=None):
+            nonlocal exhausted, pending_batches, planned, planning_epoch
+            limit = self.active_prefetch_batches
+            if staged_items and (
+                len(staged_items) >= self.active_prefetch_chunk_batches or exhausted
+            ):
+                flush_chunk(executor)
+            if pending_batches >= limit:
+                return False
+            if exhausted:
+                if (
+                    not self.epoch_lookahead_bytes
+                    or self.planner.runtime_context.mode != "train"
+                    or not self.planner._packed
+                    or not self.source.capabilities.resumable
+                    or not callable(getattr(self.source, "materialization_epoch", None))
+                    or planning_epoch != self.planner.epoch
+                    or self._next_epoch_planner is not None
+                ):
+                    return False
+                self._next_epoch_planner = self.planner.fork_next_epoch()
+                planning_epoch += 1
+                planned = iter(self._planned_transactions(planning_epoch))
+                exhausted = False
             capacity = limit - pending_batches
-            chunk_size = min(self.active_prefetch_chunk_batches, capacity)
+            chunk_size = min(
+                self.active_prefetch_chunk_batches - len(staged_items), capacity
+            )
+            if planning_budget is not None:
+                chunk_size = min(chunk_size, planning_budget)
+            admitted = False
             for _ in range(chunk_size):
                 reservations = self._try_reserve_batch_memory()
                 if reservations is None:
                     break
                 try:
-                    items.append(next(planned))
+                    staged_items.append(next(planned))
                 except StopIteration:
                     self._release_reservations(reservations)
                     exhausted = True
                     break
                 except BaseException:
                     self._release_reservations(reservations)
-                    for held in reservation_batches:
-                        self._release_reservations(held)
                     raise
-                reservation_batches.append(reservations)
-            if not items:
-                return False
-            try:
-                future = executor.submit(
-                    self._run_decode_batches,
-                    tuple(batch for batch, _ in items),
-                )
-            except BaseException:
-                for reservations in reservation_batches:
-                    self._release_reservations(reservations)
-                raise
-            pending.append(
-                (
-                    tuple(items),
-                    future,
-                    tuple(reservation_batches),
-                )
-            )
-            pending_batches += len(items)
-            return True
+                staged_reservations.append(reservations)
+                pending_batches += 1
+                admitted = True
+                if staged_items[-1][0].is_last:
+                    exhausted = True
+                    break
+            if staged_items and (
+                len(staged_items) >= self.active_prefetch_chunk_batches
+                or exhausted
+                or planning_budget is None
+            ):
+                flush_chunk(executor)
+            return admitted
 
         try:
             with ThreadPoolExecutor(
                 max_workers=self.maximum_prefetch_workers
             ) as executor:
-                while pending_batches < self.active_prefetch_batches and not exhausted:
+                while pending_batches < self.active_prefetch_batches:
                     if not submit_chunk(executor):
                         break
                 if not pending and not exhausted:
@@ -528,17 +577,21 @@ class SourceBatchDataset:
                             reservations,
                         )
                         yield envelope
-                    while (
-                        pending_batches < self.active_prefetch_batches
-                        and not exhausted
-                    ):
-                        if not submit_chunk(executor):
-                            break
+                        # Amortize planning over consumption while retaining
+                        # complete decode chunks. One extra admission catches
+                        # up after a queue expansion or temporary underfill.
+                        for _ in range(2):
+                            if not submit_chunk(executor, planning_budget=1):
+                                break
+                    if not pending:
+                        flush_chunk(executor)
                 if not exhausted:
                     raise RuntimeError(
                         "host-data memory budget stalled the ordered prefetch queue"
                     )
         finally:
+            for reservations in staged_reservations:
+                self._release_reservations(reservations)
             while active_reservation_batches:
                 self._release_reservations(
                     active_reservation_batches.popleft()
@@ -548,21 +601,49 @@ class SourceBatchDataset:
                 for reservations in reservation_batches:
                     self._release_reservations(reservations)
 
-    def __iter__(self):
-        if self.planner.finished:
-            self.planner.begin_next_epoch()
-        completed = False
+    def close(self):
+        iterator, self._prefetch_iterator = self._prefetch_iterator, None
         try:
-            iterator = (
-                self._iter_prefetched()
-                if self._effective_prefetch_workers > 0
-                else self._iter_synchronous()
-            )
-            yield from iterator
-            completed = True
+            if iterator is not None:
+                iterator.close()
         finally:
-            if not completed:
-                if self.source.capabilities.resumable:
-                    self.planner.rollback_uncommitted()
-                elif hasattr(self.source, "close_cursor"):
-                    self.source.close_cursor(self.planner._source_cursor)
+            successor, self._next_epoch_planner = self._next_epoch_planner, None
+            if successor is not None:
+                successor.close()
+
+    def __iter__(self):
+        if self._iteration_active:
+            raise RuntimeError("planner materialization supports one active iterator")
+        self._iteration_active = True
+        terminal = False
+        try:
+            if self.planner.finished:
+                self.planner.begin_next_epoch(self._next_epoch_planner)
+                self._next_epoch_planner = None
+            if self._prefetch_iterator is None:
+                self._prefetch_iterator = (
+                    self._iter_prefetched()
+                    if self._effective_prefetch_workers > 0
+                    else self._iter_synchronous()
+                )
+            for envelope in self._prefetch_iterator:
+                terminal = envelope.token.batch.is_last
+                yield envelope
+                if terminal:
+                    break
+        finally:
+            committed_terminal = (
+                terminal
+                and self.planner.finished
+                and self.planner._yield_digest == self.planner._committed_digest
+            )
+            try:
+                if not committed_terminal or self._next_epoch_planner is None:
+                    self.close()
+                if not committed_terminal:
+                    if self.source.capabilities.resumable:
+                        self.planner.rollback_uncommitted()
+                    elif hasattr(self.source, "close_cursor"):
+                        self.source.close_cursor(self.planner._source_cursor)
+            finally:
+                self._iteration_active = False

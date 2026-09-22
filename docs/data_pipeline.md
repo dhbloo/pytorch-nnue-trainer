@@ -506,6 +506,24 @@ waiting call. This keeps the ordered consumer's next chunk from being starved
 by speculative work, without increasing worker concurrency, cache capacity, or
 the ready queue. Batch publication and committed sample order remain unchanged.
 
+After the initial queue fill, the consumer plans replacement batches incrementally
+between training steps and accumulates them into the existing decode chunks.
+A bounded extra admission catches up when queue capacity grows. Staged batches
+count toward the same memory and queue limits; epoch ends and an otherwise empty
+queue flush partial chunks. This avoids periodic large planning bursts while
+preserving grouped file reads and batch decoding.
+
+Compatible adaptive NPZ training also prefetches across epoch boundaries. Once
+the current epoch is fully planned, its remaining batches and the next epoch's
+first batches share one bounded queue and decode executor. The next planner is
+adopted only after the current epoch is committed; checkpoints still describe
+consumed training data. Augmentation uses each batch's epoch even when workers
+decode two epochs concurrently. Both planner states are included in the host
+memory capacity calculation. If the selected layout cannot fit that overlap,
+the loader retains finite-epoch prefetch. This is automatic and adds no public
+configuration option; stateful transforms and evaluation keep their existing
+epoch lifecycle.
+
 The controller has only two adaptive decisions:
 
 - two consecutive wait-heavy windows with private-cache reloads grow the cache geometrically, by at least one

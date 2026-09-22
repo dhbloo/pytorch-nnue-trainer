@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+
 import hashlib
 import struct
 from collections import deque
@@ -1288,13 +1290,50 @@ class DatasetPlanner:
     def commit_batch(self, token: PlannerBatchToken) -> None:
         self.commit_prepared(self.prepare_commit([token]))
 
-    def begin_next_epoch(self) -> None:
+    def fork_next_epoch(self):
+        """Plan one epoch ahead without advancing the committed training cursor."""
+        if not self.finished or not self._packed or not self.source.capabilities.resumable:
+            raise RuntimeError("epoch lookahead requires a finished resumable packed plan")
+        if self.pipeline_composer is not None and not self.pipeline_composer.is_parallel_stateless:
+            raise RuntimeError("epoch lookahead requires stateless batch transforms")
+        successor = copy.copy(self)
+        successor._source_cursor = None
+        successor._ready = deque()
+        successor._packed_ready = PackedUInt64ReadyBuffer()
+        successor._shape_queues = {}
+        successor._packed_shape_queues = {}
+        successor._committed_pipeline_blob = self._yield_pipeline_blob
+        successor.start_epoch(self.epoch + 1)
+        successor._committed_state = successor._transaction_state()
+        successor._yield_state = successor._committed_state
+        successor._committed_digest = successor._initial_digest(successor.epoch)
+        successor._yield_digest = successor._committed_digest
+        successor._yield_pipeline_blob = successor._committed_pipeline_blob
+        return successor
+
+    def begin_next_epoch(self, prepared=None) -> None:
         if not self.finished:
             raise RuntimeError("cannot advance an unfinished planner epoch")
         if self._yield_digest != self._committed_digest:
             raise RuntimeError("cannot advance with uncommitted planner batches")
         if self._packed and self._reservoir.pending_transaction_count:
             raise RuntimeError("cannot advance with pending packed transactions")
+        if prepared is not None:
+            if (
+                prepared.source is not self.source
+                or prepared.epoch != self.epoch + 1
+                or prepared.runtime_context != self.runtime_context
+                or prepared.config != self.config
+                or prepared._committed_state.batch_index != 0
+                or prepared._committed_pipeline_blob != self._committed_pipeline_blob
+            ):
+                raise RuntimeError("prepared epoch does not follow the committed cursor")
+            self.close()
+            self.__dict__.update(prepared.__dict__)
+            # Transfer cursor ownership while retaining this planner's identity
+            # for the trainer, checkpoints and the materialization adapter.
+            prepared._source_cursor = None
+            return
         self.start_epoch(self.epoch + 1)
         self._committed_state = (
             self._transaction_state()

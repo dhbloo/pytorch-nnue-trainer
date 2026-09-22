@@ -90,10 +90,28 @@ class ProcessedNpzDecoder:
         self._cache_closed = False
         self._validated_stored_npz_paths = set()
         self._mapped_shards = {}
-        self._active_epoch = 0
+        self._default_epoch = 0
+        self._materialization_context = threading.local()
+
+    @property
+    def _active_epoch(self):
+        return getattr(self._materialization_context, "epoch", self._default_epoch)
 
     def set_epoch(self, epoch: int) -> None:
-        self._active_epoch = int(epoch)
+        self._default_epoch = int(epoch)
+
+    @contextmanager
+    def materialization_epoch(self, epoch):
+        """Bind augmentation to the batch, independent of concurrent planning."""
+        previous = getattr(self._materialization_context, "epoch", None)
+        self._materialization_context.epoch = int(epoch)
+        try:
+            yield
+        finally:
+            if previous is None:
+                del self._materialization_context.epoch
+            else:
+                self._materialization_context.epoch = previous
 
     def configure_cache(
         self,

@@ -162,6 +162,7 @@ class AdaptiveMultiMixin:
             host_memory_budget=runtime.memory_budget,
             output_batch_bytes=runtime.output_batch_bytes,
             planner_token_bytes=runtime.planner_token_bytes,
+            epoch_lookahead_bytes=runtime.epoch_lookahead_bytes,
             output_is_pinned=settings.pin_memory,
             pipeline_stats=self.pipeline_stats,
             adaptive_runtime=runtime,
@@ -170,6 +171,12 @@ class AdaptiveMultiMixin:
     def close(self):
         try:
             error = None
+            adapter = getattr(self, "_planned_decoder", None)
+            if adapter is not None:
+                try:
+                    adapter.close()
+                except Exception as exc:
+                    error = exc
             for child in self.datasets:
                 close = getattr(child, "close", None)
                 if close is not None:

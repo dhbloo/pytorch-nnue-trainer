@@ -7,7 +7,7 @@ metadata into one memory budget and one observation-driven controller.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
@@ -323,6 +323,21 @@ class AdaptivePipelineRuntime:
             resources.per_rank_host_budget_bytes
         )
         self.controller = AdaptivePipelineController(spec.config, constraints)
+        # An overlapping epoch owns another reservoir and cursor. Include its
+        # full floor in every future layout/capacity decision, not just the
+        # currently charged bytes when decode workers happen to be idle.
+        self.epoch_lookahead_bytes = 0
+        if (
+            packed_uniform
+            and self.controller.capacity_bytes() + fixed_semantic_floor_bytes
+            <= resources.per_rank_host_budget_bytes
+        ):
+            self.epoch_lookahead_bytes = fixed_semantic_floor_bytes
+            self.constraints = replace(
+                constraints,
+                fixed_semantic_floor_bytes=2 * fixed_semantic_floor_bytes,
+            )
+            self.controller.constraints = self.constraints
         self._semantic_reservation = None
         self._events: list[dict] = []
         self._total_logical_rows = total_logical_rows

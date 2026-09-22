@@ -1088,6 +1088,9 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                     if adaptive_runtime is None
                     else adaptive_runtime.planner_token_bytes
                 ),
+                epoch_lookahead_bytes=(
+                    0 if adaptive_runtime is None else adaptive_runtime.epoch_lookahead_bytes
+                ),
                 output_is_pinned=(
                     False
                     if adaptive_runtime is None
@@ -1130,8 +1133,13 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         runtime = self._adaptive_pipeline_runtime
         self._adaptive_pipeline_runtime = None
         try:
-            if decoder is not None and hasattr(decoder, "close"):
-                decoder.close()
+            try:
+                adapter = getattr(self, "_planned_decoder", None)
+                if adapter is not None:
+                    adapter.close()
+            finally:
+                if decoder is not None and hasattr(decoder, "close"):
+                    decoder.close()
         finally:
             if runtime is not None:
                 runtime.close()

@@ -3,6 +3,7 @@
 import hashlib
 import operator
 from collections.abc import Sequence
+from contextlib import ExitStack, contextmanager
 
 import numpy as np
 
@@ -59,6 +60,13 @@ class PackedCompositeRecordSource(CompositeRecordSource):
     thread_safe_materialization = True
     _child_shift = 48
     _row_mask = (1 << _child_shift) - 1
+
+    @contextmanager
+    def materialization_epoch(self, epoch):
+        with ExitStack() as stack:
+            for source in self.child_sources:
+                stack.enter_context(source.materialization_epoch(epoch))
+            yield
 
     @staticmethod
     def supports(sources):

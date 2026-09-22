@@ -285,6 +285,9 @@ class DenseNpzSource:
     def start_epoch(self, epoch: int, rank: int) -> DenseNpzCursor:
         return self.start_cycle(epoch, 0, rank)
 
+    def materialization_epoch(self, epoch):
+        return self.decoder.materialization_epoch(epoch)
+
     def start_cycle(self, epoch: int, cycle: int, rank: int) -> DenseNpzCursor:
         if epoch < 0 or cycle < 0:
             raise ValueError("dense NPZ epoch/cycle must be non-negative")
