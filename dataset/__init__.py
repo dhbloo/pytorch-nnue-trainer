@@ -412,11 +412,11 @@ def build_dataset(
     dataset_cls = DATASETS[dataset_type]
     if (
         adaptive_pipeline is not None
-        and dataset_type not in {"batched_processed_katago_numpy", "iterative_multi"}
+        and dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy", "iterative_multi"}
     ):
         raise ValueError(
             "adaptive_pipeline currently supports only "
-            "batched_processed_katago_numpy or compatible iterative_multi"
+            "batched_processed_katago_numpy, batched_katago_numpy, or compatible iterative_multi"
         )
     explicit_shuffle_window_size = "shuffle_window_size" in kwargs
     explicit_pin_memory = "pin_memory" in kwargs
@@ -456,6 +456,11 @@ def build_dataset(
             "rule",
             "has_pass_move", "filter_stm", "filter_condition",
             "board_input_channels", "stm_input_channel", "value_target_channels",
+            "shuffle_window_size", "shuffle_buffer_bytes", "steps_per_epoch",
+        },
+        "batched_katago_numpy": {
+            "rule", "has_pass_move", "value_td_level",
+            "prefetch_threads", "prefetch_batches", "pin_memory", "observability",
             "shuffle_window_size", "shuffle_buffer_bytes", "steps_per_epoch",
         },
         "batched_processed_katago_numpy": {

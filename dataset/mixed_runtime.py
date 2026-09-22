@@ -57,8 +57,11 @@ class AdaptiveMultiMixin:
         self._node_decoded_cache_catalog = None
         if spec is None:
             return
-        if not all(type(child) is BatchedProcessedKatagoNumpyDataset for child in self.datasets):
-            raise ValueError("adaptive iterative_multi requires batched processed NPZ children")
+        from .raw_npz import BatchedKatagoNumpyDataset
+
+        if not all(type(child) in {BatchedProcessedKatagoNumpyDataset, BatchedKatagoNumpyDataset}
+                   for child in self.datasets):
+            raise ValueError("adaptive iterative_multi requires compatible batched NPZ children")
         unsupported = (
             "filter_stm", "filter_condition", "board_input_channels",
             "stm_input_channel", "value_target_channels",
@@ -80,6 +83,7 @@ class AdaptiveMultiMixin:
         return (
             self.adaptive_pipeline is not None
             and self.adaptive_pipeline.node_decoded_cache is not None
+            and all(type(child) is BatchedProcessedKatagoNumpyDataset for child in self.datasets)
         )
 
     def _configure_adaptive_children(self):

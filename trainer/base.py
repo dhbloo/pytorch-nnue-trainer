@@ -783,7 +783,7 @@ class BaseTrainer:
         )
         if self.data_pipeline is None:
             if (
-                self.dataset_type != "batched_processed_katago_numpy"
+                self.dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy"}
                 or self.num_worker != 0
                 or not pipeline_eligible
                 or legacy_options.intersection(self.dataset_args)
@@ -797,10 +797,10 @@ class BaseTrainer:
             raise ValueError(
                 "data_pipeline requires parallel-stateless data_pipelines"
             )
-        if self.dataset_type not in {"batched_processed_katago_numpy", "iterative_multi"}:
+        if self.dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy", "iterative_multi"}:
             raise ValueError(
                 "data_pipeline currently supports only "
-                "batched_processed_katago_numpy or compatible iterative_multi"
+                "batched_processed_katago_numpy, batched_katago_numpy, or compatible iterative_multi"
             )
         if self.num_worker != 0:
             raise ValueError(

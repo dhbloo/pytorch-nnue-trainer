@@ -117,9 +117,9 @@ rule input and explicitly rejects conditioned models; ONNX/TorchScript engine
 export needs a separately designed I/O contract. Interactive callers must also
 provide `rule_index` before using a conditioned model.
 
-When mixing raw and processed NPZ sources, use the generic data pipeline and
-omit `data_pipeline`; the adaptive pipeline currently supports processed
-sources only. Keep `dataloader_args.batch_by_boardsize: true` for mixed board
+When mixing dense raw and processed NPZ sources, use `batched_katago_numpy`
+and `batched_processed_katago_numpy` children with `data_pipeline: {}` to share
+the adaptive batch runtime and bounded decoded RAM caches. Keep `dataloader_args.batch_by_boardsize: true` for mixed board
 sizes. Balanced mixing assigns equal source shares, so multiple sources with
 the same rule contribute multiple shares; side splitting does not rebalance
 samples. Validation should use held-out directories and its own mixing mode.

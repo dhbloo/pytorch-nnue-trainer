@@ -893,6 +893,13 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             }
         return data
 
+    def _make_record_decoder(self, telemetry_enabled, stats, **kwargs):
+        if telemetry_enabled:
+            from .telemetry import ObservedProcessedNpzDecoder
+
+            return ObservedProcessedNpzDecoder(pipeline_stats=stats, **kwargs)
+        return ProcessedNpzDecoder(**kwargs)
+
     def _adaptive_runtime_manifests(self, manifests):
         if self._pipeline_composer is None:
             return manifests
@@ -944,13 +951,9 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             if telemetry_enabled:
                 stats = PipelineStats()
         decoder_kwargs, symmetry, planner_config = self._processed_stream_options()
-        decoder_cls = ProcessedNpzDecoder
-        if telemetry_enabled:
-            from .telemetry import ObservedProcessedNpzDecoder
-
-            decoder_cls = ObservedProcessedNpzDecoder
-            decoder_kwargs["pipeline_stats"] = stats
-        self._record_decoder = decoder_cls(
+        self._record_decoder = self._make_record_decoder(
+            telemetry_enabled,
+            stats,
             boardsizes=self.boardsizes,
             runtime_context=runtime_context,
             fixed_side_input=self.fixed_side_input,

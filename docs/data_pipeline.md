@@ -79,7 +79,7 @@ datasets use the planner and receive a required `DatasetRuntimeContext` from the
 | --- | --- |
 | `katago_numpy`, `processed_katago_numpy`, `multi` | Map-style indexing and sampler-owned sampling |
 | `iterative_katago_numpy`, `iterative_processed_katago_numpy` | Planned NPZ with Dense or Indexed identities |
-| `batched_processed_katago_numpy` | Dense NPZ with a packed uniform-shape fast path and internal decode prefetch |
+| `batched_processed_katago_numpy`, `batched_katago_numpy` | Dense processed/native NPZ sharing packed batch decoding, bounded caching and internal prefetch |
 | `sparse_numpy`, `iterative_sparse_numpy` | Planned Indexed NPZ |
 | `simple_binary`, `packed_binary` | Interleaved sequential source |
 | `iterative_multi` | Composite of native child sources |
@@ -262,6 +262,7 @@ For example, combine this data fragment with a model and optimizer recipe:
 
 ```yaml
 dataset_type: iterative_multi
+data_pipeline: {}
 no_shuffle: false
 num_worker: 0
 dataset_args:
@@ -280,7 +281,7 @@ dataset_args:
       boardsizes: 15
       rule: standard
     renju_source:
-      dataset_type: iterative_katago_numpy
+      dataset_type: batched_katago_numpy
       data_paths: [data/renju/train]
       boardsizes: 15
       rule: renju
@@ -341,10 +342,15 @@ weighted-then-drain ordering is not retained. Old composite runtime checkpoints
 are incompatible with the new source schema; use the original code to resume
 those runs or start a new data stream with the new configuration.
 
-The raw NPZ example uses the generic pipeline. Adaptive `data_pipeline` requires
-all children to be compatible batched processed NPZ sources; when that condition
-holds, add `data_pipeline: {}` to retain adaptive caching and decode prefetch.
-Rules remain attached in either pipeline. See [Rule annotations for NPZ
+The example uses the same adaptive runtime for processed and native raw NPZ.
+Native `batched_katago_numpy` normalizes full-board arrays once per cache miss,
+then shares vectorized gathering, symmetry, packed mixing and ordered prefetch
+with `batched_processed_katago_numpy`. Its decoded cache is bounded CPU memory;
+it does not convert the dataset or write normalized files. Raw sources disable
+the optional processed-only disk cache for the mixture. Raw filters, channel
+selection and padded board masks are rejected explicitly, without a scalar
+fallback. The legacy iterative reader still serves those distinct contracts;
+it is not recommended for dense mixed training. Rules remain attached. See [Rule annotations for NPZ
 sources](#rule-annotations-for-npz-sources) for the field contract.
 
 ## Prefetch and device handoff
@@ -403,7 +409,7 @@ the legacy `prefetch_threads` setting.
 
 The primary resource interface is the top-level singular `data_pipeline` mapping. It is separate from
 `data_pipelines`, the older list of semantic batch transforms. The adaptive interface supports
-`dataset_type: batched_processed_katago_numpy` and requires `num_worker: 0`. It can compose `data_pipelines`
+`dataset_type: batched_processed_katago_numpy` or `batched_katago_numpy` and requires `num_worker: 0`. It can compose `data_pipelines`
 whose registered transforms declare themselves parallel and stateless; other semantic transforms remain on the
 compatibility path and are rejected when adaptive control is explicitly requested.
 
@@ -415,14 +421,14 @@ reported as configuration errors instead of silently disabling adaptation.
 
 For `iterative_multi`, opt in explicitly with `data_pipeline: {}` and keep
 `num_worker: 0`. This path supports dense, unfiltered
-`batched_processed_katago_numpy` children, each with one explicit board size,
+`batched_processed_katago_numpy` or `batched_katago_numpy` children, each with one explicit board size,
 and no composite batch transforms. It retains the selected `mixing` policy and supported record-level
 `sample_rate` semantics. Packed record IDs are shuffled and
 bucketed by shape before the global batch is partitioned across ranks; each
 rank therefore receives the same board size at each step. Queued shape buckets
 and source cursors are included in exact checkpoint/rollback state.
 
-Mixed processed-NPZ batches retain packed IDs through decoding. Requests are
+Mixed dense NPZ batches retain packed IDs through decoding. Requests are
 grouped by child across each bounded prefetch chunk, decoded as arrays, and
 scattered back into the original batch positions. Sample keys remain lazy;
 rule labels and deterministic child transforms follow the same row routing.
@@ -431,8 +437,9 @@ mixed batches. The generic mixed path also combines compatible numeric child
 arrays directly; tensor and variable-length fields retain compatibility
 collation. Field schemas and batch-shared values are still checked.
 
-The mixed path prepares one shared decoded cache over all child files, and uses
-one parent memory budget, bounded parallel decoding, pinning, and telemetry.
+The mixed path uses one parent memory budget for decoded RAM caches, bounded
+parallel decoding, pinning, and telemetry. An all-processed mixture may also
+prepare a shared mapped cache; native raw mixtures use only the RAM caches.
 Its output reservations include the temporary coexistence of child decode
 arrays and merged output, plus routing and lazy-key metadata. It does not
 allocate an independent adaptive budget for every child. Keep
