@@ -90,7 +90,10 @@ class _CapturedNewtonSchulz:
                 orthogonalize(self.static_input)
         torch.cuda.current_stream().wait_stream(side_stream)
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph):
+        # Decode workers allocate independent pinned CPU buffers. Restrict
+        # capture checks to this thread so those allocations do not invalidate
+        # the graph, which only uses its own stable GPU buffers.
+        with torch.cuda.graph(self.graph, capture_error_mode="thread_local"):
             self.static_output = orthogonalize(self.static_input)
 
     def __call__(self, stacked: Tensor) -> Tensor:
