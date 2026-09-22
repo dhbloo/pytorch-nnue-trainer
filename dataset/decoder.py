@@ -31,6 +31,7 @@ from .host_memory import (
 )
 from .stream import (
     _sha256_file,
+    collate_sample_dicts,
 )
 
 
@@ -1551,3 +1552,19 @@ class NpzRowRecordDecoder:
                 symmetry_index=symmetry_index,
             )
         return sample
+
+    def decode_batch(self, refs):
+        refs = tuple(refs)
+        if not refs:
+            return None
+        groups = {}
+        for index, ref in enumerate(refs):
+            groups.setdefault(os.path.abspath(ref.path), []).append((index, ref))
+        samples = [None] * len(refs)
+        copy_rows = len(groups) > 1 and not self.apply_symmetry
+        for entries in groups.values():
+            for index, ref in entries:
+                sample = self.decode_one(ref)
+                # Detach selected rows before evicting their file's backing arrays.
+                samples[index] = copy.deepcopy(sample) if copy_rows else sample
+        return collate_sample_dicts(samples, validate_core_fields=True)
