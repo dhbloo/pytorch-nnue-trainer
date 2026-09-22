@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import os
 import threading
@@ -174,12 +175,13 @@ class ObservedProcessedNpzDecoder(ProcessedNpzDecoder):
 
 
 class _AdjustableConcurrencyGate:
-    """Limit active decode calls while retaining one reusable executor."""
+    """Admit waiting decode calls fairly within a resizable concurrency limit."""
 
     def __init__(self, limit: int):
         self._condition = threading.Condition()
         self._limit = int(limit)
         self._active = 0
+        self._pending = deque()
 
     def set_limit(self, limit: int) -> None:
         with self._condition:
@@ -188,9 +190,20 @@ class _AdjustableConcurrencyGate:
 
     def run(self, callback, *args):
         with self._condition:
-            while self._active >= self._limit:
-                self._condition.wait()
+            ticket = object()
+            self._pending.append(ticket)
+            try:
+                # A worker completing newer chunks must not repeatedly bypass
+                # an older call needed by the ordered consumer.
+                while self._active >= self._limit or self._pending[0] is not ticket:
+                    self._condition.wait()
+            except BaseException:
+                self._pending.remove(ticket)
+                self._condition.notify_all()
+                raise
+            self._pending.popleft()
             self._active += 1
+            self._condition.notify_all()
         try:
             return callback(*args)
         finally:

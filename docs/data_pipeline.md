@@ -500,6 +500,12 @@ portable CPU ceiling; chunk size and queue depth are balanced around that count.
 depth form one layout: the controller never adjusts one value while leaving the other two in an unrelated
 intermediate state.
 
+Waiting decode calls enter the concurrency limit in FIFO order. A worker that
+finishes a later chunk cannot repeatedly take the next slot ahead of an older
+waiting call. This keeps the ordered consumer's next chunk from being starved
+by speculative work, without increasing worker concurrency, cache capacity, or
+the ready queue. Batch publication and committed sample order remain unchanged.
+
 The controller has only two adaptive decisions:
 
 - two consecutive wait-heavy windows with private-cache reloads grow the cache geometrically, by at least one
