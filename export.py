@@ -9,6 +9,7 @@ from datetime import datetime
 from dataset import build_dataset
 from dataset.core import single_process_dataset_context
 from model import build_model
+from model.rule_condition import RuleConditionEncoder
 from model.serialization import (
     build_serializer,
     get_rules_from_args,
@@ -102,6 +103,8 @@ def _get_git_revision_short_hash(fallback: str = "(unknown)") -> str:
 class ModelIOv1(torch.nn.Module):
     def __init__(self, warpped_model, apply_policy_softmax=False):
         super().__init__()
+        if any(isinstance(module, RuleConditionEncoder) for module in warpped_model.modules()):
+            raise ValueError("ModelIOv1 has no rule_index input; rule-conditioned export is unsupported")
         self.warpped_model = warpped_model
         self.apply_policy_softmax = apply_policy_softmax
         if apply_policy_softmax:

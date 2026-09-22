@@ -162,13 +162,14 @@ class ResNet(nn.Module):
         value_bias=False,
         value_gap_norm="none",
         use_channel_last=True,
+        input_args=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
         self.head_type = head_type
         self.input_type = input_type
 
-        self.input_plane = build_input_plane(input_type)
+        self.input_plane = build_input_plane(input_type, **(input_args or {}))
         self.conv_input = Conv2dBlock(
             self.input_plane.dim_plane,
             dim_feature,
@@ -238,13 +239,14 @@ class ResNetv2(nn.Module):
         value_bias=False,
         value_gap_norm="none",
         use_channel_last=True,
+        input_args=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
         self.head_type = head_type
         self.input_type = input_type
 
-        self.input_plane = build_input_plane(input_type)
+        self.input_plane = build_input_plane(input_type, **(input_args or {}))
         self.conv_input = Conv2dBlock(
             self.input_plane.dim_plane,
             dim_feature,
@@ -317,6 +319,7 @@ class ResNetv3(nn.Module):
         value_gap_norm="none",
         drop_mask=False,
         use_channel_last=False,
+        input_args=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -324,7 +327,7 @@ class ResNetv3(nn.Module):
         self.input_type = input_type
         self.drop_mask = drop_mask
 
-        self.input_plane = build_input_plane(input_type)
+        self.input_plane = build_input_plane(input_type, **(input_args or {}))
         self.conv_input = Conv2dBlock(
             self.input_plane.dim_plane,
             dim_feature,

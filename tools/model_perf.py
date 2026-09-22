@@ -9,6 +9,7 @@ import yaml
 from torch.utils.flop_counter import FlopCounterMode
 
 from model import build_model
+from model.rule_condition import RuleConditionEncoder
 from utils.compile_utils import model_inductor_config, with_inductor_options
 from utils.cuda_utils import configure_cuda_memory_limit
 from utils.file_utils import load_torch_ckpt
@@ -145,6 +146,9 @@ def make_synthetic_data(
         "value_target": torch.from_numpy(value_target),
         "policy_target": torch.from_numpy(policy_target),
     }
+
+    if any(isinstance(module, RuleConditionEncoder) for module in model.modules()):
+        data["rule_index"] = torch.from_numpy(rng.integers(0, 3, size=(batch_size, 1), dtype=np.int64))
 
     sparse_dimensions = sparse_feature_dimensions(model)
     if sparse_dimensions is not None:

@@ -1,10 +1,15 @@
 import torch
 import torch.nn as nn
 
+from .rule_condition import RuleConditionEncoder
 from .validation import validate_batch_shared_value
 
 
-def build_input_plane(input_type):
+def build_input_plane(input_type, **input_args):
+    if input_type == "rule":
+        return RuleConditionedInput(**input_args)
+    if input_args:
+        raise TypeError(f"Input {input_type!r} does not accept input_args")
     if input_type == "basic":
         return BasicInputPlane(with_stm=True)
     elif input_type == "basic-nostm" or input_type == "basicns":
@@ -49,7 +54,8 @@ class BasicInputPlane(nn.Module):
         super().__init__()
         self.with_stm = with_stm
 
-    def forward(self, data, inv_side=False):
+    def input_components(self, data, inv_side=False):
+        """Return plane views for one final concatenation by input wrappers."""
         board_input = data["board_input"].float()
         stm_input = data["stm_input"]
         assert stm_input.dtype == torch.float32
@@ -61,11 +67,12 @@ class BasicInputPlane(nn.Module):
         if self.with_stm:
             B, C, H, W = board_input.shape
             stm_input = stm_input.reshape(B, 1, 1, 1).expand(B, 1, H, W)
-            input_plane = torch.cat([board_input, stm_input], dim=1)
-        else:
-            input_plane = board_input
+            return board_input, stm_input
+        return (board_input,)
 
-        return input_plane
+    def forward(self, data, inv_side=False):
+        parts = self.input_components(data, inv_side)
+        return torch.cat(parts, dim=1) if len(parts) > 1 else parts[0]
 
     @property
     def dim_plane(self):
@@ -79,6 +86,9 @@ class MaskedInputPlane(BasicInputPlane):
     def forward(self, data, inv_side=False):
         input_plane = super().forward(data, inv_side)
 
+        return input_plane, self.input_mask(data, input_plane)
+
+    def input_mask(self, data, input_plane):
         board_size = data["board_size"]
         B, C, H, W = data["board_input"].shape
 
@@ -89,7 +99,7 @@ class MaskedInputPlane(BasicInputPlane):
         mask_cols = cols < board_size[:, 1].view(B, 1, 1)  # [B, 1, W]
         mask_plane = (mask_rows & mask_cols).unsqueeze(1)  # [B, 1, H, W]
 
-        return input_plane, mask_plane.to(input_plane.dtype)
+        return mask_plane.to(input_plane.dtype)
 
 
 class SparseEmbeddingInputPlane(BasicInputPlane):
@@ -102,14 +112,13 @@ class SparseEmbeddingInputPlane(BasicInputPlane):
         non_empty_mask = torch.unsqueeze(non_empty_mask, dim=1)  # [B, 1, H, W]
         return torch.masked_fill(sparse_feature, non_empty_mask, 0)
 
-    def forward(self, data, inv_side=False):
+    def input_components(self, data, inv_side=False):
         sparse_feature = self._embed_sparse(data)
         sparse_feature = self._mask_non_empty(data, sparse_feature)
 
         if self.with_basic:
-            input_plane = super().forward(data, inv_side=inv_side)
-            return torch.cat([input_plane, sparse_feature], dim=1)
-        return sparse_feature
+            return (*super().input_components(data, inv_side), sparse_feature)
+        return (sparse_feature,)
 
 
 class PatternCodeEmbeddingInputPlane(SparseEmbeddingInputPlane):
@@ -196,3 +205,32 @@ class LinePatEmbeddingInputPlane(SparseEmbeddingInputPlane):
     def dim_plane(self):
         base_dim = super().dim_plane if self.with_basic else 0
         return base_dim + self.feature_dim * 4
+
+
+class RuleConditionedInput(nn.Module):
+    """Compose any existing plane input with spatially broadcast rule features."""
+
+    def __init__(self, base="basicns", split_by_side=("renju",)):
+        super().__init__()
+        if base == "rule":
+            raise ValueError("A rule input cannot wrap another rule input")
+        self.base = build_input_plane(base)
+        self.encoder = RuleConditionEncoder(split_by_side)
+
+    @property
+    def dim_plane(self):
+        return self.base.dim_plane + self.encoder.dim_feature
+
+    def forward(self, data, inv_side=False):
+        if "rule_index" not in data:
+            raise ValueError("Rule-conditioned input requires dataset rule_index labels")
+        parts = self.base.input_components(data, inv_side)
+        features = self.encoder(data["rule_index"], data["stm_input"], inv_side)
+        B, _, H, W = parts[0].shape
+        if features.shape[0] != B:
+            raise ValueError("rule_index and board_input must have the same batch size")
+        rule_planes = features[:, :, None, None].expand(B, -1, H, W)
+        planes = torch.cat((*parts, rule_planes), dim=1)
+        if isinstance(self.base, MaskedInputPlane):
+            return planes, self.base.input_mask(data, planes)
+        return planes

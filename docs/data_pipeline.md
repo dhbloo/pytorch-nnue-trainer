@@ -791,9 +791,14 @@ mix annotated and unannotated output schemas, even with different board sizes.
 
 The singular `rule` annotates a source. The existing plural `rules` option does
 not create NPZ annotations and must not be used as a replacement. Models receive
-`rule_index` in the batch dictionary.
+`rule_index` in the batch dictionary. ResNet-family models can consume it with
+`input_type: rule`; see [Rule-conditioned model inputs](model_inputs.md) for
+configuration, side splitting, tensor shapes, compilation, and checkpoints.
 
 Rule labels and mixing are independent: different sources may declare the same
 rule, and no mode automatically balances rule classes. Configure each child's
 `rule` alongside its `data_paths` and choose the source distribution through
 `mixing`, as shown in [Composite sources and mixing modes](#composite-sources-and-mixing-modes).
+
+Rule-free input types continue to ignore the metadata. Selecting a rule-conditioned
+input requires every source and inference caller to provide the annotation.

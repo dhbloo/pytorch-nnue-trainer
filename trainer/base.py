@@ -46,6 +46,7 @@ from dataset.core import (
     canonical_pipeline_state_bytes,
 )
 from model import build_model
+from model.rule_condition import RuleConditionEncoder
 from model.vq import (
     VectorQuantize,
     clear_ddp_preinit_gradients,
@@ -130,13 +131,19 @@ def _devices_match(actual, expected):
 
 
 def _batch_norm_only_buffers(module):
-    """Return buffers when every one is owned by an ordinary BatchNorm."""
+    """Return BN buffers if all other buffers are immutable rule constants.
+
+    None means ineligible; an empty tuple needs no evaluation synchronization.
+    """
     buffers = tuple(module.buffers())
     if not buffers:
         return ()
 
     batch_norm_buffer_ids = set()
+    immutable_buffer_ids = set()
     for child in module.modules():
+        if isinstance(child, RuleConditionEncoder):
+            immutable_buffer_ids.update(id(value) for value in child.buffers())
         if isinstance(child, _BatchNorm) and not isinstance(
             child, torch.nn.SyncBatchNorm
         ):
@@ -144,9 +151,10 @@ def _batch_norm_only_buffers(module):
                 value = child._buffers.get(name)
                 if value is not None:
                     batch_norm_buffer_ids.add(id(value))
-    if all(id(buffer) in batch_norm_buffer_ids for buffer in buffers):
-        return buffers
-    return ()
+    allowed = batch_norm_buffer_ids | immutable_buffer_ids
+    if all(id(buffer) in allowed for buffer in buffers):
+        return tuple(buffer for buffer in buffers if id(buffer) in batch_norm_buffer_ids)
+    return None
 
 
 def _prepared_ddp(model):
@@ -3761,10 +3769,11 @@ class BaseTrainer:
             if ddp is None:
                 continue
             buffers = _batch_norm_only_buffers(ddp.module)
-            if not buffers:
+            if buffers is None:
                 continue
             ddp.broadcast_buffers = False
-            syncs.append((ddp.process_group, buffers))
+            if buffers:
+                syncs.append((ddp.process_group, buffers))
         self._evaluation_buffer_syncs = tuple(syncs)
 
     def _synchronize_evaluation_buffers(self):

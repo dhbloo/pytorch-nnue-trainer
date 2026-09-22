@@ -46,6 +46,14 @@ class ModelEMA:
                     raise RuntimeError(
                         f"EMA checkpoint tensor {name!r} differs from the model"
                     )
+            # EMA restores only parameter shadows, so model load hooks do not run.
+            from model.rule_condition import RuleConditionEncoder
+
+            for name, module in model.named_modules():
+                if isinstance(module, RuleConditionEncoder):
+                    module.validate_checkpoint_mapping(
+                        state_dict, prefix=f"{name}." if name else ""
+                    )
 
         shadows_by_parameter = {}
         self._shadows_by_name = {}
