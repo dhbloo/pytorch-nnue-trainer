@@ -129,17 +129,17 @@ class Muon(torch.optim.Optimizer):
         momentum: The momentum used by the internal SGD.
         nesterov: Whether to use Nesterov-style momentum in the internal SGD. (recommended)
         ns_steps: The number of Newton-Schulz iteration steps to use.
-        ns_backend: ``newtonschulz`` (default quintic NS) or ``gram`` (Gram-NS
-            on the smaller side, with an optional Triton path).
+        ns_backend: ``gram`` (default Gram-NS on the smaller side, with an
+            optional Triton path) or ``newtonschulz`` (quintic NS).
         reset_iterations: Gram-NS steps that refresh the residual from X.
-            Ignored by the default backend.
+            Ignored by the ``newtonschulz`` backend.
         use_fused_kernels: Use the Triton Gram-NS kernels. Requires
             ``ns_backend='gram'`` and CUDA.
         use_cuda_graph: Capture the Newton-Schulz iteration into a CUDA graph,
             one per input shape, and replay it. On by default; ignored on CPU.
             Set ``False`` to opt out.
-        use_baddbmm: Use torch.baddbmm() for speeding up the default NS path.
-        use_bf16: Run the default NS path in bf16 on devices that support it.
+        use_baddbmm: Use torch.baddbmm() for speeding up the ``newtonschulz`` path.
+        use_bf16: Run the ``newtonschulz`` path in bf16 on devices that support it.
     """
 
     def __init__(
@@ -150,7 +150,7 @@ class Muon(torch.optim.Optimizer):
         momentum=0.95,
         nesterov=True,
         ns_steps=5,
-        ns_backend="newtonschulz",
+        ns_backend="gram",
         reset_iterations=None,
         use_fused_kernels=False,
         use_cuda_graph=True,

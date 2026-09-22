@@ -183,7 +183,7 @@ def _make_muon_adamw(parameters, model, lr, weight_decay, **kwargs):
     muon_params_id_set = {id(param) for param in muon_params}
     if excluded_names:
         _print_once(f"Muon exclude_keys routed to AdamW: {excluded_names}")
-    adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8}
+    adamw_args = {"betas": (0.9, 0.999), "eps": 1e-8, "weight_decay": 1e-3}
     adamw_args.update(kwargs.pop("adamw_args", {}))
     # ChainedOptimizer copies its scheduler-controlled LR to both children on
     # every step. Reject a separate child LR instead of silently ignoring it.
