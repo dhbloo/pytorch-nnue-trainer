@@ -232,14 +232,120 @@ Uncompressed seekable binary streams support exact resume with reader byte offse
 subrecords, and serialized reservoir payloads. Continuous LZ4 streams are deterministic but declare resume
 unsupported because their decompressor state cannot be reconstructed from a normal file seek.
 
-### Composite sources
+### Composite sources and mixing modes
 
-`iterative_multi` combines native child sources without converting their physical handles. A deterministic
-integer-ratio schedule selects children, and composite identity includes the child ID. Materialization groups by
-child when necessary and restores planner order.
+`iterative_multi` combines native child sources. Each entry in `dataset_dict`
+provides its own format, paths, board sizes, and optional rule declaration.
+`multi` remains the map-style concatenation counterpart; the mixing modes below
+apply to `iterative_multi`.
 
-The composite is resumable only when every child is resumable. `sync_length=True` emits complete ratio cycles
-and stops when the next cycle cannot be satisfied; other modes follow their configured quota policy.
+Use one `mixing` mapping to select both the source distribution and epoch
+completion policy. Omitting it selects `balanced`.
+
+| `mixing.mode` | Source distribution | Epoch completion |
+|---|---|---|
+| `balanced` | Equal source counts | Last complete equal-weight cycle |
+| `weighted` | Each child's positive `blend_ratio` (default `1.0`) | Last complete weighted cycle |
+| `natural` | Random interleaving proportional to remaining source rows | Every source row supplied once |
+| `tempered` | Size weights `N_i ** size_power` | Maximum feasible proportional quotas, rounded down to whole rows |
+
+`balanced` and `weighted` supply deterministic integer-ratio cycles to the
+planner's bounded shuffle. `natural` and interior `tempered` modes randomly
+interleave remaining source quotas in bounded blocks without replacement.
+Within each child, the existing file order and bounded sample shuffle still
+apply: this is not a globally uniform permutation of every stored position.
+Sources with the same output shape can share a batch. Different shapes retain
+the existing shape buckets. Source weights are not per-batch quotas, and a
+short prefix can fluctuate.
+
+For example, combine this data fragment with a model and optimizer recipe:
+
+```yaml
+dataset_type: iterative_multi
+no_shuffle: false
+num_worker: 0
+dataset_args:
+  mixing:
+    mode: natural
+  shuffle_window_size: 262144
+  dataset_dict:
+    freestyle_source:
+      dataset_type: batched_processed_katago_numpy
+      data_paths: [data/freestyle/train]
+      boardsizes: 15
+      rule: freestyle
+    standard_source:
+      dataset_type: batched_processed_katago_numpy
+      data_paths: [data/standard/train]
+      boardsizes: 15
+      rule: standard
+    renju_source:
+      dataset_type: iterative_katago_numpy
+      data_paths: [data/renju/train]
+      boardsizes: 15
+      rule: renju
+dataloader_args:
+  batch_by_boardsize: true
+```
+
+Choose equal source supply with `mixing: {mode: balanced}`. To configure a
+`2:1:1` source mix, use `mixing: {mode: weighted}` and set `blend_ratio: 2.0`
+on the first child and `blend_ratio: 1.0` on the other two. These weights balance
+sources, not rule classes: two freestyle sources and one source for each other
+rule have a `2:1:1` rule mix at equal source weights. `blend_ratio` is rejected
+outside `weighted`, even when explicitly set to `1.0`.
+
+To transition between equal source counts and the original size distribution:
+
+```yaml
+mixing:
+  mode: tempered
+  size_power: 0.5
+```
+
+`size_power` is required in `tempered`, must be finite and in `[0, 1]`, and is
+rejected in other modes. Zero is exactly `balanced`; one is exactly `natural`,
+including order and completion behavior for the same seed. For an interior
+power `alpha`, let `N_min` be the smallest child count. The epoch quota is
+`floor(N_min * (N_i / N_min) ** alpha)` for each child; limiting sources retain
+all `N_min` rows. This differs from the continuous ideal by less than one row
+per child. The remaining rows of larger sources are not visited in that epoch.
+Known-length, globally planned sources are not oversampled within an epoch.
+Unknown-length rank-sharded streams retain their existing step-budget cycle policy.
+
+`N_i` counts logical rows after decoder-side filters. `natural` and interior
+`tempered` require known counts and `sample_rate: 1` on every child; sources
+with probabilistic admission or unknown length are rejected instead of using
+incorrect estimated counts. Natural mixing skips valid empty sources and
+rejects an entirely empty mixture. Balanced, weighted, and interior tempered
+mixing fail when a source cannot supply its required positive contribution.
+Binary/sequential streams can still use balanced or weighted mixing under
+their existing planner constraints.
+
+Completion refers to the source stream. Training drops incomplete global
+shape batches, so yielded training counts can be slightly smaller; evaluation
+pads shape tails and supplies an `is_real` mask instead. Use `natural` on the
+validation composite to cover all held-out sources. A fixed training step
+limit may also stop partway through an epoch.
+
+Keep `no_shuffle: false` in training recipes; direct `build_dataset` callers
+must pass `shuffle=True` to enable the planner shuffle. Natural/tempered source
+selection itself is seeded independently of that planner switch. Source
+selection is rank-independent for globally planned datasets. Mode, quotas,
+seed, pending source records, and remaining counts participate in exact resume;
+changing the mixing contract rejects an old cursor.
+
+`sync_length` has been removed. Migrate equal-source recipes to `balanced`,
+custom ratios to `weighted`, and full-source coverage to `natural`. The old
+weighted-then-drain ordering is not retained. Old composite runtime checkpoints
+are incompatible with the new source schema; use the original code to resume
+those runs or start a new data stream with the new configuration.
+
+The raw NPZ example uses the generic pipeline. Adaptive `data_pipeline` requires
+all children to be compatible batched processed NPZ sources; when that condition
+holds, add `data_pipeline: {}` to retain adaptive caching and decode prefetch.
+Rules remain attached in either pipeline. See [Rule annotations for NPZ
+sources](#rule-annotations-for-npz-sources) for the field contract.
 
 ## Prefetch and device handoff
 
@@ -310,11 +416,12 @@ reported as configuration errors instead of silently disabling adaptation.
 For `iterative_multi`, opt in explicitly with `data_pipeline: {}` and keep
 `num_worker: 0`. This path supports dense, unfiltered
 `batched_processed_katago_numpy` children, each with one explicit board size,
-and no composite batch transforms. It retains the record-level `blend_ratio`,
-`sample_rate`, and `sync_length` semantics. Packed record IDs are shuffled and
+and no composite batch transforms. It retains the selected `mixing` policy and supported record-level
+`sample_rate` semantics. Packed record IDs are shuffled and
 bucketed by shape before the global batch is partitioned across ranks; each
 rank therefore receives the same board size at each step. Queued shape buckets
 and source cursors are included in exact checkpoint/rollback state.
+
 
 The mixed path prepares one shared decoded cache over all child files, and uses
 one parent memory budget, bounded parallel decoding, pinning, and telemetry.
@@ -675,3 +782,8 @@ mix annotated and unannotated output schemas, even with different board sizes.
 The singular `rule` annotates a source. The existing plural `rules` option does
 not create NPZ annotations and must not be used as a replacement. Models receive
 `rule_index` in the batch dictionary.
+
+Rule labels and mixing are independent: different sources may declare the same
+rule, and no mode automatically balances rule classes. Configure each child's
+`rule` alongside its `data_paths` and choose the source distribution through
+`mixing`, as shown in [Composite sources and mixing modes](#composite-sources-and-mixing-modes).

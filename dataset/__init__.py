@@ -9,6 +9,7 @@ from utils.misc_utils import Registry, import_submodules
 from .core import DatasetRuntimeContext
 from .pipeline import BasePipeline, build_data_pipeline, warp_dataset_with_pipeline
 from .source_dataset import PlannedBatchDataset
+from .mixing import MixingConfig
 
 DATASETS = Registry("dataset")
 import_submodules(__name__, recursive=False)
@@ -19,6 +20,7 @@ def _read_multi_dataset(
     dataset_dict: dict[str, dict],
     *,
     runtime_context: DatasetRuntimeContext | None = None,
+    allow_blend_ratio: bool = False,
     **kwargs,
 ):
     datasets = []
@@ -43,7 +45,12 @@ def _read_multi_dataset(
                     f"data_paths in {dataset_name} must be a list of strings"
                 )
 
-        blend_ratio = float(dataset_args.pop("blend_ratio", 1.0))
+        if "blend_ratio" in dataset_args and not allow_blend_ratio:
+            raise ValueError("blend_ratio is only valid with mixing.mode: weighted")
+        ratio = dataset_args.pop("blend_ratio", 1.0)
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+            raise TypeError("blend_ratio must be a positive number")
+        blend_ratio = float(ratio)
         blend_ratios.append(blend_ratio)
 
         # Per-child values take precedence, but run the same public option
@@ -176,7 +183,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         apply_symmetry: bool | str = False,
         sample_rate: float = 1.0,
         shuffle: bool = False,
-        sync_length: bool = True,
+        mixing: dict | None = None,
         batch_size: int | None = None,
         batch_pipelines=(),
         shuffle_window_size: int = 32768,
@@ -193,7 +200,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         self.shuffle_window_size = shuffle_window_size
         self.shuffle_buffer_bytes = shuffle_buffer_bytes
         self.steps_per_epoch = steps_per_epoch
-        self.sync_length = sync_length
+        self.mixing = MixingConfig.parse(mixing)
         self.runtime_context = runtime_context
         self.child_ids = tuple(dataset_dict)
         child_runtime = None
@@ -216,6 +223,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
             sample_rate=sample_rate,
             shuffle=shuffle,
             runtime_context=child_runtime,
+            allow_blend_ratio=self.mixing.mode == "weighted",
         )
         if not self.datasets:
             raise ValueError("iterative_multi requires at least one child dataset")
@@ -347,7 +355,8 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
             child_sources,
             self.child_ids,
             weights,
-            sync_length=self.sync_length,
+            mixing=self.mixing,
+            seed=runtime_context.seed,
         )
         composer = (
             PipelineStateComposer(self.batch_pipelines)
@@ -371,6 +380,8 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         )
         self._install_adaptive_multi()
         self.composite_audit = {
+            "mixing": self._record_source.manifest_state()["mixing"],
+            "quotas": self._record_source.quotas,
             "weights": weights,
             "schedule": self._record_source.schedule,
             "capabilities": self._record_source.capabilities,
@@ -478,7 +489,7 @@ def build_dataset(
         },
         "multi": {"dataset_dict"},
         "iterative_multi": {
-            "dataset_dict", "sync_length", "shuffle_window_size",
+            "dataset_dict", "mixing", "shuffle_window_size",
             "shuffle_buffer_bytes", "steps_per_epoch",
         },
     }

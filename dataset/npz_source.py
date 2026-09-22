@@ -870,10 +870,8 @@ class IndexedNpzSource:
                     raise ValueError("indexed NPZ logical row count is inconsistent")
             if logical_row_count < 0 or row_begin + logical_row_count >= 1 << 64:
                 raise ValueError("indexed NPZ logical row count is out of range")
-            if logical_row_count == 0:
-                continue
             compact_indices = None
-            if indices is not None:
+            if indices is not None and len(indices):
                 if np.any(indices < 0) or np.any(indices[1:] <= indices[:-1]):
                     raise ValueError(
                         "indexed NPZ physical rows must increase strictly"
@@ -882,6 +880,7 @@ class IndexedNpzSource:
                     raise ValueError("indexed NPZ physical row is out of range")
             identity_indices = (
                 indices is None
+                or logical_row_count == 0
                 or (
                     logical_row_count == physical_row_count
                     and int(indices[0]) == 0
@@ -897,7 +896,9 @@ class IndexedNpzSource:
                 metadata_bytes += compact_indices.nbytes
             row_shape_codes = None
             uniform_shape = catalog.get("uniform_board_size")
-            if uniform_shape is not None:
+            if logical_row_count == 0 and uniform_shape is None:
+                uniform_shape_code = 0
+            elif uniform_shape is not None:
                 uniform_shape_code = self.shape_codes[
                     tuple(int(value) for value in uniform_shape)
                 ]

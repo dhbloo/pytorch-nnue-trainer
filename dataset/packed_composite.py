@@ -25,8 +25,9 @@ class _CompositeSampleKeys(Sequence):
         return ("composite", self.child_id, self.keys[index])
 
 
+
 class PackedCompositeRecordSource(CompositeRecordSource):
-    """Preserve weighted source cycles while avoiding per-record Python state."""
+    """Mix deterministic child streams without per-record Python state."""
 
     thread_safe_materialization = True
     _child_shift = 48
@@ -58,7 +59,7 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         ).hexdigest()
 
     def manifest_state(self):
-        return {**super().manifest_state(), "packed_mixing": 1}
+        return {**super().manifest_state(), "packed_mixing": 2}
 
     def _fill_cycles(self, cursor, cycle_count):
         children = []
@@ -74,32 +75,45 @@ class PackedCompositeRecordSource(CompositeRecordSource):
                 if len(values) < weight * cycle_count:
                     cursor.exhausted[child] = True
             children.append(values)
-        if self.sync_length:
-            cycles = min(
-                len(values) // weight for values, weight in zip(children, self.weights)
-            )
-        else:
-            cycles = max(
-                (len(values) + weight - 1) // weight
-                for values, weight in zip(children, self.weights)
-            )
+        cycles = min(
+            len(values) // weight for values, weight in zip(children, self.weights)
+        )
         if not cycles:
             cursor.terminal = True
             cursor.pending = np.empty(0, dtype=np.uint64)
             cursor.pending_position = 0
             return False
         grid = np.empty((cycles, len(self.schedule)), dtype=np.uint64)
-        valid = np.zeros(grid.shape, dtype=np.bool_)
+        schedule = np.asarray(self.schedule)
         for child, (values, weight) in enumerate(zip(children, self.weights)):
-            columns = np.flatnonzero(np.asarray(self.schedule) == child)
-            count = min(len(values), cycles * weight)
-            rows = np.arange(count) // weight
-            cols = columns[np.arange(count) % weight]
-            grid[rows, cols] = values[:count] | np.uint64(child << self._child_shift)
-            valid[rows, cols] = True
-        cursor.pending = np.ascontiguousarray(grid[valid])
+            columns = np.flatnonzero(schedule == child)
+            grid[:, columns] = values[:cycles * weight].reshape(cycles, weight) | np.uint64(
+                child << self._child_shift
+            )
+        cursor.pending = grid.reshape(-1)
         cursor.pending_position = 0
         cursor.cycle_index += cycles
+        return True
+
+    def _fill_quota_block(self, cursor):
+        children = self._draw_quota_sources(cursor)
+        cursor.pending_position = 0
+        if not len(children):
+            cursor.terminal = True
+            cursor.pending = np.empty(0, dtype=np.uint64)
+            return False
+        pending = np.empty(len(children), dtype=np.uint64)
+        for child in np.unique(children):
+            child = int(child)
+            positions = np.flatnonzero(children == child)
+            block, child_cursor = self.child_sources[child].next_packed_records(
+                cursor.child_cursors[child], len(positions)
+            )
+            if len(block.record_ids) != len(positions):
+                raise RuntimeError("source exhausted before its declared mixing quota")
+            cursor.child_cursors[child] = child_cursor
+            pending[positions] = block.record_ids | np.uint64(child << self._child_shift)
+        cursor.pending = pending
         return True
 
     def next_packed_records(self, cursor, limit):
@@ -109,10 +123,14 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         count = 0
         while count < limit and not cursor.terminal:
             if cursor.pending_position >= len(cursor.pending):
-                cycles = max(
-                    1, (limit - count + len(self.schedule) - 1) // len(self.schedule)
-                )
-                if not self._fill_cycles(cursor, cycles):
+                if self.quotas is not None:
+                    filled = self._fill_quota_block(cursor)
+                else:
+                    cycles = max(
+                        1, (limit - count + len(self.schedule) - 1) // len(self.schedule)
+                    )
+                    filled = self._fill_cycles(cursor, cycles)
+                if not filled:
                     break
             take = min(limit - count, len(cursor.pending) - cursor.pending_position)
             parts.append(cursor.pending[cursor.pending_position:cursor.pending_position + take])

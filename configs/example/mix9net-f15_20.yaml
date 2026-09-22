@@ -34,7 +34,8 @@ dataset_args:
 
   sample_rate: 1.0
   apply_symmetry: true
-  sync_length: true  # Setting this to true will sample the same amount of data for each sub-dataset
+  mixing:
+    mode: balanced
 
 dataloader_args:
   # Ensure the same board size for entries in the same batch

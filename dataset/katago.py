@@ -137,8 +137,7 @@ class KatagoNumpyDataset(Dataset):
         # Validate row counts after board-size filtering.
         length_list = [len(array) for array in self.data_dict.values()]
         self.length = length_list[0]
-        if self.length <= 0:
-            raise ValueError(f"no valid data entry in {self.file_list}")
+        # Empty filtered sources are valid members of a natural mixture.
         if length_list.count(self.length) != len(length_list):
             raise ValueError("NPZ fields have unequal row counts")
 
@@ -352,7 +351,10 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
                 (
                     options["fixed_board_size"]
                     if options.get("fixed_board_size") is not None
-                    else dataset.data_dict["board_size"]
+                    else (
+                        dataset.data_dict["board_size"] if length
+                        else np.asarray(dataset.data_dict["board_input"].shape[-2:])
+                    )
                 ),
             ),
             semantic_state={
