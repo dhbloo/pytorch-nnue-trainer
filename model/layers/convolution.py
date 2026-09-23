@@ -115,6 +115,7 @@ class Conv2dBlock(nn.Module):
         weight_quant_bits: Quantization bit width for weights (default: 8)
         bias_quant_scale: Quantization scale for bias. If None, uses input_quant_scale * weight_quant_scale
         bias_quant_bits: Quantization bit width for bias (default: 32)
+        norm_sizes: [H, W] pairs required by norm="sizebn", ignored otherwise (default: None)
     """
     def __init__(
         self,
@@ -138,6 +139,7 @@ class Conv2dBlock(nn.Module):
         bias_quant_scale=None,
         bias_quant_bits=32,
         weight_scale=1.0,
+        norm_sizes=None,
     ):
         super(Conv2dBlock, self).__init__()
         assert pad_type in [
@@ -147,7 +149,7 @@ class Conv2dBlock(nn.Module):
             "circular",
         ], f"Unsupported padding mode: {pad_type}"
         self.activation_first = activation_first
-        self.norm = build_norm2d_layer(norm, out_dim)
+        self.norm = build_norm2d_layer(norm, out_dim, norm_sizes=norm_sizes)
         self.activation = build_activation_layer(activation)
         self.conv = Conv2d(
             in_channels=in_dim,

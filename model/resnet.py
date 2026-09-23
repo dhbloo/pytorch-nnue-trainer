@@ -5,6 +5,10 @@ Every model here takes the same optional trunk-exit and head arguments:
 head flags ``value_bias`` / ``value_gap_norm``. All four default to off so that
 existing checkpoints keep a matching parameter layout; ``final_norm="bn"`` adds
 affine gamma/beta while ``"bn-noaffine"`` normalizes without those keys.
+
+``norm_sizes`` is a list of ``[H, W]`` pairs forwarded to every 2D norm site
+(input, trunk, and final). Only ``"sizebn"`` uses it and requires it; other
+norms ignore it. ``value_gap_norm`` is 1D and never receives it.
 """
 
 import torch
@@ -24,7 +28,7 @@ def _configure_channels_last_parameters(module: nn.Module, enabled: bool) -> Non
         module.to(memory_format=torch.channels_last)
 
 
-def _build_final_layers(final_norm, final_activation, dim_feature):
+def _build_final_layers(final_norm, final_activation, dim_feature, norm_sizes=None):
     """Optional trunk-exit norm/activation. ``none`` adds no checkpoint keys.
 
     ``final_norm`` goes through ``build_norm2d_layer``, so a mask-unaware choice
@@ -33,7 +37,7 @@ def _build_final_layers(final_norm, final_activation, dim_feature):
     breaks the "masked positions are zero" invariant the output head relies on.
     """
     return (
-        build_norm2d_layer(final_norm, dim_feature),
+        build_norm2d_layer(final_norm, dim_feature, norm_sizes=norm_sizes),
         build_activation_layer(final_activation),
     )
 
@@ -64,6 +68,7 @@ class ResBlock(nn.Module):
                           If False, applies conv→BN→activation (post-activation) (default: False)
         dim_out: Output channel dimension. If None, uses dim_in (default: None)
         dim_hidden: Hidden channel dimension between two convs. If None, uses min(dim_in, dim_out) (default: None)
+        norm_sizes: [H, W] pairs required by "sizebn" norms, ignored otherwise (default: None)
     """
     def __init__(
         self,
@@ -78,6 +83,7 @@ class ResBlock(nn.Module):
         activation_first=False,
         dim_out=None,
         dim_hidden=None,
+        norm_sizes=None,
     ):
         super().__init__()
         dim_out = dim_out or dim_in
@@ -97,6 +103,7 @@ class ResBlock(nn.Module):
                 activation,
                 pad_type,
                 activation_first=activation_first,
+                norm_sizes=norm_sizes,
             ),
             Conv2dBlock(
                 dim_hidden,
@@ -108,6 +115,7 @@ class ResBlock(nn.Module):
                 activation if activation_first else "none",
                 pad_type,
                 activation_first=activation_first,
+                norm_sizes=norm_sizes,
             ),
         )
         if self.learned_shortcut:
@@ -163,6 +171,7 @@ class ResNet(nn.Module):
         value_gap_norm="none",
         use_channel_last=True,
         input_args=None,
+        norm_sizes=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -188,11 +197,12 @@ class ResNet(nn.Module):
                 conv1_norm=trunk_norm,
                 conv2_norm=trunk_norm,
                 activation=trunk_activation,
+                norm_sizes=norm_sizes,
             )
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
         self.final_norm, self.final_activation = _build_final_layers(
-            final_norm, final_activation, dim_feature
+            final_norm, final_activation, dim_feature, norm_sizes=norm_sizes
         )
         self.output_head = build_head(
             head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm
@@ -240,6 +250,7 @@ class ResNetv2(nn.Module):
         value_gap_norm="none",
         use_channel_last=True,
         input_args=None,
+        norm_sizes=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -266,11 +277,12 @@ class ResNetv2(nn.Module):
                 conv2_norm=trunk_norm2,
                 activation=trunk_activation,
                 activation_first=True,
+                norm_sizes=norm_sizes,
             )
             conv_trunk.append(block)
         self.conv_trunk = nn.Sequential(*conv_trunk)
         self.final_norm, self.final_activation = _build_final_layers(
-            final_norm, final_activation, dim_feature
+            final_norm, final_activation, dim_feature, norm_sizes=norm_sizes
         )
         self.output_head = build_head(
             head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm
@@ -320,6 +332,7 @@ class ResNetv3(nn.Module):
         drop_mask=False,
         use_channel_last=False,
         input_args=None,
+        norm_sizes=None,
     ):
         super().__init__()
         self.model_size = (num_blocks, dim_feature)
@@ -336,6 +349,7 @@ class ResNetv3(nn.Module):
             padding=input_padding,
             norm=input_norm,
             activation="none",
+            norm_sizes=norm_sizes,
         )
         self.conv_trunk = nn.ModuleList()
         for _ in range(num_blocks):
@@ -348,10 +362,11 @@ class ResNetv3(nn.Module):
                 conv2_norm=trunk_norm2,
                 activation=trunk_activation,
                 activation_first=False,
+                norm_sizes=norm_sizes,
             )
             self.conv_trunk.append(block)
         self.final_norm, self.final_activation = _build_final_layers(
-            final_norm, final_activation, dim_feature
+            final_norm, final_activation, dim_feature, norm_sizes=norm_sizes
         )
         self.output_head = build_head(
             head_type, dim_feature, value_bias=value_bias, value_gap_norm=value_gap_norm

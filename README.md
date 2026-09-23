@@ -100,6 +100,21 @@ Export to ONNX:
 python export.py -c <path to run config> -p <path to checkpoint> -o <output file> --export_type onnx -d <path to dataset>
 ```
 
+For `sizebn`, add `--export_args "{rules: [freestyle], board_size: 15}"` for a
+fixed size, or `--export_args "{rules: [freestyle], board_size_list: [15, 20]}"`
+for dynamic ONNX. All listed sizes must have trained BN statistics; the sample
+dataset should provide one of those sizes.
+
+With `onnx` and `onnxruntime-gpu` installed, reuse one optimized session per
+board size (batch size remains dynamic):
+
+```python
+from utils.onnx_utils import create_sizebn_session
+
+session = create_sizebn_session("model_dynamic.onnx", 15, providers=["CUDAExecutionProvider"])
+outputs = session.run(None, {"board_input": board_input})  # Add global_input if required.
+```
+
 Export to (lz4 compressed) serialized binary that can be loaded in Rapfi:
 
 ```bash

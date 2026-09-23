@@ -12,6 +12,122 @@ class BatchNorm(nn.BatchNorm2d):
         return super().forward(input)
 
 
+def _validate_norm_sizes(norm_sizes) -> tuple[tuple[int, int], ...]:
+    if norm_sizes is None:
+        raise ValueError("sizebn requires norm_sizes, a list of [H, W] pairs")
+    if isinstance(norm_sizes, (str, bytes)) or len(norm_sizes) == 0:
+        raise ValueError(f"norm_sizes must be a non-empty list of [H, W] pairs, got {norm_sizes!r}")
+    sizes = []
+    for size in norm_sizes:
+        if isinstance(size, (str, bytes)) or len(size) != 2:
+            raise ValueError(f"Invalid norm size {size!r}, must be an [H, W] pair")
+        for side in size:
+            if isinstance(side, bool) or not isinstance(side, int) or side <= 0:
+                raise ValueError(f"Invalid norm size {size!r}, sides must be positive integers")
+        sizes.append((int(size[0]), int(size[1])))
+    if len(set(sizes)) != len(sizes):
+        raise ValueError(f"Duplicate entries in norm_sizes {norm_sizes!r}")
+    return tuple(sorted(sizes))
+
+
+class SizeBatchNorm(nn.Module):
+    """BatchNorm with separate running statistics per declared spatial size.
+
+    Each ``(H, W)`` in ``norm_sizes`` owns a non-affine :class:`BatchNorm` child,
+    keyed ``"{H}x{W}"``, so batch statistics and running estimates never mix
+    across board sizes. A single affine ``weight`` / ``bias`` is shared by all
+    sizes and passed to the selected bucket's normalization operation. The
+    bucket is selected from the static input shape, which
+    ``torch.compile(dynamic=False)`` guards on.
+    Inputs of an undeclared spatial size raise ``ValueError``.
+
+    For tracing-based export, replace this module with a plain
+    :class:`BatchNorm` for one size via :meth:`materialize`.
+    """
+
+    def __init__(self, num_features: int, norm_sizes, eps: float = 1e-5, momentum: float = 0.1):
+        super().__init__()
+        self.num_features = num_features
+        self.norm_sizes = _validate_norm_sizes(norm_sizes)
+        self.norms = nn.ModuleDict(
+            {
+                f"{h}x{w}": BatchNorm(num_features, eps=eps, momentum=momentum, affine=False)
+                for h, w in self.norm_sizes
+            }
+        )
+        self.weight = nn.Parameter(torch.empty(num_features))
+        self.bias = nn.Parameter(torch.empty(num_features))
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.ones_(self.weight)
+        nn.init.zeros_(self.bias)
+
+    def forward(self, x: Tensor, mask=None) -> Tensor:
+        key = f"{x.shape[-2]}x{x.shape[-1]}"
+        if key not in self.norms:
+            raise ValueError(
+                f"sizebn got undeclared spatial size {key}, declared sizes are {list(self.norms.keys())}"
+            )
+        child = self.norms[key]
+        # Keep affine inside batch_norm so autocast preserves the input dtype
+        # and materialization retains the same normalization and rounding.
+        factor = child.momentum if child.momentum is not None else 0.0
+        if child.training:
+            child.num_batches_tracked.add_(1)
+            if child.momentum is None:
+                factor = 1.0 / float(child.num_batches_tracked)
+        return F.batch_norm(
+            x,
+            child.running_mean,
+            child.running_var,
+            self.weight,
+            self.bias,
+            child.training,
+            factor,
+            child.eps,
+        )
+
+    def materialize(self, height: int, width: int) -> BatchNorm:
+        """Return a plain affine BatchNorm holding this module's state for one size."""
+        key = f"{height}x{width}"
+        if key not in self.norms:
+            raise ValueError(f"sizebn has no bucket {key}, declared sizes are {list(self.norms.keys())}")
+        child = self.norms[key]
+        if int(child.num_batches_tracked) == 0:
+            raise ValueError(f"sizebn bucket {key} has num_batches_tracked == 0 (never trained)")
+        bn = BatchNorm(self.num_features, eps=child.eps, momentum=child.momentum, affine=True)
+        bn.to(device=child.running_mean.device, dtype=child.running_mean.dtype)
+        with torch.no_grad():
+            bn.running_mean.copy_(child.running_mean)
+            bn.running_var.copy_(child.running_var)
+            bn.num_batches_tracked.copy_(child.num_batches_tracked)
+            bn.weight.copy_(self.weight)
+            bn.bias.copy_(self.bias)
+        bn.train(self.training)
+        return bn
+
+
+def materialize_size_batch_norms(model: nn.Module, board_size: int) -> int:
+    """Replace every SizeBatchNorm in ``model`` in place with its square ``board_size`` bucket.
+
+    Returns the number of replaced modules.
+    """
+    targets = [
+        (name, module) for name, module in model.named_modules() if isinstance(module, SizeBatchNorm)
+    ]
+    replacements = [(name, module.materialize(board_size, board_size)) for name, module in targets]
+    for name, bn in replacements:
+        parent_name, _, child_name = name.rpartition(".")
+        parent = model.get_submodule(parent_name) if parent_name else model
+        setattr(parent, child_name, bn)
+    return len(replacements)
+
+
+def contains_size_batch_norm(model: nn.Module) -> bool:
+    return any(isinstance(module, SizeBatchNorm) for module in model.modules())
+
+
 class GroupNorm(nn.GroupNorm):
     def forward(self, input: Tensor, mask=None) -> Tensor:
         # Pytorch's GroupNorm does not support mask, so we just call the parent class method
@@ -286,12 +402,15 @@ def build_norm1d_layer(norm: str, num_features: int):
     raise ValueError(f"Unsupported 1D normalization: {norm!r}")
 
 
-def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
+def build_norm2d_layer(norm: str, num_features=None, norm_groups=None, norm_sizes=None):
     """Build a 2D normalization layer from a string identifier.
 
     Options:
         "bn" - Batch normalization (BatchNorm2d) with affine gamma/beta
         "bn-noaffine" - BatchNorm2d without affine parameters (normalize only)
+        "sizebn" - Per-spatial-size batch normalization (SizeBatchNorm): one
+                   non-affine BatchNorm per [H, W] in norm_sizes, plus shared
+                   affine gamma/beta. Requires norm_sizes; other options ignore it.
         "gn" - Group normalization, requires norm_groups parameter
         "gn-{N}" - Group normalization with N groups parsed from the string (e.g., "gn-8")
         "ln" - Local layer normalization (channel-wise)
@@ -306,6 +425,8 @@ def build_norm2d_layer(norm: str, num_features=None, norm_groups=None):
         return BatchNorm(num_features)
     elif norm == "bn-noaffine":
         return BatchNorm(num_features, affine=False)
+    elif norm == "sizebn":
+        return SizeBatchNorm(num_features, norm_sizes)
     elif norm == "gn":
         assert isinstance(norm_groups, int)
         return GroupNorm(norm_groups, num_features)

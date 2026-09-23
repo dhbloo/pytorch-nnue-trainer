@@ -10,6 +10,7 @@ from dataset import build_dataset
 from dataset.core import single_process_dataset_context
 from model import build_model
 from model.rule_condition import RuleConditionEncoder
+from model.layers.normalization import contains_size_batch_norm, materialize_size_batch_norms
 from model.serialization import (
     build_serializer,
     get_rules_from_args,
@@ -119,7 +120,14 @@ class ModelIOv1(torch.nn.Module):
     def get_output_names(self):
         return ["value", "policy"]
 
-    def get_dynamic_axes(self):
+    def get_dynamic_axes(self, static_board_size: bool = False):
+        if static_board_size:
+            return {
+                "board_input": {0: "batch_size"},
+                "global_input": {0: "batch_size"},
+                "value": {0: "batch_size"},
+                "policy": {0: "batch_size"},
+            }
         return {
             "board_input": {0: "batch_size", 2: "board_height", 3: "board_width"},
             "global_input": {0: "batch_size"},
@@ -171,14 +179,80 @@ def _warp_model_io(model, export_args: dict):
         raise ValueError(f"Unsupported model IO version {model_io_version}")
 
 
-def export_torch_jit(output, model, export_args, **kwargs):
+def _get_sizebn_export_board_size(export_args: dict) -> int:
+    """Read the single square board side a sizebn model is materialized for."""
+    for key in ("min_board_size", "max_board_size", "board_size_list", "boardsizes"):
+        if key in export_args:
+            raise ValueError(
+                f"sizebn models export exactly one board size via export_args.board_size, got {key}"
+            )
+    if "board_size" not in export_args:
+        raise ValueError("sizebn models require export_args.board_size (one square side per export)")
+    board_size = export_args["board_size"]
+    if isinstance(board_size, bool) or not isinstance(board_size, int):
+        raise ValueError(f"sizebn export board_size must be a single int, got {board_size!r}")
+    return board_size
+
+
+def _get_dynamic_sizebn_board_sizes(export_args: dict):
+    """An explicit list requests dynamic ONNX; a single board_size stays fixed."""
+    keys = [key for key in ("board_size_list", "boardsizes") if key in export_args]
+    if not keys:
+        return None
+    if len(keys) != 1 or any(k in export_args for k in ("board_size", "min_board_size", "max_board_size")):
+        raise ValueError("Dynamic sizebn export requires exactly one board_size_list or boardsizes")
+    sizes = export_args[keys[0]]
+    if not isinstance(sizes, list) or not sizes or any(
+        isinstance(s, bool) or not isinstance(s, int) or not 1 <= s <= 32 for s in sizes
+    ):
+        raise ValueError("Dynamic sizebn board sizes must be a non-empty list of integers in [1, 32]")
+    if len(set(sizes)) != len(sizes):
+        raise ValueError("Dynamic sizebn board sizes must be distinct")
+    return sorted(sizes)
+
+
+def _check_static_board_size(board_input: torch.Tensor, static_board_size: None | int):
+    if static_board_size is None:
+        return
+    spatial_size = tuple(board_input.shape[-2:])
+    if spatial_size != (static_board_size, static_board_size):
+        raise ValueError(
+            f"Example board_input has spatial size {spatial_size}, but the model was materialized "
+            f"for board size {static_board_size}x{static_board_size}"
+        )
+
+
+class _StaticBoardSizeModel(torch.nn.Module):
+    """Keep the materialized board-size contract in the saved TorchScript graph."""
+
+    __constants__ = ["board_size"]
+
+    def __init__(self, model, board_size: int):
+        super().__init__()
+        self.model = model
+        self.board_size = board_size
+
+    def forward(self, board_input: torch.Tensor, global_input: torch.Tensor):
+        if (
+            board_input.dim() != 4
+            or board_input.size(2) != self.board_size
+            or board_input.size(3) != self.board_size
+        ):
+            raise ValueError("Input board size does not match the materialized model")
+        return self.model(board_input, global_input)
+
+
+def export_torch_jit(output, model, export_args, static_board_size=None, **kwargs):
     # Warp the model with defined input/output interface
     model = _warp_model_io(model, export_args)
 
     # Use the example inputs to trace the model with the given IO
     sampled_data = _get_sample_data(**kwargs)
     example_inputs = model.get_model_inputs(sampled_data)
+    _check_static_board_size(example_inputs[0], static_board_size)
     scripted_model = torch.jit.trace(model.forward, example_inputs, strict=True)
+    if static_board_size is not None:
+        scripted_model = torch.jit.script(_StaticBoardSizeModel(scripted_model, static_board_size))
 
     # Save the traced model
     torch.jit.save(scripted_model, output)
@@ -214,14 +288,28 @@ def parse_onnx_model_version(model_version: int) -> tuple[int, list[str], list[i
     return io_version, rules, boardsizes
 
 
-def export_onnx(output, model, export_args, **kwargs):
+def export_onnx(output, model, export_args, static_board_size=None, **kwargs):
     # Rules are required for ONNX exports (they are stamped into the model
     # version metadata). Validate before the output file is overwritten, so a
     # missing-rules error cannot destroy a previous good export.
+    export_args = dict(export_args)
+    dynamic_sizes = None
+    if contains_size_batch_norm(model):
+        dynamic_sizes = _get_dynamic_sizebn_board_sizes(export_args)
+        if dynamic_sizes is None:
+            raise ValueError("Materialize sizebn or supply board_size_list for dynamic ONNX export")
+        if export_args.get("onnx_use_dynamo", False):
+            raise ValueError("Dynamic sizebn export currently requires onnx_use_dynamo: false")
     supported_rules = get_rules_from_args(export_args)
     supported_boardsizes = get_boardsizes_from_args(export_args)
 
     import onnx
+
+    if dynamic_sizes is not None:
+        from model.layers.sizebn_export import prepare_dynamic_size_batch_norms
+
+        model.eval()
+        prepare_dynamic_size_batch_norms(model, dynamic_sizes)
 
     # Warp the model with defined input/output interface
     model = _warp_model_io(model, export_args)
@@ -230,6 +318,9 @@ def export_onnx(output, model, export_args, **kwargs):
     model.eval()
     sampled_data = _get_sample_data(**kwargs)
     args = model.get_model_inputs(sampled_data)
+    _check_static_board_size(args[0], static_board_size)
+    if dynamic_sizes is not None and tuple(args[0].shape[-2:]) not in [(s, s) for s in dynamic_sizes]:
+        raise ValueError("Example board size must be in the dynamic export's board_size_list")
     torch.onnx.export(
         model,
         args,
@@ -238,25 +329,33 @@ def export_onnx(output, model, export_args, **kwargs):
         do_constant_folding=True,
         input_names=model.get_input_names(),
         output_names=model.get_output_names(),
-        dynamic_axes=model.get_dynamic_axes(),
+        dynamic_axes=model.get_dynamic_axes(static_board_size=static_board_size is not None),
         dynamo=export_args.get("onnx_use_dynamo", False),
+        keep_initializers_as_inputs=False,
+        **({"opset_version": 18} if dynamic_sizes is not None else {}),
     )
 
-    # Run OnnxSlim if available
-    try:
-        import onnxslim
-    except ImportError:
-        print("onnxslim is not installed, skipping onnx model optimization.")
-    else:
+    # Preserve dynamic selectors and their metadata for load-time specialization.
+    if dynamic_sizes is None:
         try:
-            print("Running onnxslim to optimize the model...")
-            onnxslim.slim(output, output)
-        except Exception as e:
-            print(f"Warning: onnxslim failed ({e!r}), keeping the unslimmed model.")
+            import onnxslim
+        except ImportError:
+            print("onnxslim is not installed, skipping onnx model optimization.")
+        else:
+            try:
+                print("Running onnxslim to optimize the model...")
+                onnxslim.slim(output, output)
+            except Exception as e:
+                print(f"Warning: onnxslim failed ({e!r}), keeping the unslimmed model.")
 
     # Add metadata to the exported ONNX model
     io_version = model.get_io_version()
     onnx_model = onnx.load(output)
+    if dynamic_sizes is not None:
+        from utils.onnx_utils import lower_sizebn_onnx
+
+        onnx_model = lower_sizebn_onnx(onnx_model, dynamic_sizes)
+        onnx.checker.check_model(onnx_model)
     onnx_model.model_version = make_onnx_model_version(io_version, supported_rules, supported_boardsizes)
     onnx_model.producer_name = "https://github.com/dhbloo/pytorch-nnue-trainer"
     onnx_model.producer_version = _get_git_revision_short_hash()
@@ -371,12 +470,25 @@ def export(checkpoint, output, rundir, export_type, model_type, model_args, expo
     model.load_state_dict(model_state_dict)
     model.eval()
 
+    # Fixed exports bake in one bucket; dynamic ONNX lowers dispatch explicitly.
+    static_board_size = None
+    if contains_size_batch_norm(model):
+        export_args = kwargs.get("export_args") or {}
+        dynamic_sizes = _get_dynamic_sizebn_board_sizes(export_args)
+        if dynamic_sizes is not None:
+            if export_type != "onnx":
+                raise ValueError("Dynamic sizebn export is supported only for ONNX")
+        else:
+            static_board_size = _get_sizebn_export_board_size(export_args)
+            num_replaced = materialize_size_batch_norms(model, static_board_size)
+            print(f"Materialized {num_replaced} sizebn layers for board size {static_board_size}")
+
     if export_type == "torch-jit":
         output = output or _get_default_output_filename(checkpoint, "pt")
-        export_torch_jit(output, model, **kwargs)
+        export_torch_jit(output, model, static_board_size=static_board_size, **kwargs)
     elif export_type == "onnx":
         output = output or _get_default_output_filename(checkpoint, "onnx")
-        export_onnx(output, model, **kwargs)
+        export_onnx(output, model, static_board_size=static_board_size, **kwargs)
     elif export_type == "txt":
         output = output or _get_default_output_filename(checkpoint, "txt")
         kwargs["export_args"].setdefault("text_output", True)
