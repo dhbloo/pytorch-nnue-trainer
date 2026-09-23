@@ -9,6 +9,7 @@ from datetime import datetime
 from dataset import build_dataset
 from dataset.core import single_process_dataset_context
 from model import build_model
+from model.resnet import ResNetv3
 from model.rule_condition import RuleConditionEncoder
 from model.layers.normalization import contains_size_batch_norm, materialize_size_batch_norms
 from model.serialization import (
@@ -136,8 +137,8 @@ class ModelIOv1(torch.nn.Module):
         }
 
     def get_model_inputs(self, data: dict):
-        boardInputNCHW = data["board_input"]
-        globalInputNC = data["stm_input"]
+        boardInputNCHW = torch.as_tensor(data["board_input"])
+        globalInputNC = torch.as_tensor(data["stm_input"])
         assert boardInputNCHW.ndim == 4, f"boardInputNCHW.shape={boardInputNCHW.shape}"
         assert globalInputNC.ndim == 2, f"globalInputNC.shape={globalInputNC.shape}"
         assert boardInputNCHW.shape[0] == globalInputNC.shape[0]
@@ -168,13 +169,63 @@ class ModelIOv1(torch.nn.Module):
         return self.get_model_outputs(self.warpped_model(input_data))
 
 
+class ModelIOv2(ModelIOv1):
+    """Masked-board IO: pass each row's logical size alongside its padded canvas."""
+
+    def get_io_version(self) -> int:
+        return 2
+
+    def get_input_names(self):
+        return ["board_input", "global_input", "board_size"]
+
+    def get_dynamic_axes(self, static_board_size: bool = False):
+        axes = super().get_dynamic_axes(static_board_size)
+        axes["board_size"] = {0: "batch_size"}
+        return axes
+
+    def get_model_inputs(self, data: dict):
+        board_input, global_input = super().get_model_inputs(data)
+        board_size = torch.as_tensor(data["board_size"])
+        if board_size.ndim != 2 or board_size.shape != (board_input.shape[0], 2):
+            raise ValueError("board_size must have shape (batch_size, 2)")
+        return board_input, global_input, board_size.to(torch.int64)
+
+    def get_data_from_model_inputs(self, board_input, global_input, board_size):
+        return {
+            "board_input": board_input,
+            "stm_input": global_input,
+            "board_size": board_size,
+        }
+
+    def get_model_outputs(self, results):
+        board_mask = results.get("board_mask")
+        if board_mask is None:
+            raise ValueError("ModelIOv2 requires a model-provided board_mask")
+        value, policy = results["value"], results["policy"]
+        if policy.ndim == 4 and policy.shape[1] == 1:
+            policy = policy.squeeze(1)
+        policy = policy.masked_fill(board_mask.squeeze(1) == 0, -1e6)
+        if self.apply_policy_softmax:
+            policy = torch.softmax(policy.flatten(start_dim=1), dim=1).reshape_as(policy)
+        return value, policy
+
+    def forward(self, board_input, global_input, board_size):
+        data = self.get_data_from_model_inputs(board_input, global_input, board_size)
+        return self.get_model_outputs(self.warpped_model(data))
+
+
 def _warp_model_io(model, export_args: dict):
     # Both options are read from export_args (like onnx_use_dynamo), since no
     # top-level CLI flag defines them.
-    model_io_version = export_args.get("model_io_version", 1)
+    model_io_version = export_args.get(
+        "model_io_version",
+        2 if isinstance(model, ResNetv3) and not model.drop_mask else 1,
+    )
     apply_policy_softmax = export_args.get("apply_policy_softmax", False)
     if model_io_version == 1:
         return ModelIOv1(model, apply_policy_softmax=apply_policy_softmax)
+    elif model_io_version == 2:
+        return ModelIOv2(model, apply_policy_softmax=apply_policy_softmax)
     else:
         raise ValueError(f"Unsupported model IO version {model_io_version}")
 

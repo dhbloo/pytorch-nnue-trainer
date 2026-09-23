@@ -1065,7 +1065,7 @@ class ProcessedNpzDecoder:
         # SourceBatchDataset validates every batched field before yielding.
         # Avoid repeating the same schema walk when no transform needs it.
         if not self.fixed_side_input and not self.apply_symmetry:
-            return data
+            return self._pad_vectorized(data)
 
         # Validate the same field contract as the scalar post-processor before
         # applying the two transformations supported by this decoder.
@@ -1094,7 +1094,7 @@ class ProcessedNpzDecoder:
                 data["value_target"] = value_target
 
         if not self.apply_symmetry:
-            return data
+            return self._pad_vectorized(data)
 
         from utils.data_utils import Symmetry
 
@@ -1165,10 +1165,44 @@ class ProcessedNpzDecoder:
             policy_target = policy_board
         data["board_input"] = np.ascontiguousarray(board_input)
         data["policy_target"] = np.ascontiguousarray(policy_target)
+        return self._pad_vectorized(data)
+
+    def _pad_vectorized(self, data: dict) -> dict:
+        """Pad a homogeneous native-size batch while retaining logical board_size."""
+        if self.fixed_board_size is None:
+            return data
+        height, width = (int(value) for value in data["board_input"].shape[-2:])
+        padded_height, padded_width = self.fixed_board_size
+        if padded_height < height or padded_width < width:
+            raise ValueError("fixed_board_size must cover the source board")
+        if not np.all(data["board_size"] == (height, width)):
+            raise ValueError("source board_size differs from its decoded plane")
+        if (padded_height, padded_width) == (height, width):
+            return data
+        data["board_input"] = np.pad(
+            data["board_input"],
+            ((0, 0), (0, 0), (0, padded_height - height), (0, padded_width - width)),
+        )
+        policy = data["policy_target"]
+        if policy.ndim == 3:
+            data["policy_target"] = np.pad(
+                policy,
+                ((0, 0), (0, padded_height - height), (0, padded_width - width)),
+            )
+        elif policy.ndim == 2 and policy.shape[1] == height * width + 1:
+            board = np.pad(
+                policy[:, :-1].reshape(-1, height, width),
+                ((0, 0), (0, padded_height - height), (0, padded_width - width)),
+            )
+            data["policy_target"] = np.concatenate(
+                (board.reshape(len(policy), -1), policy[:, -1:]), axis=1
+            )
+        else:
+            raise ValueError("processed NPZ policy target does not match source board")
         return data
 
     def decode_batch(self, refs):
-        if self.fixed_board_size is not None:
+        if self.fixed_board_size is not None and len(self.boardsizes) != 1:
             return None
         if not refs:
             raise ValueError("cannot decode an empty processed NPZ batch")
@@ -1182,7 +1216,7 @@ class ProcessedNpzDecoder:
         return self._decode_grouped_batch(refs, paths)
 
     def decode_packed_batch(self, request):
-        if self.fixed_board_size is not None:
+        if self.fixed_board_size is not None and len(self.boardsizes) != 1:
             return None
         if not len(request):
             raise ValueError("cannot decode an empty packed processed NPZ batch")
@@ -1194,7 +1228,10 @@ class ProcessedNpzDecoder:
             int(index)
             for index in unique_indices[np.argsort(counts, kind="stable")]
         )
-        height, width = request.board_size
+        height, width = (
+            next(iter(self.boardsizes))
+            if self.fixed_board_size is not None else request.board_size
+        )
         policy_shape = (
             (height * width + 1,)
             if self.has_pass_move
@@ -1213,7 +1250,7 @@ class ProcessedNpzDecoder:
 
                 group = {
                     "board_size": np.tile(
-                        np.asarray(request.board_size, dtype=np.int8),
+                        np.asarray((height, width), dtype=np.int8),
                         (len(positions), 1),
                     ),
                     "board_input": selected(
@@ -1261,7 +1298,7 @@ class ProcessedNpzDecoder:
         return self._post_process_vectorized(data, request)
 
     def decode_batches(self, ref_batches):
-        if self.fixed_board_size is not None:
+        if self.fixed_board_size is not None and len(self.boardsizes) != 1:
             return None
         if not ref_batches or any(not refs for refs in ref_batches):
             raise ValueError("cannot decode an empty processed NPZ batch chunk")
@@ -1373,6 +1410,12 @@ class ProcessedNpzDecoder:
             )
             restore_order = np.argsort(grouped_positions)
 
+        native_board_size = (
+            next(iter(self.boardsizes))
+            if self.fixed_board_size is not None and len(self.boardsizes) == 1
+            else refs[0].board_size
+        )
+
         def gather(key, default):
             if one_path:
                 arrays = arrays_by_path[first_path]
@@ -1384,7 +1427,7 @@ class ProcessedNpzDecoder:
                         else np.ascontiguousarray(selected)
                     )
                 return np.stack(
-                    [default(ref.board_size) for ref in refs], axis=0
+                    [default(native_board_size) for _ in refs], axis=0
                 )
             chunks = []
             for path, _, indices, board_sizes in groups:
@@ -1393,7 +1436,7 @@ class ProcessedNpzDecoder:
                     arrays[key][indices]
                     if key in arrays
                     else np.stack(
-                        [default(board_size) for board_size in board_sizes],
+                        [default(native_board_size) for _ in board_sizes],
                         axis=0,
                     )
                 )
@@ -1418,7 +1461,7 @@ class ProcessedNpzDecoder:
                 dtype=np.float32,
             ),
         ).astype(np.float32, copy=False)
-        height, width = refs[0].board_size
+        height, width = board_input.shape[-2:]
         if not self.has_pass_move and policy_target.ndim == 2:
             expected = height * width + 1
             if policy_target.shape[1] != expected:
@@ -1429,7 +1472,7 @@ class ProcessedNpzDecoder:
             policy_target = policy_target[:, :-1].reshape(-1, height, width)
         data = {
             "board_size": np.asarray(
-                [ref.board_size for ref in refs], dtype=np.int8
+                [(height, width)] * len(refs), dtype=np.int8
             ),
             "board_input": np.ascontiguousarray(board_input),
             "stm_input": np.ascontiguousarray(stm_input),

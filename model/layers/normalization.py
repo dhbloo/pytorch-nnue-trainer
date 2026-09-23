@@ -298,7 +298,7 @@ class MaskNorm(nn.Module):
         norm_type: str,
         affine: bool = False,
         bnorm_epsilon: float = 1e-4,
-        bnorm_running_avg_momentum: float = 1e-3,
+        bnorm_running_avg_momentum: float = 0.1,
     ):
         super().__init__()
         assert norm_type in ["bnorm", "fixup"], f"Invalid norm type {norm_type}"

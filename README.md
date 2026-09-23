@@ -105,6 +105,10 @@ fixed size, or `--export_args "{rules: [freestyle], board_size_list: [15, 20]}"`
 for dynamic ONNX. All listed sizes must have trained BN statistics; the sample
 dataset should provide one of those sizes.
 
+For masked `resnetv3`, use `--export_args "{rules: [freestyle], boardsizes: [15, 20]}"`.
+Its dynamic ONNX graph takes `board_input` `(B, 2, H, W)` and logical
+`board_size` `(B, 2)`; pad mixed sizes to the same `H, W` within a batch.
+
 With `onnx` and `onnxruntime-gpu` installed, reuse one optimized session per
 board size (batch size remains dynamic):
 

@@ -190,9 +190,13 @@ def collate_sample_dicts(
                         int(item)
                         for item in np.asarray(samples[index]["board_size"])
                     )
+                    physical_size = tuple(
+                        int(item)
+                        for item in np.asarray(samples[index]["board_input"]).shape[-2:]
+                    )
                     spatial = (
                         array.ndim == 2
-                        and tuple(array.shape) == board_size
+                        and tuple(array.shape) in (board_size, physical_size)
                     )
                     flat = (
                         array.ndim == 1
@@ -200,11 +204,8 @@ def collate_sample_dicts(
                         in {
                             board_size[0] * board_size[1],
                             board_size[0] * board_size[1] + 1,
-                            int(np.asarray(samples[index]["board_input"]).shape[-2])
-                            * int(np.asarray(samples[index]["board_input"]).shape[-1]),
-                            int(np.asarray(samples[index]["board_input"]).shape[-2])
-                            * int(np.asarray(samples[index]["board_input"]).shape[-1])
-                            + 1,
+                            physical_size[0] * physical_size[1],
+                            physical_size[0] * physical_size[1] + 1,
                         }
                     )
                     if not (spatial or flat):

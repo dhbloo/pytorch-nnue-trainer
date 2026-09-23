@@ -1649,9 +1649,12 @@ class PipelineStateComposer:
                     )
                 spatial_policy = (
                     len(shape) == 3
-                    and np.all(
-                        board_sizes
-                        == np.asarray(shape[-2:], dtype=np.int64)[None, :]
+                    and (
+                        np.all(
+                            board_sizes
+                            == np.asarray(shape[-2:], dtype=np.int64)[None, :]
+                        )
+                        or tuple(shape[-2:]) == tuple(data["board_input"].shape[-2:])
                     )
                 )
                 logical_policy_sizes = board_sizes[:, 0] * board_sizes[:, 1]

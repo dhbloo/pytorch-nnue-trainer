@@ -85,8 +85,8 @@ class MaskedInputPlane(BasicInputPlane):
 
     def forward(self, data, inv_side=False):
         input_plane = super().forward(data, inv_side)
-
-        return input_plane, self.input_mask(data, input_plane)
+        mask_plane = self.input_mask(data, input_plane)
+        return input_plane * mask_plane, mask_plane
 
     def input_mask(self, data, input_plane):
         board_size = data["board_size"]

@@ -46,6 +46,7 @@ from dataset.core import (
     canonical_pipeline_state_bytes,
 )
 from model import build_model
+from model.layers.normalization import MaskNorm
 from model.rule_condition import RuleConditionEncoder
 from model.vq import (
     VectorQuantize,
@@ -151,6 +152,9 @@ def _batch_norm_only_buffers(module):
                 value = child._buffers.get(name)
                 if value is not None:
                     batch_norm_buffer_ids.add(id(value))
+        if isinstance(child, MaskNorm) and child.norm_type == "bnorm":
+            for name in ("running_mean", "running_var"):
+                batch_norm_buffer_ids.add(id(child._buffers[name]))
     allowed = batch_norm_buffer_ids | immutable_buffer_ids
     if all(id(buffer) in allowed for buffer in buffers):
         return tuple(buffer for buffer in buffers if id(buffer) in batch_norm_buffer_ids)
