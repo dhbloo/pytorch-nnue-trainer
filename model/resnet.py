@@ -84,6 +84,7 @@ class ResBlock(nn.Module):
         dim_out=None,
         dim_hidden=None,
         norm_sizes=None,
+        conv_bias=True,
     ):
         super().__init__()
         dim_out = dim_out or dim_in
@@ -104,6 +105,7 @@ class ResBlock(nn.Module):
                 pad_type,
                 activation_first=activation_first,
                 norm_sizes=norm_sizes,
+                bias=conv_bias,
             ),
             Conv2dBlock(
                 dim_hidden,
@@ -116,6 +118,7 @@ class ResBlock(nn.Module):
                 pad_type,
                 activation_first=activation_first,
                 norm_sizes=norm_sizes,
+                bias=conv_bias,
             ),
         )
         if self.learned_shortcut:
@@ -324,6 +327,7 @@ class ResNetv3(nn.Module):
         trunk_padding=1,
         trunk_norm1="maskbn-noaffine",
         trunk_norm2="maskbn",
+        trunk_conv_bias=True,
         trunk_activation="relu",
         final_norm="none",
         final_activation="none",
@@ -339,6 +343,7 @@ class ResNetv3(nn.Module):
         self.head_type = head_type
         self.input_type = input_type
         self.drop_mask = drop_mask
+        self.trunk_conv_bias = trunk_conv_bias
 
         self.input_plane = build_input_plane(input_type, **(input_args or {}))
         self.conv_input = Conv2dBlock(
@@ -363,6 +368,7 @@ class ResNetv3(nn.Module):
                 activation=trunk_activation,
                 activation_first=False,
                 norm_sizes=norm_sizes,
+                conv_bias=trunk_conv_bias,
             )
             self.conv_trunk.append(block)
         self.final_norm, self.final_activation = _build_final_layers(
@@ -395,4 +401,5 @@ class ResNetv3(nn.Module):
     @property
     def name(self):
         b, f = self.model_size
-        return f"resnetv3_{self.input_type}_{b}b{f}f{self.head_type}"
+        suffix = "-nobias" if not self.trunk_conv_bias else ""
+        return f"resnetv3_{self.input_type}_{b}b{f}f{self.head_type}{suffix}"
