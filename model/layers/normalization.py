@@ -381,7 +381,7 @@ class MaskNorm(nn.Module):
         else:
             x = self._apply_affine_transform(x)
         if mask is not None:
-            x = x * mask
+            x = x * mask.to(dtype=x.dtype)
         return x
 
 
