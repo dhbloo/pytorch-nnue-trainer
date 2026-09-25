@@ -8,8 +8,9 @@ from utils.winrate_model import WinrateModel
 from . import DATASETS
 from .core import PipelineStateComposer, uniform_below
 from .planner import DatasetPlanner, PlannerConfig
+from .execution import SequentialLifecycleMixin
 from .sequential_source import InterleavedSequentialSource
-from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .source_dataset import PlannedBatchDataset
 
 
 class EntryHead(ctypes.Structure):
@@ -190,7 +191,7 @@ def raw_entry_metadata(raw_entry: bytes) -> tuple[int, str, int]:
 
 
 @DATASETS.register("packed_binary")
-class PackedBinaryDataset(PlannedBatchDataset):
+class PackedBinaryDataset(SequentialLifecycleMixin, PlannedBatchDataset):
     FILE_EXTS = [".lz4", ".binpack"]
 
     def __init__(
@@ -217,6 +218,7 @@ class PackedBinaryDataset(PlannedBatchDataset):
         sequential_active_streams: int = 2,
         sequential_read_quantum: int = 256,
         steps_per_epoch: int | None = None,
+        adaptive_pipeline=None,
     ):
         """
         Args:
@@ -247,6 +249,8 @@ class PackedBinaryDataset(PlannedBatchDataset):
         self.sequential_active_streams = sequential_active_streams
         self.sequential_read_quantum = sequential_read_quantum
         self.steps_per_epoch = steps_per_epoch
+        self.adaptive_pipeline = adaptive_pipeline
+        self._adaptive_pipeline_runtime = None
         self.winrate_model_args = dict(winrate_model_args or {})
         self.winrate_model = WinrateModel(**self.winrate_model_args)
     @property
@@ -362,10 +366,7 @@ class PackedBinaryDataset(PlannedBatchDataset):
                 else None
             ),
         )
-        self._planned_decoder = SourceBatchDataset(
-            self._partitioned_stream,
-            self._record_source,
-        )
+        self._finish_sequential_execution()
         return self._partitioned_stream
 
     def _open_binary_file(self, filename: str):

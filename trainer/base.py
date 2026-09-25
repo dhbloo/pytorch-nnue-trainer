@@ -5,7 +5,7 @@ import numpy as np
 import random
 import numbers
 from torch.nn.modules.batchnorm import _BatchNorm
-from torch.utils.data import IterableDataset
+from torch.utils.data import Dataset, IterableDataset
 from accelerate import (
     Accelerator,
     DataLoaderConfiguration,
@@ -68,6 +68,7 @@ from utils.training_utils import (
     state_dict_drop_size_unmatched,
     DeviceLoaderWrapper,
     ObservedDeviceLoaderWrapper,
+    ObservedPreparedLoaderWrapper,
     CudaPrefetchLoaderWrapper,
     StaticSlotLoaderWrapper,
     ResumableSampler,
@@ -534,6 +535,7 @@ class BaseTrainer:
             raise ValueError("cuda_prefetch_batches requires CUDA training")
         self._setup_cuda_memory_limit()
         self._setup_profiler()
+        self._preload_execution_checkpoint()
         self._setup_data()
         self._init_models()
         self._setup_optimizer()
@@ -769,12 +771,28 @@ class BaseTrainer:
             )
 
     def _resolve_adaptive_pipeline_spec(self):
+        supported_types = {
+            "batched_processed_katago_numpy", "batched_katago_numpy",
+            "iterative_processed_katago_numpy", "iterative_katago_numpy",
+            "iterative_sparse_numpy", "sparse_numpy", "iterative_multi",
+            "simple_binary", "packed_binary",
+            "katago_numpy", "processed_katago_numpy", "multi",
+        }
+        observed_map = self.dataset_type in {
+            "katago_numpy", "processed_katago_numpy", "multi"
+        }
+        observed_sequential = self.dataset_type in {
+            "simple_binary", "packed_binary"
+        }
         legacy_options = {
             "prefetch_threads",
             "prefetch_batches",
             "pin_memory",
         }
-        loader_options = {"pin_memory", "shuffle_buffer_size"}
+        loader_options = (
+            {"shuffle_buffer_size"} if observed_map
+            else {"pin_memory", "shuffle_buffer_size"}
+        )
         from dataset.pipeline import supports_parallel_stateless_pipeline
 
         pipeline_eligible = supports_parallel_stateless_pipeline(
@@ -786,39 +804,46 @@ class BaseTrainer:
             self.data_pipeline is not None,
         )
         if self.data_pipeline is None:
-            if (
-                self.dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy"}
-                or self.num_worker != 0
-                or not pipeline_eligible
-                or legacy_options.intersection(self.dataset_args)
-                or loader_options.intersection(self.dataloader_args)
-            ):
+            if self.dataset_type not in supported_types:
                 return None
             from dataset.pipeline_config import AdaptiveDataPipelineConfig
 
             self.data_pipeline = AdaptiveDataPipelineConfig()
-        elif policy_explicit and not pipeline_eligible:
+        elif policy_explicit and not pipeline_eligible and not (
+            observed_map or observed_sequential
+        ):
             raise ValueError(
                 "data_pipeline requires parallel-stateless data_pipelines"
             )
-        if self.dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy", "iterative_multi"}:
+        if self.dataset_type not in supported_types:
             raise ValueError(
-                "data_pipeline currently supports only "
-                "batched_processed_katago_numpy, batched_katago_numpy, or compatible iterative_multi"
+                "data_pipeline requires a supported built-in dataset"
             )
-        if self.num_worker != 0:
+        if self.num_worker != 0 and not observed_map:
             raise ValueError(
                 "data_pipeline requires num_worker=0 because its internal "
                 "decode workers own the rank-local memory budget"
             )
+        compatibility_layout = (
+            not policy_explicit
+            and (
+                self.dataset_type in {
+                    "iterative_processed_katago_numpy", "iterative_katago_numpy",
+                    "iterative_sparse_numpy", "sparse_numpy", "iterative_multi",
+                }
+                or not pipeline_eligible
+                or bool(legacy_options.intersection(self.dataset_args))
+                or bool(loader_options.intersection(self.dataloader_args))
+            )
+        )
         conflicts = sorted(legacy_options.intersection(self.dataset_args))
-        if conflicts:
+        if conflicts and not compatibility_layout:
             raise ValueError(
                 "data_pipeline cannot be combined with legacy dataset option(s): "
                 + ", ".join(conflicts)
             )
         loader_conflicts = sorted(loader_options.intersection(self.dataloader_args))
-        if loader_conflicts:
+        if loader_conflicts and not compatibility_layout:
             raise ValueError(
                 "data_pipeline cannot be combined with dataloader option(s): "
                 + ", ".join(loader_conflicts)
@@ -856,7 +881,10 @@ class BaseTrainer:
             self.accelerator.process_index,
         )
         cache_candidate = None
-        if layout.is_leader:
+        if not compatibility_layout and layout.is_leader and self.dataset_type not in {
+            "simple_binary", "packed_binary", "katago_numpy",
+            "processed_katago_numpy", "multi",
+        }:
             try:
                 cache_directory = tempfile.mkdtemp(prefix="ntr-decoded-")
                 visibility_token = os.urandom(16).hex()
@@ -912,6 +940,12 @@ class BaseTrainer:
             self.data_pipeline,
             resources,
             pin_memory_supported=self.accelerator.device.type == "cuda",
+            origin="explicit" if policy_explicit else "implicit",
+            compatibility_layout=compatibility_layout,
+            preferred_backend=(
+                "generic" if not policy_explicit and self.dataset_type == "iterative_multi"
+                else None
+            ),
             consumer_retained_batches=self.gradient_accumulation_steps,
             h2d_lookahead_batches=self.cuda_prefetch_batches,
             node_decoded_cache=node_cache,
@@ -939,16 +973,42 @@ class BaseTrainer:
             ),
             shuffle=shuffle,
             pipeline_args=self.data_pipelines,
-            adaptive_pipeline=self._adaptive_pipeline_spec,
+            adaptive_pipeline=(
+                None if self._adaptive_pipeline_spec is not None
+                and self._adaptive_pipeline_spec.compatibility_layout
+                else self._adaptive_pipeline_spec
+            ),
+            resume_execution_hint=self._resume_execution_hint,
             **train_dataset_args,
             ),
         )
+        if (
+            self._adaptive_pipeline_spec is not None
+            and self._adaptive_pipeline_spec.compatibility_layout
+            and isinstance(self.train_dataset, Dataset)
+            and not isinstance(self.train_dataset, IterableDataset)
+        ):
+            from dataset.execution import (
+                ObservedExecutionRuntime, attach_observed_map_execution,
+            )
+
+            self.train_dataset = attach_observed_map_execution(
+                self.train_dataset,
+                self._adaptive_pipeline_spec,
+                ObservedExecutionRuntime(self._adaptive_pipeline_spec),
+            )
+        map_decision = getattr(self.train_dataset, "execution_decision", None)
+        self._map_pipeline_stats = None
+        if map_decision is not None and map_decision.backend == "map":
+            from dataset.telemetry import PipelineStats
+
+            self._map_pipeline_stats = PipelineStats()
         prepare_node_cache = getattr(
             self.train_dataset,
             "prepare_node_decoded_cache",
             None,
         )
-        if prepare_node_cache is not None:
+        if prepare_node_cache is not None and self._adaptive_pipeline_spec is not None:
             self._collective_dataset_call(
                 "node decoded-cache preparation",
                 prepare_node_cache,
@@ -979,6 +1039,18 @@ class BaseTrainer:
                 "training stream manifest inspection",
                 self.train_dataset._build_partitioned_stream,
             )
+            if (
+                self._adaptive_pipeline_spec is not None
+                and self._adaptive_pipeline_spec.compatibility_layout
+            ):
+                from dataset.execution import attach_observed_legacy_execution
+
+                self._collective_dataset_call(
+                    "legacy-layout observation",
+                    lambda: attach_observed_legacy_execution(
+                        self.train_dataset, self._adaptive_pipeline_spec
+                    ),
+                )
             self._validate_stream_signature_collectively(
                 self._resume_stream, "training"
             )
@@ -1032,9 +1104,14 @@ class BaseTrainer:
         )
         self._validate_cuda_prefetch_support(self.train_loader)
         self._data_stream_signature = self._build_data_stream_signature()
-        if getattr(self.train_dataset, "pipeline_stats", None) is not None:
+        if (
+            getattr(self.train_dataset, "pipeline_stats", None) is not None
+            or getattr(self.train_dataset, "passive_pipeline_stats", None) is not None
+            or self._map_pipeline_stats is not None
+        ):
             self._log_metrics = self._log_metrics_observed
         self._synchronize_pipeline_tuning_state()
+        self._log_data_execution(self.train_dataset, "train")
 
         if self.val_datas or self.val_dataset_type:
             val_dataset_args = self._evaluation_dataset_args(
@@ -1072,15 +1149,85 @@ class BaseTrainer:
                 self._validate_stream_signature_collectively(
                     val_stream, "validation"
                 )
+            from dataset.stream import EvaluationBatchPlannerDataset
+
             self.val_loader = build_data_loader(
                 self.val_dataset,
                 self.batch_size_per_process * self.eval_bs_multipler,
-                num_workers=self.num_worker,
+                num_workers=(
+                    0 if isinstance(self.val_dataset, EvaluationBatchPlannerDataset)
+                    else self.num_worker
+                ),
                 shuffle=False,
                 **self.dataloader_args,
             )
+            self._log_data_execution(self.val_dataset, "validation")
         else:
             self.val_dataset, self.val_loader = None, None
+
+    def _log_data_execution(self, dataset, phase):
+        decision = getattr(dataset, "execution_decision", None)
+        if decision is None:
+            return
+        executor = getattr(dataset, "_planned_decoder", None)
+        runtime = getattr(dataset, "_adaptive_pipeline_runtime", None)
+        workers = (
+            self.num_worker if decision.backend == "map"
+            else getattr(executor, "active_prefetch_workers", 0)
+        )
+        queue = (
+            self.dataloader_args.get("prefetch_factor", 2)
+            if workers and decision.backend == "map"
+            else getattr(executor, "active_prefetch_batches", 0)
+        )
+        cache_bytes = (
+            runtime.settings.decoded_cache_bytes if runtime is not None else None
+        )
+        self.accelerator.print(
+            f"Data execution {phase}: backend={decision.backend}, "
+            f"policy={decision.policy}, workers={workers}, queue={queue}, "
+            f"cache_bytes={cache_bytes}, "
+            f"memory_accounting={decision.capabilities.memory_accounting}, "
+            f"reasons={','.join(decision.reasons)}"
+        )
+
+    def _preload_execution_checkpoint(self):
+        """Freeze a mixed stream's saved physical backend before data setup."""
+        self._preloaded_state_filename = None
+        self._preloaded_state_checkpoint = None
+        self._resume_execution_hint = None
+        self._preloaded_state_search_done = self.dataset_type == "iterative_multi"
+        if self.dataset_type != "iterative_multi":
+            return
+        state_filename = find_latest_ckpt(self.ckpt_dir, "state_")
+        if state_filename is None:
+            return
+        state = torch.load(state_filename, map_location="cpu", weights_only=True)
+        resume = state.get("resume")
+        if isinstance(resume, dict) and isinstance(resume.get("ranks"), list):
+            rank_states = self._validate_rank_resume_states(resume["ranks"])
+            backends = set()
+            for rank_state in rank_states:
+                backend = rank_state.get("execution_backend")
+                if backend is None and rank_state.get("cursor_kind") == "file_stream_v1":
+                    cursor = (rank_state.get("stream") or {}).get("cursor") or {}
+                    source_cursor = cursor.get("source_cursor") or {}
+                    if source_cursor.get("schema") == "composite-record-source-v4":
+                        backend = (
+                            "packed" if "packed_pending" in source_cursor else "generic"
+                        )
+                if backend is not None:
+                    backends.add(backend)
+            if len(backends) > 1 or backends.difference({"packed", "generic"}):
+                raise RuntimeError("Cannot resume: mixed execution backends disagree")
+            if backends:
+                from dataset.execution import ResumeExecutionHint
+
+                self._resume_execution_hint = ResumeExecutionHint(
+                    backend=backends.pop(), legacy=True
+                )
+        self._preloaded_state_filename = state_filename
+        self._preloaded_state_checkpoint = state
 
     def _training_dataset_args(self):
         """Translate optimizer-step options to the data-stream contract."""
@@ -1150,10 +1297,15 @@ class BaseTrainer:
                 self.test_dataset._build_partitioned_stream,
             )
             self._validate_stream_signature_collectively(test_stream, "test")
+        from dataset.stream import EvaluationBatchPlannerDataset
+
         self.test_loader = build_data_loader(
             self.test_dataset,
             self.batch_size_per_process * self.eval_bs_multipler,
-            num_workers=self.num_worker,
+            num_workers=(
+                0 if isinstance(self.test_dataset, EvaluationBatchPlannerDataset)
+                else self.num_worker
+            ),
             shuffle=False,
             **self.dataloader_args,
         )
@@ -1859,10 +2011,17 @@ class BaseTrainer:
         """Resume from the latest training state in *ckpt_dir*, falling back to
         legacy merged checkpoints in the rundir root, then to optional
         pretrained weights."""
-        state_filename = find_latest_ckpt(self.ckpt_dir, "state_")
+        state_filename = self._preloaded_state_filename
+        if state_filename is None and not self._preloaded_state_search_done:
+            state_filename = find_latest_ckpt(self.ckpt_dir, "state_")
 
         if state_filename:
-            self._load_state_checkpoint(state_filename)
+            try:
+                self._load_state_checkpoint(
+                    state_filename, state=self._preloaded_state_checkpoint
+                )
+            finally:
+                self._preloaded_state_checkpoint = None
             return
 
         if os.path.isdir(self.ckpt_dir) and any(
@@ -1880,13 +2039,14 @@ class BaseTrainer:
 
         self._load_pretrained_weights()
 
-    def _load_state_checkpoint(self, state_filename):
+    def _load_state_checkpoint(self, state_filename, *, state=None):
         """Load models, optimizers, and scaler anchored on *state_filename*."""
         iteration = get_iteration_from_ckpt_filename(state_filename)
         if iteration is None:
             raise RuntimeError(f"Cannot parse iteration from state file {state_filename}")
 
-        state = torch.load(state_filename, map_location="cpu", weights_only=True)
+        if state is None:
+            state = torch.load(state_filename, map_location="cpu", weights_only=True)
         if state.get("format_version") != 2:
             raise RuntimeError(
                 f"Cannot resume checkpoint {state_filename}: exact continuation"
@@ -2112,6 +2272,8 @@ class BaseTrainer:
             "cursor_kind": state.get("cursor_kind"),
             "data_stream_signature": state.get("data_stream_signature"),
         }
+        if "execution_backend" in state:
+            projection["execution_backend"] = state["execution_backend"]
         if "vq_runtime" in state:
             projection["vq_runtime"] = (
                 {
@@ -2791,6 +2953,9 @@ class BaseTrainer:
             "data_stream_signature": self._data_stream_signature,
             "rng": self._capture_rng_state(),
         }
+        decision = getattr(self.train_dataset, "execution_decision", None)
+        if decision is not None:
+            state["execution_backend"] = decision.backend
         if getattr(self, "_resume_stream", None) is not None:
             identity = self.train_dataset.runtime_context.rank_local_identity
             state.update(
@@ -3756,6 +3921,10 @@ class BaseTrainer:
             self.train_loader = self._prepare_data_loader(self.train_loader)
         else:
             self.train_loader = prepared[-1]
+            if getattr(self, "_map_pipeline_stats", None) is not None:
+                self.train_loader = ObservedPreparedLoaderWrapper(
+                    self.train_loader, self._map_pipeline_stats
+                )
         if self.val_loader is not None:
             self.val_loader = self._prepare_data_loader(
                 self.val_loader,
@@ -3811,6 +3980,8 @@ class BaseTrainer:
         ):
             pipeline_stats = getattr(dataloader.dataset, "pipeline_stats", None)
             is_training_loader = dataloader is getattr(self, "train_loader", None)
+            if is_training_loader and getattr(self, "_map_pipeline_stats", None) is not None:
+                pipeline_stats = self._map_pipeline_stats
             if is_training_loader and self.cuda_prefetch_batches > 0:
                 # Static input slots replace multi-deep lookahead: with a
                 # cudagraph-compiled step, fresh device addresses each step
@@ -3858,6 +4029,13 @@ class BaseTrainer:
             # The underlying sampler still enforces the configured sample-level
             # drop_last. The outer shard must retain a complete unpaired batch.
             prepared.batch_sampler.drop_last = False
+        if (
+            dataloader is getattr(self, "train_loader", None)
+            and getattr(self, "_map_pipeline_stats", None) is not None
+        ):
+            return ObservedPreparedLoaderWrapper(
+                prepared, self._map_pipeline_stats
+            )
         return prepared
 
     def _validate_cuda_prefetch_support(self, dataloader):
@@ -5204,6 +5382,11 @@ class BaseTrainer:
         # object collectives stay off the healthy input path.
         data = None
         restarted_epoch = False
+        map_fetch_start = (
+            time.perf_counter_ns()
+            if getattr(self, "_map_pipeline_stats", None) is not None
+            else None
+        )
         try:
             try:
                 data = next(self._train_data_iter)
@@ -5246,6 +5429,11 @@ class BaseTrainer:
                 (*data.semantic_memory_leases, *data.host_memory_leases)
             )
             data = data.data
+        if map_fetch_start is not None:
+            self._map_pipeline_stats.record_decode(
+                time.perf_counter_ns() - map_fetch_start,
+                self.batch_size_per_process,
+            )
         return _BatchFetchResult(
             data=data,
             restarted_epoch=restarted_epoch,
@@ -5259,9 +5447,18 @@ class BaseTrainer:
 
     def _flush_pipeline_metrics(self, consumer_batches_s):
         dataset = getattr(getattr(self, "train_loader", None), "dataset", None)
-        if getattr(dataset, "pipeline_stats", None) is None:
+        map_stats = getattr(self, "_map_pipeline_stats", None)
+        if (
+            getattr(dataset, "pipeline_stats", None) is None
+            and getattr(dataset, "passive_pipeline_stats", None) is None
+            and map_stats is None
+        ):
             return {}, {}, None
-        local_snapshot = dataset.pipeline_metrics_snapshot()
+        local_snapshot = (
+            map_stats.snapshot(active_workers=max(1, self.num_worker))
+            if map_stats is not None
+            else dataset.pipeline_metrics_snapshot()
+        )
         snapshots = (
             [local_snapshot]
             if self.accelerator.num_processes == 1

@@ -1,13 +1,14 @@
-"""Reuse the adaptive NPZ runtime for a compatible composite source."""
+"""Share one adaptive runtime across compatible composite NPZ sources."""
 
 import os
 
 import numpy as np
 import torch
 
-from .katago import BatchedProcessedKatagoNumpyDataset
+from .katago import BatchedProcessedKatagoNumpyDataset, IterativeProcessedKatagoNumpyDataset
+from .execution import PipelineLifecycleMixin
 from .pipeline_runtime import AdaptivePipelineRuntime
-from .telemetry import ObservedSourceBatchDataset, PipelineStats
+from .telemetry import PipelineStats
 from .stream import reject_duplicate_physical_files
 
 
@@ -25,7 +26,10 @@ class _CompositeDecoderCache:
             )
         }
 
-    def configure_cache(self, *, entries, byte_capacity):
+    def configure_cache(
+        self, *, entries, byte_capacity, host_memory_budget=None,
+        file_size_catalog=(),
+    ):
         if byte_capacity < sum(self.floors):
             raise ValueError("mixed decoded cache cannot fit one file from each child")
         remaining = byte_capacity - sum(self.floors)
@@ -37,44 +41,54 @@ class _CompositeDecoderCache:
             )
 
 
-class AdaptiveMultiMixin:
+class AdaptiveMultiMixin(PipelineLifecycleMixin):
     # The cache is prepared over the union once. Per-child ordinal catalogs
     # must never be independently installed into the shared directory.
-    prepare_node_decoded_cache = BatchedProcessedKatagoNumpyDataset.prepare_node_decoded_cache
-    activate_node_decoded_cache = BatchedProcessedKatagoNumpyDataset.activate_node_decoded_cache
-    node_decoded_cache_ready = BatchedProcessedKatagoNumpyDataset.node_decoded_cache_ready
-    set_node_decoded_cache_enabled = BatchedProcessedKatagoNumpyDataset.set_node_decoded_cache_enabled
-    cleanup_node_decoded_cache = BatchedProcessedKatagoNumpyDataset.cleanup_node_decoded_cache
-    pipeline_metrics_snapshot = BatchedProcessedKatagoNumpyDataset.pipeline_metrics_snapshot
-    pipeline_tuning_update = BatchedProcessedKatagoNumpyDataset.pipeline_tuning_update
-    pipeline_tuning_state_dict = BatchedProcessedKatagoNumpyDataset.pipeline_tuning_state_dict
-    load_pipeline_tuning_state_dict = BatchedProcessedKatagoNumpyDataset.load_pipeline_tuning_state_dict
-    restore_pipeline_tuning_state_dict = BatchedProcessedKatagoNumpyDataset.restore_pipeline_tuning_state_dict
 
     def _init_adaptive_multi(self, spec):
         self.adaptive_pipeline = spec
         self._adaptive_pipeline_runtime = None
+        self._observed_composite = False
         self._node_decoded_cache_catalog = None
+        self._shared_host_memory_budget = None
         if spec is None:
             return
         from .raw_npz import BatchedKatagoNumpyDataset
+        from .katago import IterativeKatagoNumpyDataset
+        from .sparse_numpy import IterativeSparseNumpyDataset
+        from .simple_binary import SimpleBinaryDataset
+        from .packed_binary import PackedBinaryDataset
+        from .host_memory import HostMemoryBudget
 
-        if not all(type(child) in {BatchedProcessedKatagoNumpyDataset, BatchedKatagoNumpyDataset}
-                   for child in self.datasets):
-            raise ValueError("adaptive iterative_multi requires compatible batched NPZ children")
-        unsupported = (
-            "filter_stm", "filter_condition", "board_input_channels",
-            "stm_input_channel", "value_target_channels",
-        )
-        if any(
-            any(child.extra_kwargs.get(key) is not None for key in unsupported)
-            for child in self.datasets
-        ):
-            raise ValueError("adaptive iterative_multi requires dense unfiltered NPZ children")
-        if any(len(child.boardsizes) != 1 for child in self.datasets):
-            raise ValueError("adaptive iterative_multi requires one board size per child")
+        supported = {
+            BatchedProcessedKatagoNumpyDataset,
+            IterativeProcessedKatagoNumpyDataset,
+            BatchedKatagoNumpyDataset,
+            IterativeKatagoNumpyDataset,
+            IterativeSparseNumpyDataset,
+        }
+        binary_types = {SimpleBinaryDataset, PackedBinaryDataset}
+        if not all(type(child) in supported | binary_types for child in self.datasets):
+            raise ValueError("adaptive iterative_multi requires supported record children")
+        if any(type(child) in binary_types for child in self.datasets):
+            from .execution import ObservedExecutionRuntime
+
+            self._adaptive_pipeline_runtime = ObservedExecutionRuntime(spec)
+            self._observed_composite = True
+            self.file_list = reject_duplicate_physical_files(
+                [path for child in self.datasets for path in child.file_list]
+            )
+            return
         if self.batch_pipelines:
-            raise ValueError("adaptive iterative_multi does not support batch_pipelines")
+            from .core import PipelineStateComposer
+
+            if not PipelineStateComposer(self.batch_pipelines).is_parallel_stateless:
+                raise ValueError(
+                    "adaptive iterative_multi requires parallel-stateless batch_pipelines"
+                )
+        self._shared_host_memory_budget = HostMemoryBudget(
+            spec.resources.per_rank_host_budget_bytes
+        )
         self.file_list = reject_duplicate_physical_files(
             [path for child in self.datasets for path in child.file_list]
         )
@@ -87,11 +101,13 @@ class AdaptiveMultiMixin:
         )
 
     def _configure_adaptive_children(self):
-        if self.adaptive_pipeline is None:
+        if self.adaptive_pipeline is None or self._observed_composite:
             return
         catalog = self._node_decoded_cache_catalog
         for child in self.datasets:
-            child.observability = True
+            child._shared_host_memory_budget = self._shared_host_memory_budget
+            if hasattr(child, "observability"):
+                child.observability = True
             if catalog is not None:
                 child._node_decoded_cache_catalog = {
                     os.path.abspath(path): catalog[os.path.abspath(path)]
@@ -101,13 +117,52 @@ class AdaptiveMultiMixin:
     def _install_adaptive_multi(self):
         if self.adaptive_pipeline is None:
             return
+        if self._observed_composite:
+            from .execution import build_execution
+
+            self.pipeline_stats = PipelineStats()
+            self._planned_decoder = build_execution(
+                self._partitioned_stream,
+                self._record_source,
+                decision=self.execution_decision,
+                runtime=self._adaptive_pipeline_runtime,
+                pipeline_stats=self.pipeline_stats,
+                prefetch_workers=0,
+                prefetch_batches=1,
+            )
+            return
         from .packed_composite import PackedCompositeRecordSource
 
-        if not isinstance(self._record_source, PackedCompositeRecordSource):
-            raise ValueError("adaptive iterative_multi requires packed dense NPZ sources")
-        manifests = [
-            manifest for child in self.datasets for manifest in child._record_manifests
+        packed = isinstance(self._record_source, PackedCompositeRecordSource)
+        composer = self._partitioned_stream.pipeline_composer
+        child_manifests = [
+            getattr(child, "_record_manifests", None)
+            or getattr(child, "_indexed_manifests", None)
+            for child in self.datasets
         ]
+        if any(not group for group in child_manifests):
+            raise ValueError("adaptive composite child has no budgeted manifest")
+        manifests = [
+            {
+                **manifest,
+                "output_row_bytes": (
+                    manifest["output_row_bytes"]
+                    + composer.added_output_row_bytes(manifest["board_size"])
+                ),
+            }
+            if composer is not None
+            else manifest
+            for group in child_manifests
+            for manifest in group
+        ]
+        cache_floors = [
+            max(manifest["decoded_file_bytes"] for manifest in group)
+            for group in child_manifests
+        ]
+        indexed_catalog_bytes = sum(
+            getattr(child._record_source.decoder, "catalog_reserved_bytes", 0)
+            for child in self.datasets
+        )
         context = self.runtime_context
         runtime = AdaptivePipelineRuntime(
             self.adaptive_pipeline,
@@ -116,56 +171,72 @@ class AdaptiveMultiMixin:
             global_batch_size=context.global_batch_size,
             shuffle=self.shuffle,
             shuffle_window_size=self.shuffle_window_size,
+            memory_budget=self._shared_host_memory_budget,
             shared_decoded_cache=self._node_decoded_cache_catalog is not None,
             packed_mixed_shapes=len(self._record_source.shape_codes),
-            minimum_cache_bytes=sum(
-                max(m["decoded_file_bytes"] for m in child._record_manifests)
-                for child in self.datasets
-            ),
+            minimum_cache_bytes=sum(cache_floors),
+            serial_execution=not packed,
+            pre_reserved_semantic_bytes=indexed_catalog_bytes,
+            generic_source_count=len(self.datasets),
         )
         self._adaptive_pipeline_runtime = runtime
         self.pipeline_stats = PipelineStats()
         settings = runtime.settings
-        for child in self.datasets:
+        dense_children = [
+            (child, group, floor)
+            for child, group, floor in zip(self.datasets, child_manifests, cache_floors)
+            if hasattr(child, "_record_decoder")
+        ]
+        for child, group, floor in dense_children:
             child._record_decoder.pipeline_stats = self.pipeline_stats
             child._record_decoder.configure_cache(
-                entries=max(1, len(child._record_manifests)),
-                byte_capacity=settings.decoded_cache_bytes,
+                entries=max(1, len(group)),
+                byte_capacity=(
+                    settings.decoded_cache_bytes if packed else floor
+                ),
                 host_memory_budget=runtime.memory_budget,
-                file_size_catalog=child._record_manifests,
+                file_size_catalog=group,
             )
-        self._record_source.decoder = _CompositeDecoderCache(
-            (child._record_decoder for child in self.datasets),
-            [child._record_manifests for child in self.datasets],
-        )
-        self._record_source.decoder.configure_cache(
-            entries=1, byte_capacity=settings.decoded_cache_bytes
-        )
+        if packed:
+            self._record_source.decoder = _CompositeDecoderCache(
+                (child._record_decoder for child in self.datasets),
+                child_manifests,
+            )
+            self._record_source.decoder.configure_cache(
+                entries=1, byte_capacity=settings.decoded_cache_bytes
+            )
         runtime.reserve_semantic_floor()
 
         def finalize(data):
             if not settings.pin_memory:
                 return data
             return {
-                key: torch.from_numpy(np.ascontiguousarray(value)).pin_memory()
+                key: (
+                    torch.from_numpy(np.ascontiguousarray(value)).pin_memory()
+                    if isinstance(value, np.ndarray) and value.dtype.kind in "biuf"
+                    else value
+                )
                 for key, value in data.items()
             }
 
-        self._planned_decoder = ObservedSourceBatchDataset(
+        from .execution import build_execution
+
+        self._planned_decoder = build_execution(
             self._partitioned_stream,
             self._record_source,
+            decision=self.execution_decision,
+            runtime=runtime,
+            pipeline_stats=self.pipeline_stats,
             finalize_batch=finalize,
-            prefetch_workers=settings.decode_workers,
+            prefetch_workers=(settings.decode_workers if packed else 0),
             prefetch_batches=settings.ready_queue_batches,
             prefetch_chunk_batches=settings.decode_chunk_batches,
-            finalize_in_prefetch=True,
+            finalize_in_prefetch=packed,
             host_memory_budget=runtime.memory_budget,
             output_batch_bytes=runtime.output_batch_bytes,
             planner_token_bytes=runtime.planner_token_bytes,
             epoch_lookahead_bytes=runtime.epoch_lookahead_bytes,
             output_is_pinned=settings.pin_memory,
-            pipeline_stats=self.pipeline_stats,
-            adaptive_runtime=runtime,
         )
 
     def close(self):
@@ -177,6 +248,12 @@ class AdaptiveMultiMixin:
                     adapter.close()
                 except Exception as exc:
                     error = exc
+            planner = getattr(self, "_partitioned_stream", None)
+            if planner is not None:
+                try:
+                    planner.close()
+                except Exception as exc:
+                    error = error or exc
             for child in self.datasets:
                 close = getattr(child, "close", None)
                 if close is not None:

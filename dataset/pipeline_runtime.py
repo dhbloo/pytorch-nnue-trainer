@@ -11,36 +11,23 @@ from dataclasses import dataclass, field, replace
 import hashlib
 import json
 import math
-import struct
 from typing import Mapping, Sequence
 
 from .host_memory import HostMemoryBudget, HostMemoryCategory
+from .pipeline_estimates import estimate_npz_execution
 from .node_decoded_cache import NodeDecodedCache
-from .packed import PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT
 from .pipeline_config import AdaptiveDataPipelineConfig
 from .pipeline_controller import (
     AdaptivePipelineController,
     DecodeLayout,
     PipelineCapacityError,
-    PipelineControllerConstraints,
     PipelineObservation,
     PipelineSettings,
 )
 from .pipeline_topology import DistributedPipelineResources
-from .planner import SOURCE_CHUNK_SIZE, PACKED_MIXED_SOURCE_CHUNK_SIZE
 
 
 ADAPTIVE_PIPELINE_RUNTIME_SCHEMA = "adaptive-pipeline-runtime-v5"
-
-_PACKED_RECORD_ID_BYTES = 8
-_BATCH_MASK_BYTES = 1
-_READY_BATCH_METADATA_BYTES_PER_ROW = (
-    2 * struct.calcsize("P") + _BATCH_MASK_BYTES
-)
-_PINNED_FINALIZATION_COPY_COUNT = 2
-# Child IDs, gather positions, child-key arrays and lazy output-key lookups.
-_COMPOSITE_ROUTING_BYTES_PER_ROW = 64
-
 
 @dataclass(frozen=True, slots=True)
 class AdaptivePipelineRuntimeSpec:
@@ -49,6 +36,9 @@ class AdaptivePipelineRuntimeSpec:
     config: AdaptiveDataPipelineConfig
     resources: DistributedPipelineResources
     pin_memory_supported: bool
+    origin: str = "explicit"
+    compatibility_layout: bool = False
+    preferred_backend: str | None = None
     consumer_retained_batches: int = 1
     h2d_lookahead_batches: int = 0
     node_decoded_cache: NodeDecodedCache | None = field(
@@ -64,6 +54,12 @@ class AdaptivePipelineRuntimeSpec:
             raise TypeError("resources must be DistributedPipelineResources")
         if type(self.pin_memory_supported) is not bool:
             raise TypeError("pin_memory_supported must be a boolean")
+        if self.origin not in {"explicit", "implicit"}:
+            raise ValueError("origin must be explicit or implicit")
+        if type(self.compatibility_layout) is not bool:
+            raise TypeError("compatibility_layout must be a boolean")
+        if self.preferred_backend not in {None, "packed", "generic"}:
+            raise ValueError("preferred_backend must be packed, generic, or null")
         if (
             type(self.consumer_retained_batches) is not int
             or self.consumer_retained_batches <= 0
@@ -90,13 +86,6 @@ def _positive_int(name: str, value) -> int:
         raise TypeError(f"{name} must be a positive integer")
     if value <= 0:
         raise ValueError(f"{name} must be a positive integer")
-    return value
-
-
-def _manifest_size(catalog: Mapping, name: str) -> int:
-    value = catalog.get(name)
-    if type(value) is not int or value < 0:
-        raise ValueError(f"processed-NPZ manifest {name} must be non-negative")
     return value
 
 
@@ -137,6 +126,10 @@ class AdaptivePipelineRuntime:
         shared_decoded_cache: bool = False,
         packed_mixed_shapes: int = 0,
         minimum_cache_bytes: int = 0,
+        serial_execution: bool = False,
+        pre_reserved_semantic_bytes: int = 0,
+        generic_source_count: int = 1,
+        serial_shape_count: int = 1,
     ) -> None:
         if type(packed_mixed_shapes) is not int or packed_mixed_shapes < 0:
             raise ValueError("packed_mixed_shapes must be a non-negative integer")
@@ -155,6 +148,12 @@ class AdaptivePipelineRuntime:
             raise TypeError("shuffle must be a boolean")
         if type(shared_decoded_cache) is not bool:
             raise TypeError("shared_decoded_cache must be a boolean")
+        if type(serial_execution) is not bool:
+            raise TypeError("serial_execution must be a boolean")
+        if type(pre_reserved_semantic_bytes) is not int or pre_reserved_semantic_bytes < 0:
+            raise ValueError("pre_reserved_semantic_bytes must be non-negative")
+        generic_source_count = _positive_int("generic_source_count", generic_source_count)
+        serial_shape_count = _positive_int("serial_shape_count", serial_shape_count)
         if memory_budget is not None:
             if not isinstance(memory_budget, HostMemoryBudget):
                 raise TypeError("memory_budget must be HostMemoryBudget or null")
@@ -163,166 +162,81 @@ class AdaptivePipelineRuntime:
                     "memory_budget total must match the resolved per-rank host budget"
                 )
 
-        decoded_sizes = tuple(
-            _manifest_size(catalog, "decoded_file_bytes")
-            for catalog in manifests
+        footprint = estimate_npz_execution(
+            spec,
+            manifests,
+            local_batch_size=local_batch_size,
+            global_batch_size=global_batch_size,
+            shuffle=shuffle,
+            shuffle_window_size=shuffle_window_size,
+            shared_decoded_cache=shared_decoded_cache,
+            packed_mixed_shapes=packed_mixed_shapes,
+            minimum_cache_bytes=minimum_cache_bytes,
         )
-        inflight_sizes = tuple(
-            _manifest_size(catalog, "inflight_file_bytes")
-            if "inflight_file_bytes" in catalog
-            else decoded_size
-            for catalog, decoded_size in zip(manifests, decoded_sizes)
-        )
-        output_row_sizes = tuple(
-            _manifest_size(catalog, "output_row_bytes")
-            for catalog in manifests
-        )
-        positive_decoded_sizes = tuple(size for size in decoded_sizes if size > 0)
-        positive_inflight_sizes = tuple(
-            inflight_size
-            for decoded_size, inflight_size in zip(
-                decoded_sizes,
-                inflight_sizes,
+        constraints = footprint.constraints
+        if serial_execution:
+            # Generic NPZ planners retain Python envelopes and pointer-based
+            # cursor snapshots. Packed uint64 accounting alone is too small.
+            reservoir_rows = shuffle_window_size if shuffle else 1
+            shape_rows = max(serial_shape_count, packed_mixed_shapes) * global_batch_size
+            pending_rows = generic_source_count * 1024
+            record_bytes = 2048
+            snapshot_pointer_bytes = 16 * (
+                reservoir_rows + shape_rows + pending_rows
             )
-            if decoded_size > 0
-        )
-        positive_output_sizes = tuple(size for size in output_row_sizes if size > 0)
-        if not positive_decoded_sizes or not positive_output_sizes:
-            raise ValueError(
-                "adaptive pipeline requires at least one non-empty accepted NPZ file"
+            generic_fixed_bytes = record_bytes * (
+                reservoir_rows + shape_rows + 2 * global_batch_size
+                + pending_rows + len(manifests)
             )
-
-        planned_pin_memory = (
-            spec.config.advanced.pin_memory
-            if spec.config.advanced is not None
-            else spec.pin_memory_supported
-        )
-        output_copy_count = (
-            _PINNED_FINALIZATION_COPY_COUNT if planned_pin_memory else 1
-        )
-        if packed_mixed_shapes:
-            # Child decode chunks coexist with their scattered composite output.
-            # Routing indices and lazy keys also outlive child materialization.
-            output_copy_count += 1
-        composite_metadata_bytes = (
-            _COMPOSITE_ROUTING_BYTES_PER_ROW if packed_mixed_shapes else 0
-        )
-        output_batch_bytes = (
-            (
-                max(positive_output_sizes) * output_copy_count
-                + _READY_BATCH_METADATA_BYTES_PER_ROW
-                + composite_metadata_bytes
+            generic_token_bytes = (
+                record_bytes * (global_batch_size + pending_rows)
+                + snapshot_pointer_bytes
             )
-            * local_batch_size
-        )
-
-        reservoir_capacity = shuffle_window_size if shuffle else 1
-        reservoir_bytes = reservoir_capacity * _PACKED_RECORD_ID_BYTES
-        planned_batch_bytes = global_batch_size * (
-            _PACKED_RECORD_ID_BYTES + _BATCH_MASK_BYTES
-        )
-        board_sizes = []
-        for catalog in manifests:
-            board_size = catalog.get("board_size")
-            if (
-                not isinstance(board_size, (list, tuple))
-                or len(board_size) != 2
-            ):
-                board_sizes = []
-                break
-            board_sizes.append(tuple(int(value) for value in board_size))
-        packed_uniform = bool(packed_mixed_shapes) or (
-            bool(board_sizes) and len(set(board_sizes)) == 1
-        )
-        source_chunk_size = (
-            PACKED_MIXED_SOURCE_CHUNK_SIZE
-            if packed_mixed_shapes > 1 else SOURCE_CHUNK_SIZE
-        )
-        packed_journal_bytes = (
-            (global_batch_size * max(1, packed_mixed_shapes) + source_chunk_size)
-            * PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT
-        )
-        planner_token_bytes = (
-            planned_batch_bytes + packed_journal_bytes
-            if packed_uniform
-            else reservoir_bytes + planned_batch_bytes
-        )
-        # Mixed shape queues retain at most one global batch per shape.
-        # Snapshot arrays are immutable and shared until consumed.
-        shape_queue_bytes = packed_mixed_shapes * global_batch_size * _PACKED_RECORD_ID_BYTES
-        planner_token_bytes += shape_queue_bytes
-        queued_batch_bytes = output_batch_bytes + planner_token_bytes
-        # Packed transactions retain deltas per queued batch. At the terminal
-        # drain, rollback temporarily retains the live reservoir allocation,
-        # one pre-drain image, one zero-copy ready array, and the absorbed
-        # no-batch probe's journal. Generic planners keep the previous
-        # live-plus-committed snapshot accounting.
-        fixed_semantic_floor_bytes = (
-            3 * reservoir_bytes + planned_batch_bytes + packed_journal_bytes
-            if packed_uniform
-            else 2 * reservoir_bytes + planned_batch_bytes
-        )
-
-        fixed_semantic_floor_bytes += 2 * shape_queue_bytes
-
-        resources = spec.resources
-        total_decoded_bytes = sum(positive_decoded_sizes)
-        total_logical_rows = sum(
-            int(catalog.get("logical_row_count", 0))
-            for catalog in manifests
-            if int(catalog.get("decoded_file_bytes", 0)) > 0
-        )
-        initial_queue_batches = max(1, resources.per_rank_cpu_limit * 8)
-        lookahead_rows = global_batch_size * initial_queue_batches
-        if shuffle:
-            lookahead_rows += shuffle_window_size
-        initial_cache_bytes = max(max(positive_decoded_sizes), minimum_cache_bytes)
-        if total_logical_rows > 0:
-            working_fraction = min(
-                1.0,
-                1.25 * lookahead_rows / total_logical_rows,
-            )
-            initial_cache_bytes = min(
-                total_decoded_bytes,
-                max(
-                    initial_cache_bytes,
-                    math.ceil(total_decoded_bytes * working_fraction),
+            constraints = replace(
+                constraints,
+                per_rank_cpu_limit=1,
+                total_decoded_bytes=constraints.largest_decoded_file_bytes,
+                initial_decoded_cache_bytes=constraints.largest_decoded_file_bytes,
+                fixed_semantic_floor_bytes=(
+                    constraints.fixed_semantic_floor_bytes + generic_fixed_bytes
+                ),
+                planner_token_bytes_per_queued_batch=(
+                    constraints.planner_token_bytes_per_queued_batch
+                    + generic_token_bytes
+                ),
+                consumer_retained_bytes=(
+                    constraints.consumer_retained_bytes
+                    + spec.consumer_retained_batches * generic_token_bytes
+                ),
+                h2d_retained_bytes=(
+                    constraints.h2d_retained_bytes
+                    + spec.h2d_lookahead_batches * generic_token_bytes
                 ),
             )
-        if shared_decoded_cache:
-            initial_cache_bytes = total_decoded_bytes
-        constraints = PipelineControllerConstraints(
-            local_rank_count=resources.local_rank_count,
-            per_rank_host_budget_bytes=resources.per_rank_host_budget_bytes,
-            per_rank_cpu_limit=resources.per_rank_cpu_limit,
-            largest_decoded_file_bytes=max(max(positive_decoded_sizes), minimum_cache_bytes),
-            output_batch_bytes=output_batch_bytes,
-            fixed_semantic_floor_bytes=fixed_semantic_floor_bytes,
-            planner_token_bytes_per_queued_batch=planner_token_bytes,
-            pin_memory_supported=spec.pin_memory_supported,
-            largest_inflight_file_bytes=max(positive_inflight_sizes),
-            consumer_retained_bytes=(
-                spec.consumer_retained_batches * queued_batch_bytes
-            ),
-            h2d_retained_bytes=(
-                0
-                if spec.h2d_lookahead_batches == 0
-                else (
-                    spec.h2d_lookahead_batches * queued_batch_bytes
-                    + (spec.h2d_lookahead_batches + 1)
-                    * output_batch_bytes
-                )
-            ),
-            total_decoded_bytes=total_decoded_bytes,
-            initial_decoded_cache_bytes=initial_cache_bytes,
-            shared_decoded_cache=shared_decoded_cache,
-        )
+        self._semantic_reservation_bytes = constraints.fixed_semantic_floor_bytes
+        if pre_reserved_semantic_bytes:
+            constraints = replace(
+                constraints,
+                fixed_semantic_floor_bytes=(
+                    constraints.fixed_semantic_floor_bytes
+                    + pre_reserved_semantic_bytes
+                ),
+            )
+        packed_uniform = footprint.packed_uniform and not serial_execution
+        fixed_semantic_floor_bytes = footprint.semantic_floor_bytes
+        total_logical_rows = footprint.total_logical_rows
+        resources = spec.resources
         self.spec = spec
+        self.serial_execution = serial_execution
         self.constraints = constraints
         self.memory_budget = memory_budget or HostMemoryBudget(
             resources.per_rank_host_budget_bytes
         )
         self.controller = AdaptivePipelineController(spec.config, constraints)
+        if serial_execution:
+            self.controller.restore_performance_settings(
+                self.controller.settings, frozen=True
+            )
         # An overlapping epoch owns another reservoir and cursor. Include its
         # full floor in every future layout/capacity decision, not just the
         # currently charged bytes when decode workers happen to be idle.
@@ -350,7 +264,7 @@ class AdaptivePipelineRuntime:
 
     @property
     def maximum_prefetch_workers(self) -> int:
-        return self.constraints.per_rank_cpu_limit
+        return 0 if self.serial_execution else self.constraints.per_rank_cpu_limit
 
     @property
     def output_batch_bytes(self) -> int:
@@ -365,7 +279,7 @@ class AdaptivePipelineRuntime:
             return
         self._semantic_reservation = self.memory_budget.reserve(
             HostMemoryCategory.SEMANTIC_FIXED,
-            self.constraints.fixed_semantic_floor_bytes,
+            self._semantic_reservation_bytes,
             label="planner fixed state",
         )
 
@@ -497,6 +411,8 @@ class AdaptivePipelineRuntime:
             "constraints": constraints,
             "total_logical_rows": self._total_logical_rows,
         }
+        if self.serial_execution:
+            payload["serial_execution"] = True
         return self._hash_runtime_key(payload)
 
     def _build_legacy_runtime_key(self) -> str:
@@ -504,6 +420,8 @@ class AdaptivePipelineRuntime:
             "config": _config_state(self.spec.config),
             "constraints": self.constraints.as_dict(),
         }
+        if self.serial_execution:
+            payload["serial_execution"] = True
         return self._hash_runtime_key(payload)
 
     @staticmethod

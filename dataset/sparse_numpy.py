@@ -5,13 +5,14 @@ from .decoder import NpzRowRecordDecoder
 from .core import PipelineStateComposer
 from .npz_source import IndexedNpzSource
 from .planner import DatasetPlanner, PlannerConfig
-from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .source_dataset import PlannedBatchDataset
+from .execution import IndexedLifecycleMixin
 from .stream import reject_duplicate_physical_files
 
 
 @DATASETS.register("sparse_numpy")
 @DATASETS.register("iterative_sparse_numpy")
-class IterativeSparseNumpyDataset(PlannedBatchDataset):
+class IterativeSparseNumpyDataset(IndexedLifecycleMixin, PlannedBatchDataset):
     FILE_EXTS = [".npz"]
 
     def __init__(
@@ -30,6 +31,7 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
         shuffle_window_size: int = 32768,
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
+        adaptive_pipeline=None,
     ):
         super().__init__()
         self.batch_pipelines = tuple(batch_pipelines)
@@ -44,6 +46,8 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
         self.shuffle_window_size = shuffle_window_size
         self.shuffle_buffer_bytes = shuffle_buffer_bytes
         self.steps_per_epoch = steps_per_epoch
+        self.adaptive_pipeline = adaptive_pipeline
+        self._adaptive_pipeline_runtime = None
     def _build_partitioned_stream(self):
         runtime_context = getattr(self, "runtime_context", None)
         if runtime_context is None:
@@ -64,6 +68,32 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
             with np.load(path, allow_pickle=False) as source:
                 return reader._unpack_data(
                     **{key: np.array(source[key], copy=True) for key in source.files}
+                )
+
+        budget = None
+        file_memory_bound = None
+        output_row_bound = None
+        shared_budget = getattr(self, "_shared_host_memory_budget", None)
+        if self.adaptive_pipeline is not None or shared_budget is not None:
+            from .host_memory import HostMemoryBudget
+            from .indexed_estimates import (
+                sparse_indexed_file_bound,
+                sparse_indexed_output_row_bytes,
+            )
+
+            budget = shared_budget or HostMemoryBudget(
+                self.adaptive_pipeline.resources.per_rank_host_budget_bytes
+            )
+            file_memory_bound = sparse_indexed_file_bound
+
+            def output_row_bound(schemas):
+                packed_shape, _ = schemas["binaryInputNCHWPacked"]
+                physical_width = int(np.sqrt(8 * packed_shape[2]))
+                output_shape = self.fixed_board_size or (
+                    physical_width, physical_width
+                )
+                return sparse_indexed_output_row_bytes(
+                    schemas, output_shape=output_shape
                 )
 
         decoder = NpzRowRecordDecoder(
@@ -91,6 +121,9 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
                 "fixed_board_size": self.fixed_board_size,
                 "drop_extra": self.drop_extra,
             },
+            host_memory_budget=budget,
+            file_memory_bound=file_memory_bound,
+            output_row_bound=output_row_bound,
         )
         paths = reject_duplicate_physical_files(self.file_list)
         catalogs = [
@@ -104,6 +137,23 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
             shuffle=self.shuffle,
             sample_rate=self.sample_rate,
         )
+        manifests = [
+            {
+                **{key: catalog[key] for key in (
+                    "decoded_file_bytes", "inflight_file_bytes",
+                    "output_row_bytes", "logical_row_count",
+                )},
+                "board_size": catalog.get(
+                    "board_size",
+                    max(self._record_source.shape_codes, key=lambda shape: shape[0] * shape[1]),
+                ),
+            }
+            for catalog in catalogs
+        ] if budget is not None else None
+        self._indexed_manifests = manifests
+        del catalogs
+        if budget is not None:
+            decoder.finalize_catalog_reservations(self._record_source.descriptors)
         composer = (
             PipelineStateComposer(self.batch_pipelines)
             if self.batch_pipelines
@@ -120,9 +170,8 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
             ),
             pipeline_composer=composer,
         )
-        self._planned_decoder = SourceBatchDataset(
-            self._partitioned_stream,
-            self._record_source,
+        self._finish_indexed_execution(
+            decoder, manifests, self._partitioned_stream.config
         )
         return self._partitioned_stream
 
@@ -225,10 +274,11 @@ class IterativeSparseNumpyDataset(PlannedBatchDataset):
             symmetry_type=self.apply_symmetry,
             drop_extra=self.drop_extra,
         )
-        # Convert unsigned feature storage to PyTorch-compatible signed types.
-        if data["sparse_feature_dim"].max() > np.iinfo(np.int32).max:
-            raise ValueError("sparse feature dimension exceeds int32")
-        data["sparse_feature_input"] = data["sparse_feature_input"].astype(np.int32)
-        data["sparse_feature_dim"] = data["sparse_feature_dim"].astype(np.int32)
+        # Convert retained unsigned feature storage to signed tensor types.
+        if "sparse_feature_dim" in data:
+            if data["sparse_feature_dim"].max() > np.iinfo(np.int32).max:
+                raise ValueError("sparse feature dimension exceeds int32")
+            data["sparse_feature_input"] = data["sparse_feature_input"].astype(np.int32)
+            data["sparse_feature_dim"] = data["sparse_feature_dim"].astype(np.int32)
 
         return data

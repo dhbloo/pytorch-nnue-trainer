@@ -7,8 +7,9 @@ from utils.data_utils import *
 from . import DATASETS
 from .core import PipelineStateComposer, uniform_below
 from .planner import DatasetPlanner, PlannerConfig
+from .execution import SequentialLifecycleMixin
 from .sequential_source import InterleavedSequentialSource
-from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .source_dataset import PlannedBatchDataset
 
 
 class EntryHead(ctypes.Structure):
@@ -83,7 +84,7 @@ def raw_entry_shape(raw_entry: bytes):
 
 
 @DATASETS.register("simple_binary")
-class SimpleBinaryDataset(PlannedBatchDataset):
+class SimpleBinaryDataset(SequentialLifecycleMixin, PlannedBatchDataset):
     FILE_EXTS = [".lz4", ".bin"]
 
     def __init__(
@@ -104,6 +105,7 @@ class SimpleBinaryDataset(PlannedBatchDataset):
         sequential_active_streams: int = 2,
         sequential_read_quantum: int = 256,
         steps_per_epoch: int | None = None,
+        adaptive_pipeline=None,
     ):
         super().__init__()
         self.batch_pipelines = tuple(batch_pipelines)
@@ -121,6 +123,8 @@ class SimpleBinaryDataset(PlannedBatchDataset):
         self.sequential_active_streams = sequential_active_streams
         self.sequential_read_quantum = sequential_read_quantum
         self.steps_per_epoch = steps_per_epoch
+        self.adaptive_pipeline = adaptive_pipeline
+        self._adaptive_pipeline_runtime = None
     @property
     def capabilities(self):
         from .core import DatasetCapabilities
@@ -218,9 +222,7 @@ class SimpleBinaryDataset(PlannedBatchDataset):
                 else None
             ),
         )
-        self._planned_decoder = SourceBatchDataset(
-            self._partitioned_stream, self._record_source
-        )
+        self._finish_sequential_execution()
         return self._partitioned_stream
 
     def _open_binary_file(self, filename: str):

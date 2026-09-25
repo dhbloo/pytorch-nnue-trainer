@@ -45,6 +45,24 @@ class PlannedBatchDataset(IterableDataset):
             self._build_partitioned_stream()
         yield from self._planned_decoder
 
+    def close(self):
+        decoder = getattr(self._record_source, "decoder", None)
+        runtime = getattr(self, "_adaptive_pipeline_runtime", None)
+        try:
+            if self._planned_decoder is not None:
+                self._planned_decoder.close()
+        finally:
+            try:
+                if self._partitioned_stream is not None:
+                    self._partitioned_stream.close()
+            finally:
+                try:
+                    if decoder is not None and hasattr(decoder, "close"):
+                        decoder.close()
+                finally:
+                    if runtime is not None:
+                        runtime.close()
+
 
 class SourceBatchDataset:
     """Materialize v2 planner batches while preserving trainer transactions."""

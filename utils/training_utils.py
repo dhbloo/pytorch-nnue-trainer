@@ -355,6 +355,38 @@ class ObservedDeviceLoaderWrapper(DeviceLoaderWrapper):
             yield batch
 
 
+class ObservedPreparedLoaderWrapper:
+    """Measure an already prepared map loader without changing its dispatch."""
+
+    def __init__(self, dataloader, pipeline_stats):
+        self.dataloader = dataloader
+        self.pipeline_stats = pipeline_stats
+
+    @property
+    def dataset(self):
+        return self.dataloader.dataset
+
+    def __len__(self):
+        return len(self.dataloader)
+
+    def __getattr__(self, name):
+        return getattr(self.dataloader, name)
+
+    def __iter__(self):
+        import time
+
+        iterator = iter(self.dataloader)
+        while True:
+            start = time.perf_counter_ns()
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                return
+            elapsed = time.perf_counter_ns() - start
+            self.pipeline_stats.record_source_wait(elapsed)
+            yield batch
+
+
 def _move_to_device_and_collect(
     value,
     device,

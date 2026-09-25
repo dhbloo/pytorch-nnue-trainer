@@ -149,7 +149,7 @@ class SafeFilterEvaluator:
             operand = self._eval(node.operand)
             self._check_result_allocation(
                 getattr(operand, "shape", ()),
-                getattr(getattr(operand, "dtype", None), "itemsize", 8),
+                self._result_itemsize(_UNARY[type(node.op)], operand),
                 node,
             )
             result = _UNARY[type(node.op)](operand)
@@ -165,7 +165,9 @@ class SafeFilterEvaluator:
                     raise self._error(node, "exponent must be a literal integer in [0, 8]")
             left = self._eval(node.left)
             right = self._eval(node.right)
-            self._check_broadcast(left, right, node)
+            self._check_broadcast(
+                left, right, node, function=_BINARY[type(node.op)]
+            )
             try:
                 result = _BINARY[type(node.op)](left, right)
             except Exception as exc:
@@ -180,9 +182,15 @@ class SafeFilterEvaluator:
                 if type(op_node) not in _COMPARE:
                     raise self._error(node, f"comparison {type(op_node).__name__} is forbidden")
                 right = self._eval(comparator)
-                self._check_broadcast(left, right, node)
+                self._check_broadcast(left, right, node, result_itemsize=1)
                 part = self._check_array(_COMPARE[type(op_node)](left, right), "comparison intermediate")
-                result = part if result is None else np.logical_and(result, part)
+                if result is None:
+                    result = part
+                else:
+                    self._check_broadcast(result, part, node, result_itemsize=1)
+                    result = self._check_array(
+                        np.logical_and(result, part), "comparison intermediate"
+                    )
                 left = right
             return result
         if isinstance(node, ast.Subscript):
@@ -191,10 +199,7 @@ class SafeFilterEvaluator:
                 raise self._error(node, "only numeric arrays may be indexed")
             index = self._index_literal(node.slice)
             if self._contains_advanced_index(index):
-                advanced_count = self._advanced_index_count(index)
-                estimated_elements = max(1, advanced_count) * max(
-                    1, value.size // max(1, value.shape[0])
-                )
+                estimated_elements = self._advanced_result_elements(value.shape, index)
                 self._check_result_allocation(
                     (estimated_elements,), value.dtype.itemsize, node
                 )
@@ -226,7 +231,7 @@ class SafeFilterEvaluator:
                     raise self._error(node, "incompatible function argument shapes") from exc
                 self._check_result_allocation(
                     shape,
-                    max(arg.dtype.itemsize for arg in arrays),
+                    self._result_itemsize(function, *args),
                     node,
                 )
             try:
@@ -236,7 +241,21 @@ class SafeFilterEvaluator:
             return self._check_array(result, "function intermediate")
         raise self._error(node, "syntax is forbidden")
 
-    def _check_broadcast(self, left: Any, right: Any, node: ast.AST) -> None:
+    @staticmethod
+    def _result_itemsize(function, *args) -> int:
+        probes = [
+            np.ones((), dtype=value.dtype)
+            if isinstance(value, np.ndarray) else value
+            for value in args
+        ]
+        with np.errstate(all="ignore"):
+            result = function(*probes)
+        return int(np.asarray(result).dtype.itemsize)
+
+    def _check_broadcast(
+        self, left: Any, right: Any, node: ast.AST, *,
+        function=None, result_itemsize=None,
+    ) -> None:
         shapes = [value.shape for value in (left, right) if isinstance(value, np.ndarray)]
         if not shapes:
             return
@@ -244,13 +263,10 @@ class SafeFilterEvaluator:
             shape = np.broadcast_shapes(*shapes)
         except ValueError as exc:
             raise self._error(node, f"incompatible broadcast shapes {shapes}") from exc
-        itemsize = max(
-            (
-                value.dtype.itemsize
-                for value in (left, right)
-                if isinstance(value, np.ndarray)
-            ),
-            default=8,
+        itemsize = (
+            result_itemsize
+            if result_itemsize is not None
+            else self._result_itemsize(function, left, right)
         )
         self._check_result_allocation(shape, itemsize, node)
 
@@ -269,19 +285,38 @@ class SafeFilterEvaluator:
         if isinstance(index, list):
             return True
         return isinstance(index, tuple) and any(
-            isinstance(item, list) for item in index
+            isinstance(item, (list, tuple)) for item in index
         )
 
     @staticmethod
-    def _advanced_index_count(index):
-        if isinstance(index, list):
-            return len(index)
-        if isinstance(index, tuple):
-            return max(
-                (len(item) for item in index if isinstance(item, list)),
-                default=0,
-            )
-        return 0
+    def _advanced_result_elements(shape, index):
+        dimensions = list(index) if isinstance(index, tuple) else [index]
+        rank = len(shape)
+        if dimensions.count(Ellipsis) > 1:
+            raise ValueError("advanced subscript contains multiple ellipses")
+        consumed = sum(item is not Ellipsis for item in dimensions)
+        if Ellipsis in dimensions:
+            position = dimensions.index(Ellipsis)
+            dimensions[position:position + 1] = [slice(None)] * (rank - consumed)
+        dimensions.extend([slice(None)] * (rank - len(dimensions)))
+        if len(dimensions) != rank:
+            raise ValueError("advanced subscript exceeds array rank")
+        elements = 1
+        advanced = []
+        for extent, item in zip(shape, dimensions):
+            if isinstance(item, (list, tuple)) and all(
+                isinstance(value, int) for value in item
+            ):
+                advanced.append((len(item),))
+            elif isinstance(item, slice):
+                elements *= len(range(*item.indices(extent)))
+            elif isinstance(item, int):
+                continue
+            else:
+                raise ValueError("unsupported advanced subscript component")
+        if advanced:
+            elements *= math.prod(np.broadcast_shapes(*advanced))
+        return elements
 
     def _index_literal(self, node: ast.AST) -> Any:
         if isinstance(node, ast.Constant):

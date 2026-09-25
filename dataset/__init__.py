@@ -21,6 +21,8 @@ def _read_multi_dataset(
     *,
     runtime_context: DatasetRuntimeContext | None = None,
     allow_blend_ratio: bool = False,
+    budgeted_npz_alias: bool = False,
+    wrap_map_evaluation: bool = True,
     **kwargs,
 ):
     datasets = []
@@ -28,6 +30,8 @@ def _read_multi_dataset(
     for dataset_name, dataset_args in dataset_dict.items():
         dataset_args = dict(dataset_args)  # never mutate the caller's config dict
         dataset_type = dataset_args.pop("dataset_type")
+        if budgeted_npz_alias and dataset_type == "iterative_processed_katago_numpy":
+            dataset_type = "batched_processed_katago_numpy"
         if dataset_type not in DATASETS:
             raise ValueError(
                 f"invalid dataset type in {dataset_name}: {dataset_type}"
@@ -65,6 +69,7 @@ def _read_multi_dataset(
                 dataset_type,
                 data_paths,
                 runtime_context=runtime_context,
+                wrap_map_evaluation=wrap_map_evaluation,
                 **resolved_args,
             )
         else:
@@ -121,6 +126,7 @@ class MultiDataset(Dataset):
             apply_symmetry=apply_symmetry,
             shuffle=shuffle,
             runtime_context=runtime_context,
+            wrap_map_evaluation=False,
         )
         # check if all datasets have __len__ and __getitem__ method
         if not all(
@@ -132,6 +138,16 @@ class MultiDataset(Dataset):
     @property
     def is_fixed_side_input(self):
         return self.fixed_side_input
+
+    def close(self):
+        runtime = getattr(self, "_adaptive_pipeline_runtime", None)
+        if runtime is not None:
+            runtime.close()
+            self._adaptive_pipeline_runtime = None
+        for dataset in self.datasets:
+            close = getattr(dataset, "close", None)
+            if close is not None:
+                close()
 
     def __len__(self):
         return sum(len(dataset) for dataset in self.datasets)
@@ -164,6 +180,36 @@ class MultiDataset(Dataset):
             index -= len(dataset)
         raise IndexError("Index out of range")
 
+    def map_output_shape(self, index):
+        for dataset in self.datasets:
+            if index < len(dataset):
+                shape_of = getattr(dataset, "map_output_shape", None)
+                return (
+                    shape_of(index)
+                    if shape_of is not None
+                    else dataset.map_record_ref(index).output_shape
+                )
+            index -= len(dataset)
+        raise IndexError("Index out of range")
+
+    def map_sample_key(self, index):
+        for child, dataset in enumerate(self.datasets):
+            if index < len(dataset):
+                key_of = getattr(dataset, "map_sample_key", None)
+                key = (
+                    key_of(index)
+                    if key_of is not None
+                    else dataset.map_record_ref(index).sample_key
+                )
+                return (
+                    "map-child",
+                    key[1],
+                    key[2],
+                    (child, *key[3]),
+                )
+            index -= len(dataset)
+        raise IndexError("Index out of range")
+
 
 from .mixed_runtime import AdaptiveMultiMixin
 
@@ -191,6 +237,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         steps_per_epoch: int | None = None,
         runtime_context: DatasetRuntimeContext | None = None,
         adaptive_pipeline=None,
+        resume_execution_hint=None,
     ) -> None:
         super().__init__()
         self.batch_pipelines = tuple(batch_pipelines)
@@ -202,6 +249,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         self.steps_per_epoch = steps_per_epoch
         self.mixing = MixingConfig.parse(mixing)
         self.runtime_context = runtime_context
+        self.resume_execution_hint = resume_execution_hint
         self.child_ids = tuple(dataset_dict)
         child_runtime = None
         if runtime_context is not None:
@@ -224,6 +272,13 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
             shuffle=shuffle,
             runtime_context=child_runtime,
             allow_blend_ratio=self.mixing.mode == "weighted",
+            budgeted_npz_alias=(
+                adaptive_pipeline is not None
+                and not any(
+                    args.get("dataset_type") in {"simple_binary", "packed_binary"}
+                    for args in dataset_dict.values()
+                )
+            ),
         )
         if not self.datasets:
             raise ValueError("iterative_multi requires at least one child dataset")
@@ -289,7 +344,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         from .composite_source import CompositeRecordSource
         from .core import PipelineStateComposer
         from .planner import DatasetPlanner, PlannerConfig
-        from .source_dataset import SourceBatchDataset
+        from .execution import build_execution, resolve_execution
         from .stream import reject_duplicate_physical_files
 
         structural_defaults = {
@@ -311,7 +366,15 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
                 }
             )
         for name in structural_defaults:
-            values = [state[name] for state in structural_states]
+            values = [
+                state[name]
+                for dataset, state in zip(self.datasets, structural_states)
+                if name != "drop_extra"
+                or hasattr(dataset, name)
+                or name in getattr(dataset, "extra_kwargs", {})
+            ]
+            if not values:
+                continue
             if any(value != values[0] for value in values[1:]):
                 raise ValueError(
                     f"iterative_multi children have incompatible structural "
@@ -350,18 +413,29 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
                     planner.close()
         weights = self._integer_ratio_weights()
         from .packed_composite import PackedCompositeRecordSource
-        source_cls = PackedCompositeRecordSource if self.adaptive_pipeline is not None else CompositeRecordSource
+        composer = (
+            PipelineStateComposer(self.batch_pipelines)
+            if self.batch_pipelines
+            else None
+        )
+        self.execution_decision = resolve_execution(
+            child_sources,
+            requested_policy=self.adaptive_pipeline,
+            pipeline_composer=composer,
+            resume_hint=self.resume_execution_hint,
+            observational_generic=self._observed_composite,
+        )
+        source_cls = (
+            PackedCompositeRecordSource
+            if self.execution_decision.backend == "packed"
+            else CompositeRecordSource
+        )
         self._record_source = source_cls(
             child_sources,
             self.child_ids,
             weights,
             mixing=self.mixing,
             seed=runtime_context.seed,
-        )
-        composer = (
-            PipelineStateComposer(self.batch_pipelines)
-            if self.batch_pipelines
-            else None
         )
         self._partitioned_stream = DatasetPlanner(
             self._record_source,
@@ -374,11 +448,17 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
             ),
             pipeline_composer=composer,
         )
-        self._planned_decoder = SourceBatchDataset(
-            self._partitioned_stream,
-            self._record_source,
-        )
-        self._install_adaptive_multi()
+        if self.adaptive_pipeline is None:
+            self._planned_decoder = build_execution(
+                self._partitioned_stream,
+                self._record_source,
+                decision=self.execution_decision,
+            )
+        try:
+            self._install_adaptive_multi()
+        except BaseException:
+            self.close()
+            raise
         self.composite_audit = {
             "mixing": self._record_source.manifest_state()["mixing"],
             "quotas": self._record_source.quotas,
@@ -403,6 +483,8 @@ def build_dataset(
     shuffle: bool=False,
     pipeline_args: None | dict = None,
     adaptive_pipeline=None,
+    resume_execution_hint=None,
+    wrap_map_evaluation: bool = True,
     **kwargs,
 ) -> Dataset | IterableDataset:
     if not isinstance(runtime_context, DatasetRuntimeContext):
@@ -410,13 +492,25 @@ def build_dataset(
     if dataset_type not in DATASETS:
         raise ValueError(f"Unknown dataset type: {dataset_type}")
     dataset_cls = DATASETS[dataset_type]
+    observed_map = adaptive_pipeline is not None and dataset_type in {
+        "katago_numpy", "processed_katago_numpy", "multi"
+    }
+    if adaptive_pipeline is not None and dataset_type == "iterative_processed_katago_numpy":
+        # Both public names construct the same dense NPZ source and planner.
+        # The batched adapter adds budgeted cache/prefetch ownership.
+        dataset_cls = DATASETS["batched_processed_katago_numpy"]
     if (
         adaptive_pipeline is not None
-        and dataset_type not in {"batched_processed_katago_numpy", "batched_katago_numpy", "iterative_multi"}
+        and dataset_type not in {
+            "batched_processed_katago_numpy", "batched_katago_numpy",
+            "iterative_processed_katago_numpy", "iterative_katago_numpy",
+            "iterative_sparse_numpy", "sparse_numpy", "iterative_multi",
+            "simple_binary", "packed_binary",
+            "katago_numpy", "processed_katago_numpy", "multi",
+        }
     ):
         raise ValueError(
-            "adaptive_pipeline currently supports only "
-            "batched_processed_katago_numpy, batched_katago_numpy, or compatible iterative_multi"
+            "adaptive_pipeline requires a supported built-in dataset"
         )
     explicit_shuffle_window_size = "shuffle_window_size" in kwargs
     explicit_pin_memory = "pin_memory" in kwargs
@@ -571,6 +665,7 @@ def build_dataset(
                 )
             kwargs["batch_pipelines"] = batch_pipelines
             pipeline_args = None
+    map_runtime = None
     if adaptive_pipeline is not None:
         from .pipeline_runtime import AdaptivePipelineRuntimeSpec
 
@@ -578,7 +673,16 @@ def build_dataset(
             raise TypeError(
                 "adaptive_pipeline must be AdaptivePipelineRuntimeSpec or null"
             )
-        kwargs["adaptive_pipeline"] = adaptive_pipeline
+        if observed_map:
+            from .execution import ObservedExecutionRuntime
+
+            map_runtime = ObservedExecutionRuntime(adaptive_pipeline)
+        else:
+            kwargs["adaptive_pipeline"] = adaptive_pipeline
+    if resume_execution_hint is not None:
+        if dataset_cls is not MultiIterativeDataset:
+            raise ValueError("resume execution hint requires iterative_multi")
+        kwargs["resume_execution_hint"] = resume_execution_hint
     if dataset_cls in {MultiDataset, MultiIterativeDataset}:
         kwargs["runtime_context"] = runtime_context
 
@@ -598,8 +702,16 @@ def build_dataset(
     if pipeline_args is not None:
         dataset = warp_dataset_with_pipeline(dataset, pipeline_args)
 
+    if observed_map:
+        from .execution import attach_observed_map_execution
+
+        dataset = attach_observed_map_execution(
+            dataset, adaptive_pipeline, map_runtime
+        )
+
     if (
-        runtime_context.mode in {"validate", "test"}
+        wrap_map_evaluation
+        and runtime_context.mode in {"validate", "test"}
         and isinstance(dataset, Dataset)
         and not isinstance(dataset, IterableDataset)
     ):

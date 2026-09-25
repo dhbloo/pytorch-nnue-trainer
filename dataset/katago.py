@@ -2,7 +2,6 @@ import numpy as np
 import torch
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
 from torch.utils.data.dataset import Dataset
 from torch.utils.data import get_worker_info
 from utils.data_utils import *
@@ -11,7 +10,8 @@ from .decoder import NpzRowRecordDecoder, ProcessedNpzDecoder
 from .core import PipelineStateComposer, uniform_below
 from .npz_source import DenseNpzSource, IndexedNpzSource
 from .planner import DatasetPlanner, PlannerConfig
-from .source_dataset import PlannedBatchDataset, SourceBatchDataset
+from .source_dataset import PlannedBatchDataset
+from .execution import IndexedLifecycleMixin, PipelineLifecycleMixin
 from .stream import (
     MapRecordRef,
     reject_duplicate_physical_files,
@@ -69,6 +69,12 @@ def _map_symmetry_index(dataset, index, board_size):
 @DATASETS.register("katago_numpy")
 class KatagoNumpyDataset(Dataset):
     FILE_EXTS = [".npz"]
+
+    def close(self):
+        runtime = getattr(self, "_adaptive_pipeline_runtime", None)
+        if runtime is not None:
+            runtime.close()
+            self._adaptive_pipeline_runtime = None
 
     def __init__(
         self,
@@ -264,9 +270,22 @@ class KatagoNumpyDataset(Dataset):
             tuple(output_shape),
         )
 
+    def map_output_shape(self, index):
+        if self.fixed_board_size is not None:
+            return self.fixed_board_size
+        return tuple(int(value) for value in self.data_dict["board_size"][index])
+
+    def map_sample_key(self, index):
+        return (
+            "map-row",
+            self._sample_root_digest,
+            type(self).__name__,
+            (int(index),),
+        )
+
 
 @DATASETS.register("iterative_katago_numpy")
-class IterativeKatagoNumpyDataset(PlannedBatchDataset):
+class IterativeKatagoNumpyDataset(IndexedLifecycleMixin, PlannedBatchDataset):
     """
     Similar to KatagoNumpyDataset but with iterative loading.
     This is useful when the dataset is too large to fit into memory.
@@ -293,6 +312,7 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
         shuffle_buffer_bytes: int | None = None,
         steps_per_epoch: int | None = None,
         rule: str | None = None,
+        adaptive_pipeline=None,
     ):
         super().__init__()
         self.file_list = file_list
@@ -302,6 +322,8 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
         self.shuffle = shuffle
         self.sample_rate = sample_rate
         self.batch_pipelines = tuple(batch_pipelines)
+        self.adaptive_pipeline = adaptive_pipeline
+        self._adaptive_pipeline_runtime = None
         self.extra_kwargs = {
             **({"rule": rule} if rule is not None else {}),
             "fixed_board_size": fixed_board_size,
@@ -340,6 +362,41 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
             )
             return dataset, len(dataset)
 
+        budget = None
+        file_memory_bound = None
+        output_row_bound = None
+        shared_budget = getattr(self, "_shared_host_memory_budget", None)
+        if self.adaptive_pipeline is not None or shared_budget is not None:
+            from .host_memory import HostMemoryBudget
+            from .indexed_estimates import (
+                raw_indexed_file_bound,
+                raw_indexed_output_row_bytes,
+            )
+
+            budget = shared_budget or HostMemoryBudget(
+                self.adaptive_pipeline.resources.per_rank_host_budget_bytes
+            )
+            file_memory_bound = lambda schemas: raw_indexed_file_bound(
+                schemas,
+                has_pass_move=options["has_pass_move"],
+                rule_index=self.rule_index,
+                filter_stm=options["filter_stm"],
+                filter_condition=options["filter_condition"],
+            )
+
+            def output_row_bound(schemas):
+                packed_shape, _ = schemas["binaryInputNCHWPacked"]
+                physical_width = int(np.sqrt(8 * packed_shape[2]))
+                output_shape = options["fixed_board_size"] or (
+                    physical_width, physical_width
+                )
+                return raw_indexed_output_row_bytes(
+                    schemas,
+                    output_shape=output_shape,
+                    has_pass_move=options["has_pass_move"],
+                    rule_index=self.rule_index,
+                )
+
         decoder = NpzRowRecordDecoder(
             "raw-katago-npz",
             runtime_context,
@@ -362,6 +419,9 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
                 "fixed_side_input": self.fixed_side_input,
                 **options,
             },
+            host_memory_budget=budget,
+            file_memory_bound=file_memory_bound,
+            output_row_bound=output_row_bound,
         )
         paths = reject_duplicate_physical_files(self.file_list)
         catalogs = [
@@ -375,6 +435,23 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
             shuffle=self.shuffle,
             sample_rate=self.sample_rate,
         )
+        manifests = [
+            {
+                **{key: catalog[key] for key in (
+                    "decoded_file_bytes", "inflight_file_bytes",
+                    "output_row_bytes", "logical_row_count",
+                )},
+                "board_size": catalog.get(
+                    "board_size",
+                    max(self._record_source.shape_codes, key=lambda shape: shape[0] * shape[1]),
+                ),
+            }
+            for catalog in catalogs
+        ] if budget is not None else None
+        self._indexed_manifests = manifests
+        del catalogs
+        if budget is not None:
+            decoder.finalize_catalog_reservations(self._record_source.descriptors)
         composer = (
             PipelineStateComposer(self.batch_pipelines)
             if self.batch_pipelines
@@ -393,9 +470,8 @@ class IterativeKatagoNumpyDataset(PlannedBatchDataset):
             ),
             pipeline_composer=composer,
         )
-        self._planned_decoder = SourceBatchDataset(
-            self._partitioned_stream,
-            self._record_source,
+        self._finish_indexed_execution(
+            decoder, manifests, self._partitioned_stream.config
         )
         return self._partitioned_stream
 
@@ -412,6 +488,12 @@ class ProcessedKatagoNumpyDataset(Dataset):
     """
 
     FILE_EXTS = [".npz"]
+
+    def close(self):
+        runtime = getattr(self, "_adaptive_pipeline_runtime", None)
+        if runtime is not None:
+            runtime.close()
+            self._adaptive_pipeline_runtime = None
 
     def __init__(
         self,
@@ -582,15 +664,29 @@ class ProcessedKatagoNumpyDataset(Dataset):
             tuple(int(value) for value in output_shape),
         )
 
+    def map_output_shape(self, index):
+        return tuple(int(value) for value in (self.fixed_board_size or self.boardsize))
+
+    def map_sample_key(self, index):
+        return (
+            "map-row",
+            self._sample_root_digest,
+            type(self).__name__,
+            (int(index),),
+        )
+
 
 @DATASETS.register("iterative_processed_katago_numpy")
-class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
+class IterativeProcessedKatagoNumpyDataset(PipelineLifecycleMixin, PlannedBatchDataset):
     """
     Similar to ProcessedKatagoNumpyDataset but with iterative loading.
     This is useful when the dataset is too large to fit into memory.
     """
 
     FILE_EXTS = [".npz"]
+
+    def _node_decoded_cache_is_supported(self):
+        return False
 
     def __init__(
         self,
@@ -616,6 +712,7 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
         rule: str | None = None,
     ):
         super().__init__()
+        self.adaptive_pipeline = None
         self.file_list = file_list
         self.rule_index = None if rule is None else Rule.from_string(rule).index
         self.boardsizes = boardsizes
@@ -712,9 +809,16 @@ class IterativeProcessedKatagoNumpyDataset(PlannedBatchDataset):
             manifests,
             planner_config,
         )
-        self._planned_decoder = SourceBatchDataset(
+        from .execution import build_execution, resolve_execution
+
+        self.execution_decision = resolve_execution(
+            self._record_source,
+            pipeline_composer=self._partitioned_stream.pipeline_composer,
+        )
+        self._planned_decoder = build_execution(
             self._partitioned_stream,
             self._record_source,
+            decision=self.execution_decision,
         )
         return self._partitioned_stream
 
@@ -832,59 +936,6 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             )
         )
 
-    def prepare_node_decoded_cache(self):
-        """Build this run's node-local immutable cache on the node leader."""
-
-        if not self._node_decoded_cache_is_supported():
-            return
-        paths = reject_duplicate_physical_files(self.file_list)
-        cache = self.adaptive_pipeline.node_decoded_cache
-        cache.prepare(
-            paths,
-            workers=self.adaptive_pipeline.resources.per_rank_cpu_limit,
-        )
-
-    def activate_node_decoded_cache(self):
-        """Install the collectively prepared source-to-mmap catalog."""
-
-        if not self._node_decoded_cache_is_supported():
-            return
-        paths = reject_duplicate_physical_files(self.file_list)
-        self._node_decoded_cache_catalog = (
-            self.adaptive_pipeline.node_decoded_cache.catalog(paths)
-        )
-
-    def node_decoded_cache_ready(self):
-        if not self._node_decoded_cache_is_supported():
-            return False
-        return self.adaptive_pipeline.node_decoded_cache.is_ready()
-
-    def set_node_decoded_cache_enabled(self, enabled):
-        """Apply one globally coordinated cache availability decision."""
-
-        if type(enabled) is not bool:
-            raise TypeError("node decoded-cache enablement must be a boolean")
-        if enabled:
-            self.activate_node_decoded_cache()
-            return
-        self._node_decoded_cache_catalog = None
-        cache = (
-            None
-            if self.adaptive_pipeline is None
-            else self.adaptive_pipeline.node_decoded_cache
-        )
-        if cache is not None:
-            cache.cleanup()
-
-    def cleanup_node_decoded_cache(self):
-        cache = (
-            None
-            if self.adaptive_pipeline is None
-            else self.adaptive_pipeline.node_decoded_cache
-        )
-        if cache is not None:
-            cache.cleanup()
-
     def _finalize_planned_batch(self, data):
         if self.pin_memory:
             return {
@@ -924,6 +975,8 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             )
         paths = reject_duplicate_physical_files(self.file_list)
         adaptive_enabled = self.adaptive_pipeline is not None
+        shared_budget = getattr(self, "_shared_host_memory_budget", None)
+        budgeted_inspection = adaptive_enabled or shared_budget is not None
         if adaptive_enabled:
             from .pipeline_runtime import AdaptivePipelineRuntimeSpec
 
@@ -965,10 +1018,10 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                 self._node_decoded_cache_catalog
             )
         bootstrap_memory_budget = None
-        if adaptive_enabled:
+        if budgeted_inspection:
             from .host_memory import HostMemoryBudget
 
-            bootstrap_memory_budget = HostMemoryBudget(
+            bootstrap_memory_budget = shared_budget or HostMemoryBudget(
                 self.adaptive_pipeline.resources.per_rank_host_budget_bytes
             )
             self._record_decoder.configure_cache(
@@ -982,7 +1035,7 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         # files share the same one-file bootstrap hard-memory allowance.
         manifest_workers = (
             1
-            if adaptive_enabled
+            if budgeted_inspection
             else min(
                 2 if runtime_context.world_size == 1 else 1,
                 self.prefetch_threads,
@@ -996,7 +1049,7 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                 manifest_workers,
             )
         except BaseException:
-            if adaptive_enabled:
+            if budgeted_inspection:
                 self._record_decoder.close()
             raise
         self._record_manifests = manifests
@@ -1047,16 +1100,15 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                 finally:
                     adaptive_runtime.close()
             raise
-        adapter_cls = SourceBatchDataset
-        adapter_kwargs = {}
-        if telemetry_enabled:
-            from .telemetry import ObservedSourceBatchDataset
+        from .execution import build_execution, resolve_execution
 
-            adapter_cls = ObservedSourceBatchDataset
-            adapter_kwargs["pipeline_stats"] = stats
+        self.execution_decision = resolve_execution(
+            self._record_source,
+            requested_policy=self.adaptive_pipeline,
+            pipeline_composer=self._partitioned_stream.pipeline_composer,
+        )
         if adaptive_runtime is not None:
             settings = adaptive_runtime.settings
-            adapter_kwargs["adaptive_runtime"] = adaptive_runtime
             effective_workers = settings.decode_workers
             effective_batches = settings.ready_queue_batches
             effective_chunk_batches = settings.decode_chunk_batches
@@ -1065,9 +1117,12 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
             effective_batches = self.prefetch_batches
             effective_chunk_batches = None
         try:
-            self._planned_decoder = adapter_cls(
+            self._planned_decoder = build_execution(
                 self._partitioned_stream,
                 self._record_source,
+                decision=self.execution_decision,
+                runtime=adaptive_runtime,
+                pipeline_stats=stats if telemetry_enabled else None,
                 finalize_batch=self._finalize_planned_batch,
                 prefetch_workers=effective_workers,
                 prefetch_batches=effective_batches,
@@ -1096,7 +1151,6 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
                     if adaptive_runtime is None
                     else adaptive_runtime.settings.pin_memory
                 ),
-                **adapter_kwargs,
             )
         except BaseException:
             if adaptive_runtime is not None:
@@ -1109,24 +1163,6 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         if telemetry_enabled:
             self.pipeline_stats = stats
         return self._partitioned_stream
-
-    def pipeline_metrics_snapshot(self):
-        if not hasattr(self._planned_decoder, "pipeline_metrics_snapshot"):
-            return None
-        metrics = self._planned_decoder.pipeline_metrics_snapshot()
-        runtime = self._adaptive_pipeline_runtime
-        if runtime is not None and metrics is not None:
-            memory = runtime.memory_snapshot()
-            total_bytes = memory["total_bytes"]
-            metrics = replace(
-                metrics,
-                host_memory_used_fraction=memory["used_bytes"] / total_bytes,
-                host_memory_high_water_fraction=(
-                    memory["high_water_bytes"] / total_bytes
-                ),
-                host_memory_backpressure_events=memory["backpressure_events"],
-            )
-        return metrics
 
     def close(self):
         decoder = self._record_decoder
@@ -1143,38 +1179,3 @@ class BatchedProcessedKatagoNumpyDataset(IterativeProcessedKatagoNumpyDataset):
         finally:
             if runtime is not None:
                 runtime.close()
-
-    def pipeline_tuning_update(
-        self,
-        metrics,
-        iteration,
-        *,
-        epoch_changed=False,
-    ):
-        if not hasattr(self._planned_decoder, "pipeline_tuning_update"):
-            return None
-        return self._planned_decoder.pipeline_tuning_update(
-            metrics,
-            iteration,
-            epoch_changed=epoch_changed,
-        )
-
-    def pipeline_tuning_state_dict(self):
-        if not hasattr(self._planned_decoder, "pipeline_tuning_state_dict"):
-            return None
-        return self._planned_decoder.pipeline_tuning_state_dict()
-
-    def load_pipeline_tuning_state_dict(self, state):
-        if not hasattr(self._planned_decoder, "load_pipeline_tuning_state_dict"):
-            if state is not None:
-                raise ValueError("adaptive data pipeline is disabled")
-            return
-        self._planned_decoder.load_pipeline_tuning_state_dict(state)
-
-    def restore_pipeline_tuning_state_dict(self, state):
-        restore = getattr(
-            self._planned_decoder,
-            "restore_pipeline_tuning_state_dict",
-            None,
-        )
-        return False if restore is None else restore(state)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import copy
+import math
 import threading
 import struct
 import zipfile
@@ -36,6 +37,34 @@ from .stream import (
 
 
 _CACHE_CONFIG_UNSET = object()
+# The next read may allocate before the previous 8 MiB chunk is rebound.
+_CHECKSUM_READ_BYTES = 16 * 1024 * 1024
+
+
+def inspect_npz_member_schemas(path):
+    """Read NPY headers without inflating NPZ members into host arrays."""
+    schemas = {}
+    with zipfile.ZipFile(path) as archive:
+        for info in archive.infolist():
+            if info.is_dir():
+                continue
+            name = info.filename
+            key = name[:-4] if name.endswith(".npy") else name
+            if key in schemas:
+                raise ValueError(f"duplicate NPZ member {key!r}")
+            with archive.open(info) as member:
+                version = np.lib.format.read_magic(member)
+                shape, _, dtype = _read_npy_array_header(member, version)
+            dtype = np.dtype(dtype)
+            if dtype.hasobject or any(dim < 0 for dim in shape):
+                raise ValueError(f"unsupported NPZ member schema {key!r}")
+            payload_bytes = math.prod(shape) * dtype.itemsize
+            if payload_bytes > info.file_size:
+                raise ValueError(f"truncated NPZ member {key!r}")
+            schemas[key] = (tuple(int(dim) for dim in shape), dtype)
+    if not schemas:
+        raise ValueError("NPZ archive contains no array members")
+    return schemas
 
 
 class ProcessedNpzCacheAdmissionError(RuntimeError):
@@ -900,6 +929,19 @@ class ProcessedNpzDecoder:
                     break
             evict_oldest(mmap_entry=False)
             loaded_count -= 1
+    def _file_sha256(self, path: str) -> bytes:
+        budget = self._host_memory_budget
+        if budget is None:
+            return _sha256_file(path)
+        with self._array_cache_condition:
+            self._evict_idle_for_budget(budget, _CHECKSUM_READ_BYTES)
+        with budget.reserve(
+            HostMemoryCategory.INFLIGHT_TRANSIENT,
+            _CHECKSUM_READ_BYTES,
+            label="NPZ file checksum",
+        ):
+            return _sha256_file(path)
+
     def inspect(self, path: str, file_ordinal: int) -> dict:
         canonical = os.path.abspath(path)
         can_use_headers = all(
@@ -975,7 +1017,7 @@ class ProcessedNpzDecoder:
                 int(inflight_file_bytes),
             )
         output_row_bytes = self._output_row_payload_bytes(schemas, board_size)
-        file_digest = _sha256_file(canonical)
+        file_digest = self._file_sha256(canonical)
         stat = os.stat(canonical)
         output_board_size = (
             board_size
@@ -1498,7 +1540,18 @@ class NpzRowRecordDecoder:
         apply_symmetry=False,
         semantic_state=None,
         catalog_rows=None,
+        host_memory_budget=None,
+        file_memory_bound=None,
+        output_row_bound=None,
     ):
+        if (host_memory_budget is None) != (file_memory_bound is None):
+            raise ValueError("row decoder memory budget requires a file bound")
+        if host_memory_budget is not None and output_row_bound is None:
+            raise ValueError("row decoder memory budget requires an output row bound")
+        if host_memory_budget is not None and not isinstance(
+            host_memory_budget, HostMemoryBudget
+        ):
+            raise TypeError("host_memory_budget must be a HostMemoryBudget")
         self.format_id = format_id
         self.runtime_context = runtime_context
         self.load_file = load_file
@@ -1506,8 +1559,14 @@ class NpzRowRecordDecoder:
         self.apply_symmetry = apply_symmetry
         self.semantic_state = dict(semantic_state or {})
         self.catalog_rows = catalog_rows
+        self.host_memory_budget = host_memory_budget
+        self.file_memory_bound = file_memory_bound
+        self.output_row_bound = output_row_bound
         self._cache_path = None
         self._cache_value = None
+        self._cache_reservation = None
+        self._cache_bound = None
+        self._catalog_reservations = []
         self._active_epoch = 0
 
     def set_epoch(self, epoch):
@@ -1525,7 +1584,31 @@ class NpzRowRecordDecoder:
 
     def inspect_compact(self, path, file_ordinal):
         canonical = os.path.abspath(path)
-        data, length = self._load(canonical)
+        catalog_reservation = None
+        schemas = None
+        bound = None
+        if self.host_memory_budget is not None:
+            schemas = inspect_npz_member_schemas(canonical)
+            bound = self.file_memory_bound(schemas)
+            catalog_reservation = self.host_memory_budget.reserve(
+                HostMemoryCategory.SEMANTIC_FIXED,
+                bound.catalog_bytes,
+                label="indexed NPZ catalog staging",
+            )
+        try:
+            catalog = self._inspect_compact_loaded(
+                canonical, file_ordinal, bound=bound, schemas=schemas
+            )
+        except BaseException:
+            if catalog_reservation is not None:
+                catalog_reservation.release()
+            raise
+        if catalog_reservation is not None:
+            self._catalog_reservations.append(catalog_reservation)
+        return catalog
+
+    def _inspect_compact_loaded(self, canonical, file_ordinal, *, bound, schemas):
+        data, length = self._load(canonical, bound=bound, schemas=schemas)
         if self.catalog_rows is None:
             indices = []
             board_sizes = []
@@ -1562,11 +1645,25 @@ class NpzRowRecordDecoder:
             raise ValueError(
                 f"{self.format_id} compact catalog has invalid row/shape arrays"
             )
+        if self.host_memory_budget is not None:
+            if indices is not None:
+                indices = np.array(indices, dtype=np.int64, copy=True)
+            if board_sizes is not None:
+                board_sizes = np.array(board_sizes, dtype=np.int64, copy=True)
         stat = os.stat(canonical)
-        return {
+        if self.host_memory_budget is None:
+            file_sha256 = _sha256_file(canonical)
+        else:
+            with self.host_memory_budget.reserve(
+                HostMemoryCategory.INFLIGHT_TRANSIENT,
+                _CHECKSUM_READ_BYTES,
+                label="indexed NPZ file checksum",
+            ):
+                file_sha256 = _sha256_file(canonical)
+        catalog = {
             "path": canonical,
             "file_ordinal": int(file_ordinal),
-            "file_sha256": _sha256_file(canonical),
+            "file_sha256": file_sha256,
             "size": int(stat.st_size),
             "mtime_ns": int(stat.st_mtime_ns),
             "physical_row_count": int(length),
@@ -1575,13 +1672,117 @@ class NpzRowRecordDecoder:
             "board_sizes": board_sizes,
             "uniform_board_size": uniform_board_size,
         }
+        if self._cache_bound is not None:
+            catalog["decoded_file_bytes"] = self._cache_reservation.nbytes
+            catalog["inflight_file_bytes"] = self._cache_bound.transient_bytes
+            catalog["catalog_bytes"] = self._cache_bound.catalog_bytes
+            catalog["output_row_bytes"] = int(self.output_row_bound(schemas))
+            if uniform_board_size is not None:
+                catalog["board_size"] = uniform_board_size
+        return catalog
 
-    def _load(self, path):
+    @staticmethod
+    def _resident_bytes(data):
+        value = data[0] if isinstance(data, tuple) else data
+        arrays = value.data_dict if hasattr(value, "data_dict") else value
+        if not isinstance(arrays, Mapping):
+            raise TypeError("budgeted NPZ row decoder requires array-backed data")
+        owners = {}
+        for value in arrays.values():
+            array = np.asarray(value)
+            owner = array
+            while isinstance(owner.base, np.ndarray):
+                owner = owner.base
+            backing = owner.base
+            if backing is not None and hasattr(backing, "nbytes"):
+                owners[id(backing)] = max(
+                    owners.get(id(backing), 0), int(backing.nbytes)
+                )
+            elif isinstance(backing, (bytes, bytearray)):
+                owners[id(backing)] = max(
+                    owners.get(id(backing), 0), len(backing)
+                )
+            else:
+                owners[id(owner)] = int(owner.nbytes)
+        return sum(owners.values())
+
+    def _load(self, path, *, bound=None, schemas=None):
         canonical = os.path.abspath(path)
         if canonical != self._cache_path:
-            self._cache_value = self.load_file(canonical)
-            self._cache_path = canonical
+            self._cache_value = None
+            self._cache_path = None
+            if self._cache_reservation is not None:
+                self._cache_reservation.release()
+                self._cache_reservation = None
+            self._cache_bound = None
+            reservation = None
+            if self.host_memory_budget is not None:
+                from .execution import FileMemoryBound
+
+                if bound is None:
+                    if schemas is None:
+                        schemas = inspect_npz_member_schemas(canonical)
+                    bound = self.file_memory_bound(schemas)
+                if not isinstance(bound, FileMemoryBound):
+                    raise TypeError("file_memory_bound must return FileMemoryBound")
+                reservation = self.host_memory_budget.reserve(
+                    HostMemoryCategory.INFLIGHT_TRANSIENT,
+                    bound.transient_bytes,
+                    label="indexed NPZ file load",
+                )
+            try:
+                value = self.load_file(canonical)
+                if reservation is not None:
+                    actual_bytes = self._resident_bytes(value)
+                    if actual_bytes > bound.resident_bytes:
+                        raise RuntimeError(
+                            "indexed NPZ retained arrays exceed their declared memory bound"
+                        )
+                    reservation.resize(actual_bytes)
+                    reservation.reclassify(HostMemoryCategory.DECODED_CACHE)
+                self._cache_value = value
+                self._cache_path = canonical
+                self._cache_reservation = reservation
+                self._cache_bound = bound
+            except BaseException:
+                if reservation is not None:
+                    reservation.release()
+                raise
         return self._cache_value
+
+    def finalize_catalog_reservations(self, descriptors):
+        if self.host_memory_budget is None:
+            return
+        descriptors = tuple(descriptors)
+        if len(descriptors) != len(self._catalog_reservations):
+            raise RuntimeError("indexed NPZ catalog reservation count differs")
+        for reservation, descriptor in zip(self._catalog_reservations, descriptors):
+            retained = 1024
+            for array in (descriptor.row_indices, descriptor.row_shape_codes):
+                if array is not None:
+                    retained += int(array.nbytes)
+            # The source holds one Python shape tuple per distinct code.  Use
+            # the code-space bound without allocating another sorted array.
+            retained += 160 * (
+                1 if descriptor.row_shape_codes is None
+                else min(len(descriptor.row_shape_codes), 1 << 16)
+            )
+            reservation.resize(retained)
+
+    @property
+    def catalog_reserved_bytes(self):
+        return sum(item.nbytes for item in self._catalog_reservations)
+
+    def close(self):
+        self._cache_value = None
+        self._cache_path = None
+        self._cache_bound = None
+        if self._cache_reservation is not None:
+            self._cache_reservation.release()
+            self._cache_reservation = None
+        for reservation in self._catalog_reservations:
+            reservation.release()
+        self._catalog_reservations.clear()
 
     def decode_one(self, ref):
         data, length = self._load(ref.path)

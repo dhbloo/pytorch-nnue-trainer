@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+from array import array
 from collections.abc import Sequence
 import hashlib
 import os
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -269,50 +269,79 @@ class EvaluationBatchPlannerDataset(IterableDataset):
     def is_fixed_side_input(self):
         return self.dataset.is_fixed_side_input
 
+    @property
+    def adaptive_pipeline(self):
+        return getattr(self.dataset, "adaptive_pipeline", None)
+
+    @property
+    def execution_decision(self):
+        return getattr(self.dataset, "execution_decision", None)
+
+    @property
+    def _adaptive_pipeline_runtime(self):
+        return getattr(self.dataset, "_adaptive_pipeline_runtime", None)
+
+    def close(self):
+        close = getattr(self.dataset, "close", None)
+        if close is not None:
+            close()
+
     def __iter__(self):
         if len(self.dataset) == 0:
             raise RuntimeError("evaluation dataset contains no real samples")
         global_size = self.runtime_context.global_batch_size
-        buckets = defaultdict(list)
+        shape_of = getattr(self.dataset, "map_output_shape", None)
+        bucket_indices = {}
         for index in range(len(self.dataset)):
-            ref = self.dataset.map_record_ref(index)
-            if not isinstance(ref, MapRecordRef):
-                raise TypeError("map_record_ref must return MapRecordRef")
-            buckets[ref.output_shape].append(ref)
-        global_batches = []
-        for shape in buckets:
-            bucket = buckets[shape]
-            for start in range(0, len(bucket), global_size):
-                real = bucket[start : start + global_size]
-                values = list(real)
-                while len(values) < global_size:
-                    values.append(real[(len(values) - len(real)) % len(real)])
-                global_batches.append(
-                    (
-                        values,
-                        [True] * len(real) + [False] * (global_size - len(real)),
-                    )
-                )
+            if shape_of is None:
+                ref = self.dataset.map_record_ref(index)
+                if not isinstance(ref, MapRecordRef):
+                    raise TypeError("map_record_ref must return MapRecordRef")
+                shape = ref.output_shape
+            else:
+                shape = tuple(shape_of(index))
+            if shape not in bucket_indices:
+                bucket_indices[shape] = array("Q")
+            bucket_indices[shape].append(index)
+        buckets = {
+            shape: np.frombuffer(indices, dtype=np.uint64)
+            for shape, indices in bucket_indices.items()
+        }
+        total_batches = sum(
+            (len(indices) + global_size - 1) // global_size
+            for indices in buckets.values()
+        )
         identity = self.runtime_context.rank_local_identity
-        for batch_index, (values, mask) in enumerate(global_batches):
-            local = values[identity.slice_start : identity.slice_stop]
-            local_mask = np.asarray(
-                mask[identity.slice_start : identity.slice_stop], dtype=np.bool_
-            )
-            samples = [self.dataset[ref.index] for ref in local]
-            token = MapEvaluationBatchToken(
-                epoch=0,
-                batch_index=batch_index,
-                before_digest=_cursor_digest(0, batch_index),
-                after_digest=_cursor_digest(0, batch_index + 1),
-                is_last=batch_index + 1 == len(global_batches),
-            )
-            yield BatchEnvelope(
-                collate_sample_dicts(
-                    samples,
-                    validate_core_fields=True,
-                ),
-                token,
-                local_mask,
-                tuple(ref.sample_key for ref in local),
-            )
+        key_of = getattr(self.dataset, "map_sample_key", None)
+        batch_index = 0
+        for indices in buckets.values():
+            for start in range(0, len(indices), global_size):
+                real = indices[start : start + global_size]
+                padded = np.resize(real, global_size)
+                local_indices = padded[identity.slice_start : identity.slice_stop]
+                if key_of is None:
+                    local_refs = [
+                        self.dataset.map_record_ref(int(index))
+                        for index in local_indices
+                    ]
+                    sample_keys = tuple(ref.sample_key for ref in local_refs)
+                else:
+                    sample_keys = tuple(key_of(int(index)) for index in local_indices)
+                local_mask = np.arange(
+                    identity.slice_start, identity.slice_stop
+                ) < len(real)
+                samples = [self.dataset[int(index)] for index in local_indices]
+                token = MapEvaluationBatchToken(
+                    epoch=0,
+                    batch_index=batch_index,
+                    before_digest=_cursor_digest(0, batch_index),
+                    after_digest=_cursor_digest(0, batch_index + 1),
+                    is_last=batch_index + 1 == total_batches,
+                )
+                yield BatchEnvelope(
+                    collate_sample_dicts(samples, validate_core_fields=True),
+                    token,
+                    local_mask,
+                    sample_keys,
+                )
+                batch_index += 1

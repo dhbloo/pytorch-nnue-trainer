@@ -232,5 +232,6 @@ class RuleConditionedInput(nn.Module):
         rule_planes = features[:, :, None, None].expand(B, -1, H, W)
         planes = torch.cat((*parts, rule_planes), dim=1)
         if isinstance(self.base, MaskedInputPlane):
-            return planes, self.base.input_mask(data, planes)
+            mask = self.base.input_mask(data, planes)
+            return planes * mask, mask
         return planes

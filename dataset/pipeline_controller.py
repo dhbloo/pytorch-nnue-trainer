@@ -602,7 +602,7 @@ class AdaptivePipelineController:
         budget = self.constraints.per_rank_host_budget_bytes
         if required > budget:
             raise PipelineCapacityError(
-                "minimum processed-NPZ pipeline does not fit the per-rank host "
+                "minimum adaptive data pipeline does not fit the per-rank host "
                 f"budget: required={required}, budget={budget}; "
                 f"fixed={self.constraints.fixed_semantic_floor_bytes}, "
                 f"consumer_retained={self.constraints.consumer_retained_bytes}, "
@@ -691,7 +691,7 @@ class AdaptivePipelineController:
                 break
             workers = max(1, workers // 2)
         raise PipelineCapacityError(
-            "minimum processed-NPZ pipeline does not fit the per-rank host budget"
+            "minimum adaptive data pipeline does not fit the per-rank host budget"
         )
 
     def _ensure_capacity(self, settings: PipelineSettings) -> None:

@@ -9,7 +9,6 @@ import numpy as np
 from . import DATASETS
 from .decoder import ProcessedNpzDecoder, _read_npy_array_header
 from .katago import BatchedProcessedKatagoNumpyDataset
-from .stream import _sha256_file
 from .telemetry import ObservedProcessedNpzDecoder
 
 
@@ -98,7 +97,7 @@ class RawNpzDecoder(ProcessedNpzDecoder):
         stat = os.stat(canonical)
         return {
             "path": canonical, "file_ordinal": int(file_ordinal),
-            "file_sha256": _sha256_file(canonical), "size": int(stat.st_size),
+            "file_sha256": self._file_sha256(canonical), "size": int(stat.st_size),
             "mtime_ns": int(stat.st_mtime_ns),
             "logical_row_count": length if accepted else 0,
             "board_size": self.fixed_board_size or (size, size),

@@ -72,6 +72,31 @@ class DatasetPipelineWrapper(Dataset):
     def map_record_ref(self, index):
         return self.dataset.map_record_ref(index)
 
+    def map_output_shape(self, index):
+        shape_of = getattr(self.dataset, "map_output_shape", None)
+        return (
+            shape_of(index)
+            if shape_of is not None
+            else self.dataset.map_record_ref(index).output_shape
+        )
+
+    def map_sample_key(self, index):
+        key_of = getattr(self.dataset, "map_sample_key", None)
+        return (
+            key_of(index)
+            if key_of is not None
+            else self.dataset.map_record_ref(index).sample_key
+        )
+
+    def close(self):
+        runtime = getattr(self, "_adaptive_pipeline_runtime", None)
+        if runtime is not None:
+            runtime.close()
+            self._adaptive_pipeline_runtime = None
+        close = getattr(self.dataset, "close", None)
+        if close is not None:
+            close()
+
 
 class IterativePipelineWrapper(IterableDataset):
     def __init__(self, dataset, pipelines) -> None:

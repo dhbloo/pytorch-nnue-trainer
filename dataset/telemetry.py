@@ -51,6 +51,23 @@ class PipelineMetricWindow:
     host_memory_used_fraction: float | None = None
     host_memory_high_water_fraction: float | None = None
     host_memory_backpressure_events: int | None = None
+    telemetry_complete: bool = True
+
+
+class PassivePipelineStats:
+    """Sample process memory at log boundaries without touching a fixed reader."""
+
+    def snapshot(self, *, active_workers: int) -> PipelineMetricWindow:
+        return PipelineMetricWindow(
+            producer_capacity_rows_s=0.0,
+            data_wait_fraction=0.0,
+            prefetch_wait_fraction=0.0,
+            source_tail_wait_fraction=0.0,
+            h2d_wait_fraction=0.0,
+            cache_reloads=0,
+            rss_gib=(probe_process_resident_bytes().value or 0) / 1024**3,
+            telemetry_complete=False,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,7 +230,7 @@ class _AdjustableConcurrencyGate:
 
 
 class ObservedSourceBatchDataset(SourceBatchDataset):
-    """Measured adapter for the adaptive processed-NPZ pipeline."""
+    """Measure decoded throughput without changing ordered execution."""
 
     def __init__(
         self,
@@ -225,6 +242,13 @@ class ObservedSourceBatchDataset(SourceBatchDataset):
         super().__init__(*args, **kwargs)
         self.pipeline_stats = pipeline_stats
         self.adaptive_runtime = adaptive_runtime
+        # Serial observational formats retain per-batch wait timing at the
+        # loader boundary; sample decode timing to keep their hot path lean.
+        self._decode_sample_interval = (
+            16 if getattr(adaptive_runtime, "memory_accounting", None) == "observed"
+            else 1
+        )
+        self._decode_sample_index = 0
         self._maximum_prefetch_workers = int(
             self._effective_prefetch_workers
             if adaptive_runtime is None
@@ -232,13 +256,15 @@ class ObservedSourceBatchDataset(SourceBatchDataset):
         )
         self._concurrency_gate = (
             _AdjustableConcurrencyGate(self.active_prefetch_workers)
-            if adaptive_runtime is not None and self._effective_prefetch_workers > 0
+            if adaptive_runtime is not None
+            and getattr(adaptive_runtime, "memory_accounting", None) != "observed"
+            and self._effective_prefetch_workers > 0
             else None
         )
 
     @property
     def active_prefetch_workers(self) -> int:
-        if self.adaptive_runtime is None:
+        if self.adaptive_runtime is None or self._effective_prefetch_workers == 0:
             return self._effective_prefetch_workers
         return int(self.adaptive_runtime.settings.decode_workers)
 
@@ -261,6 +287,11 @@ class ObservedSourceBatchDataset(SourceBatchDataset):
         )
 
     def _decode_batch(self, batch):
+        if self._decode_sample_interval > 1:
+            sample_index = self._decode_sample_index
+            self._decode_sample_index += 1
+            if sample_index % self._decode_sample_interval:
+                return super()._decode_batch(batch)
         start = time.perf_counter_ns()
         decoded = super()._decode_batch(batch)
         self.pipeline_stats.record_decode(
@@ -363,6 +394,15 @@ def aggregate_pipeline_snapshots(
     if not snapshots:
         return AggregatedPipelineMetrics({}, {}, {})
     consumer_rows_s = consumer_batches_s * rows_per_batch
+    if not all(snapshot.telemetry_complete for snapshot in snapshots):
+        return AggregatedPipelineMetrics(
+            observation={"throughput/consumer_rows_s": float(consumer_rows_s)},
+            public={},
+            process={
+                "process_rss_gib_mean": sum(snapshot.rss_gib for snapshot in snapshots)
+                / len(snapshots),
+            },
+        )
     data_wait_fraction = max(snapshot.data_wait_fraction for snapshot in snapshots)
     prefetch_wait_fraction = max(
         snapshot.prefetch_wait_fraction for snapshot in snapshots
