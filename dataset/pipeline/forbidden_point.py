@@ -7,6 +7,7 @@ from dataset.core import FieldSpec
 class ForbiddenPointPipeline(BasePipeline):
     pipeline_id = "forbidden_point"
     schema_version = 1
+    parallel_stateless = True
     input_fields = (
         FieldSpec("board_input", True, "per_sample", (-2, -1), 0, "stack", ("b", "i", "u"), "plain"),
         FieldSpec("stm_input", True, "per_sample", None, None, "stack", ("i", "f"), "plain"),
@@ -20,6 +21,11 @@ class ForbiddenPointPipeline(BasePipeline):
 
     def signature_state(self):
         return {"fixed_side_input": bool(self.fixed_side_input)}
+
+    def added_output_row_bytes(self, board_size):
+        height, width = board_size
+        # One int8 output plane plus at most one contiguous int8 board copy.
+        return 3 * height * width
 
     def process(self, data):
         from forbidden_point_cpp import transform_board_to_forbidden_point
@@ -46,15 +52,15 @@ class ForbiddenPointPipeline(BasePipeline):
         return data
 
     def process_batch(self, data, *, sample_keys=None, rng_keys=None):
-        outputs = [
-            self.process(
-                {
-                    "board_input": data["board_input"][index],
-                    "stm_input": data["stm_input"][index],
-                }
-            )["forbidden_point"]
-            for index in range(len(data["board_input"]))
-        ]
+        from forbidden_point_cpp import transform_board_to_forbidden_point
+
+        boards = data["board_input"]
+        height, width = boards.shape[-2:]
+        outputs = np.empty((len(boards), height, width), dtype=np.int8)
+        for index, board in enumerate(boards):
+            if not self.fixed_side_input and not (data["stm_input"][index] < 0):
+                board = np.flip(board, axis=0)
+            transform_board_to_forbidden_point(board, outputs[index])
         result = dict(data)
-        result["forbidden_point"] = np.stack(outputs, axis=0)
+        result["forbidden_point"] = outputs
         return result
