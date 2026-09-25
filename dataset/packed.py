@@ -12,6 +12,7 @@ from .shuffle import RESERVOIR_ALGORITHM, ReservoirStats
 
 
 PACKED_RESERVOIR_ALGORITHM = RESERVOIR_ALGORITHM + "-uint64"
+PACKED_SOURCE_CHUNK_SIZE = 16 * 1024
 # One normal-path undo entry retains a slot index and the evicted uint64 value.
 PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT = 2 * np.dtype(np.uint64).itemsize
 

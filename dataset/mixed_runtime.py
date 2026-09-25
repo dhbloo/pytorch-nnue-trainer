@@ -174,6 +174,10 @@ class AdaptiveMultiMixin(PipelineLifecycleMixin):
             memory_budget=self._shared_host_memory_budget,
             shared_decoded_cache=self._node_decoded_cache_catalog is not None,
             packed_mixed_shapes=len(self._record_source.shape_codes),
+            packed_source_chunk_size=(
+                getattr(self._record_source, "packed_source_chunk_size", None)
+                if packed else None
+            ),
             minimum_cache_bytes=sum(cache_floors),
             serial_execution=not packed,
             pre_reserved_semantic_bytes=indexed_catalog_bytes,

@@ -21,6 +21,9 @@ _READY_BATCH_METADATA_BYTES_PER_ROW = (
 )
 _PINNED_FINALIZATION_COPY_COUNT = 2
 _COMPOSITE_ROUTING_BYTES_PER_ROW = 64
+# One-row NPZ files can retain one NumPy array object per routed row before
+# concatenation, alongside routing arrays and the previous child block.
+_PACKED_QUOTA_WORKSPACE_BYTES_PER_ROW = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +79,7 @@ def estimate_npz_execution(
     shared_decoded_cache: bool,
     packed_mixed_shapes: int,
     minimum_cache_bytes: int,
+    packed_source_chunk_size: int | None = None,
 ) -> ExecutionFootprint:
     """Estimate the existing controller inputs without changing its constants."""
     decoded_sizes = tuple(
@@ -149,10 +153,12 @@ def estimate_npz_execution(
     packed_uniform = bool(packed_mixed_shapes) or (
         bool(board_sizes) and len(set(board_sizes)) == 1
     )
-    source_chunk_size = (
-        PACKED_MIXED_SOURCE_CHUNK_SIZE
-        if packed_mixed_shapes > 1 else SOURCE_CHUNK_SIZE
-    )
+    source_chunk_size = packed_source_chunk_size
+    if source_chunk_size is None:
+        source_chunk_size = (
+            PACKED_MIXED_SOURCE_CHUNK_SIZE
+            if packed_mixed_shapes > 1 else SOURCE_CHUNK_SIZE
+        )
     packed_journal_bytes = (
         (global_batch_size * max(1, packed_mixed_shapes) + source_chunk_size)
         * PACKED_RESERVOIR_UNDO_BYTES_PER_REPLACEMENT
@@ -179,6 +185,12 @@ def estimate_npz_execution(
     )
 
     fixed_semantic_floor_bytes += 2 * shape_queue_bytes
+    if packed_source_chunk_size is not None:
+        # Quota draws, merged routing IDs, child positions, and source blocks
+        # coexist while a packed source chunk is assembled.
+        fixed_semantic_floor_bytes += (
+            source_chunk_size * _PACKED_QUOTA_WORKSPACE_BYTES_PER_ROW
+        )
 
     resources = spec.resources
     total_decoded_bytes = sum(positive_decoded_sizes)

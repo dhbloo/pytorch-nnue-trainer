@@ -18,6 +18,7 @@ from .core import (
 )
 from .packed import (
     PACKED_RESERVOIR_ALGORITHM,
+    PACKED_SOURCE_CHUNK_SIZE,
     PackedEnvelopeBatch,
     PackedReadySnapshot,
     PackedReadyState,
@@ -31,7 +32,7 @@ from .source import RecordEnvelope, RecordSource, SOURCE_CURSOR_SCHEMA
 
 PLANNER_ALGORITHM = "dataset-planner-v2"
 SOURCE_CHUNK_SIZE = 1024
-PACKED_MIXED_SOURCE_CHUNK_SIZE = 16 * SOURCE_CHUNK_SIZE
+PACKED_MIXED_SOURCE_CHUNK_SIZE = PACKED_SOURCE_CHUNK_SIZE
 
 
 @dataclass(frozen=True, slots=True)
@@ -210,11 +211,14 @@ class DatasetPlanner:
             and callable(getattr(source, "next_packed_records", None))
             and callable(getattr(source, "envelopes_from_record_ids", None))
         )
-        self._packed_source_chunk_size = (
-            PACKED_MIXED_SOURCE_CHUNK_SIZE
-            if self._packed and self._uniform_shape_code is None
-            else SOURCE_CHUNK_SIZE
-        )
+        if not self._packed:
+            self._packed_source_chunk_size = SOURCE_CHUNK_SIZE
+        elif self._uniform_shape_code is None:
+            self._packed_source_chunk_size = PACKED_MIXED_SOURCE_CHUNK_SIZE
+        else:
+            self._packed_source_chunk_size = getattr(
+                source, "packed_source_chunk_size", SOURCE_CHUNK_SIZE
+            )
         self._epoch = 0
         self._batch_index = 0
         self._source_cycle = 0

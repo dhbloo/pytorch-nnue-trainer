@@ -125,6 +125,7 @@ class AdaptivePipelineRuntime:
         memory_budget: HostMemoryBudget | None = None,
         shared_decoded_cache: bool = False,
         packed_mixed_shapes: int = 0,
+        packed_source_chunk_size: int | None = None,
         minimum_cache_bytes: int = 0,
         serial_execution: bool = False,
         pre_reserved_semantic_bytes: int = 0,
@@ -133,6 +134,10 @@ class AdaptivePipelineRuntime:
     ) -> None:
         if type(packed_mixed_shapes) is not int or packed_mixed_shapes < 0:
             raise ValueError("packed_mixed_shapes must be a non-negative integer")
+        if packed_source_chunk_size is not None:
+            packed_source_chunk_size = _positive_int(
+                "packed_source_chunk_size", packed_source_chunk_size
+            )
         if type(minimum_cache_bytes) is not int or minimum_cache_bytes < 0:
             raise ValueError("minimum_cache_bytes must be a non-negative integer")
         if not isinstance(spec, AdaptivePipelineRuntimeSpec):
@@ -171,6 +176,7 @@ class AdaptivePipelineRuntime:
             shuffle_window_size=shuffle_window_size,
             shared_decoded_cache=shared_decoded_cache,
             packed_mixed_shapes=packed_mixed_shapes,
+            packed_source_chunk_size=packed_source_chunk_size,
             minimum_cache_bytes=minimum_cache_bytes,
         )
         constraints = footprint.constraints

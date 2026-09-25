@@ -7,10 +7,14 @@ from contextlib import ExitStack, contextmanager
 
 import numpy as np
 
-from .composite_source import CompositeRecordSource, _merge_child_batches
+from .composite_source import (
+    MIXING_BLOCK_ROWS,
+    CompositeRecordSource,
+    _merge_child_batches,
+)
 from .core import canonical_pipeline_state_bytes
 from .npz_source import DenseNpzSource
-from .packed import PackedEnvelopeBatch, PackedRecordBlock
+from .packed import PACKED_SOURCE_CHUNK_SIZE, PackedEnvelopeBatch, PackedRecordBlock
 
 
 class _CompositeSampleKeys(Sequence):
@@ -81,6 +85,8 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         super().__init__(*args, **kwargs)
         if not self.supports(self.child_sources):
             raise TypeError("packed mixing requires uniform dense NPZ children")
+        if self.quotas is not None:
+            self.packed_source_chunk_size = PACKED_SOURCE_CHUNK_SIZE
         self._child_shapes = np.asarray(
             [self.shape_codes[next(iter(source.shape_codes))] for source in self.child_sources],
             dtype=np.int32,
@@ -151,6 +157,36 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         cursor.pending = pending
         return True
 
+    def _fill_quota_blocks(self, cursor, block_count):
+        if block_count == 1:
+            return self._fill_quota_block(cursor)
+        draws = []
+        for _ in range(block_count):
+            children = self._draw_quota_sources(cursor)
+            if not len(children):
+                break
+            draws.append(children)
+        if not draws:
+            cursor.pending_position = 0
+            cursor.terminal = True
+            cursor.pending = np.empty(0, dtype=np.uint64)
+            return False
+        children = np.concatenate(draws)
+        pending = np.empty(len(children), dtype=np.uint64)
+        for child in np.unique(children):
+            child = int(child)
+            positions = np.flatnonzero(children == child)
+            block, child_cursor = self.child_sources[child].next_packed_records(
+                cursor.child_cursors[child], len(positions)
+            )
+            if len(block.record_ids) != len(positions):
+                raise RuntimeError("source exhausted before its declared mixing quota")
+            cursor.child_cursors[child] = child_cursor
+            pending[positions] = block.record_ids | np.uint64(child << self._child_shift)
+        cursor.pending = pending
+        cursor.pending_position = 0
+        return True
+
     def next_packed_records(self, cursor, limit):
         if type(limit) is not int or limit <= 0:
             raise ValueError("composite chunk limit must be positive")
@@ -159,7 +195,10 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         while count < limit and not cursor.terminal:
             if cursor.pending_position >= len(cursor.pending):
                 if self.quotas is not None:
-                    filled = self._fill_quota_block(cursor)
+                    block_count = (
+                        limit - count + MIXING_BLOCK_ROWS - 1
+                    ) // MIXING_BLOCK_ROWS
+                    filled = self._fill_quota_blocks(cursor, block_count)
                 else:
                     cycles = max(
                         1, (limit - count + len(self.schedule) - 1) // len(self.schedule)
