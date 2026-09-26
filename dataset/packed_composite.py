@@ -85,7 +85,7 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         super().__init__(*args, **kwargs)
         if not self.supports(self.child_sources):
             raise TypeError("packed mixing requires uniform dense NPZ children")
-        if self.quotas is not None:
+        if self.quotas is not None or len(self.shape_codes) == 1:
             self.packed_source_chunk_size = PACKED_SOURCE_CHUNK_SIZE
         self._child_shapes = np.asarray(
             [self.shape_codes[next(iter(source.shape_codes))] for source in self.child_sources],
