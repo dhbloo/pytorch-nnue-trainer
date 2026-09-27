@@ -11,7 +11,7 @@ I/O. `DatasetPlanner` owns bounded shuffle, shape-aware batching, distributed po
 
 The built-in iterable pipeline provides:
 
-- no per-record Python metadata: Dense sources use `O(file count)` metadata and indexed sources use compact
+- no dataset-sized per-record Python metadata: Dense sources use `O(file count)` metadata and indexed sources use compact
   fixed-width NumPy maps only when their format requires one;
 - shuffle and prefetch memory bounded by configured active work, with decode memory proportional to a bounded
   number of active source files and materialized batches rather than total dataset size;
@@ -55,12 +55,16 @@ DatasetPlanner
         |
         v
 RecordSource
-  +----------------------+----------------------+------------------+
-  |                      |                      |                  |
-  v                      v                      v                  v
-Dense/Indexed NPZ   Sequential binary     Composite source   Map evaluation
-  compact row IDs     bounded raw entry     routed payloads    direct indexing
-  format-specific I/O  interleaved readers  child ownership    sampler-owned
+  +----------------------+----------------------+
+  |                      |                      |
+  v                      v                      v
+Dense/Indexed NPZ   Sequential binary     Composite source
+  compact row IDs     bounded raw entry     routed payloads
+  format-specific I/O  interleaved readers  child ownership
+
+Map dataset / DataLoader
+  - direct indexing and sampler-owned training
+  - EvaluationBatchPlannerDataset for complete evaluation
 ```
 
 The main implementation boundaries are:
@@ -70,19 +74,29 @@ The main implementation boundaries are:
 - [`dataset/packed.py`](../dataset/packed.py): fixed-width packed reservoir and ready storage;
 - [`dataset/npz_source.py`](../dataset/npz_source.py): compact Dense and Indexed NPZ sources;
 - [`dataset/sequential_source.py`](../dataset/sequential_source.py): interleaved sequential readers;
-- [`dataset/source_dataset.py`](../dataset/source_dataset.py): decode prefetch and ordered publication.
+- [`dataset/source_dataset.py`](../dataset/source_dataset.py): decode prefetch and ordered publication;
+- [`dataset/execution.py`](../dataset/execution.py): physical backend selection, resource-policy capabilities,
+  and shared execution lifecycle.
 
 Map-style datasets retain direct indexing for complete evaluation and sampler-owned sampling. Built-in iterable
 datasets use the planner and receive a required `DatasetRuntimeContext` from the trainer.
 
-| Public dataset type | Execution path |
-| --- | --- |
-| `katago_numpy`, `processed_katago_numpy`, `multi` | Map-style indexing and sampler-owned sampling |
-| `iterative_katago_numpy`, `iterative_processed_katago_numpy` | Planned NPZ with Dense or Indexed identities |
-| `batched_processed_katago_numpy`, `batched_katago_numpy` | Dense processed/native NPZ sharing packed batch decoding, bounded caching and internal prefetch |
-| `sparse_numpy`, `iterative_sparse_numpy` | Planned Indexed NPZ |
-| `simple_binary`, `packed_binary` | Interleaved sequential source |
-| `iterative_multi` | Composite of native child sources |
+The common contract does not imply one physical hot path. Built-in iterable sources share `DatasetPlanner`
+and `SourceBatchDataset` (or its observed subclass); map datasets retain a separate indexing/sampler path.
+
+| Public dataset type | Backend | Physical work |
+| --- | --- | --- |
+| `katago_numpy`, `processed_katago_numpy`, `multi` | `map` | Eager arrays, direct indexing, sampler-owned sampling |
+| `iterative_processed_katago_numpy` | `packed` | Dense IDs and batch decoding; explicit policy selects the budgeted batched adapter |
+| `batched_processed_katago_numpy`, `batched_katago_numpy` | `packed` | Dense processed/native NPZ, vectorized decoding, bounded caches and ordered internal prefetch |
+| `iterative_katago_numpy`, `sparse_numpy`, `iterative_sparse_numpy` | `indexed` | Row maps, serial materialization and a one-file cache; batch decoding still prepares rows individually |
+| `simple_binary`, `packed_binary` | `sequential` | Interleaved readers, bounded raw entries, ordered per-record decoding |
+| `iterative_multi` | `packed` or `generic` | Packed dense routing when eligible; otherwise generic child routing, including saved compatibility layouts |
+
+Backend names describe source execution, not every planner operation: an indexed source can also use packed
+planner IDs. Eligible packed composites require each child to be a uniform-shape dense NPZ source; different
+children may have different shapes. Indexed, sequential, and map support is not evidence of equivalent decode
+parallelism, caching, memory enforcement, or throughput.
 
 ## Core contracts
 
@@ -124,7 +138,8 @@ the planner, and `resident_bytes` accounts for owned sequential payload retained
 Uniform Dense and Indexed NPZ sources use a faster physical backend: contiguous `uint64` record IDs flow through
 the native reservoir, ready FIFO, batch slicing, digesting, and materialization without constructing envelopes.
 A compatibility envelope is created only if external or debugging code explicitly iterates the packed view.
-Mixed-shape and sequential sources use generic bounded envelopes.
+Eligible packed composites also retain packed IDs when different children have different shapes. Non-packed
+mixed sources and sequential sources use generic bounded envelopes.
 
 No built-in source retains one Python object per logical record in the dataset. Indexed inspection may construct
 temporary Python values while building its compact NumPy maps, but those values are not part of steady-state
@@ -352,10 +367,11 @@ Native `batched_katago_numpy` normalizes full-board arrays once per cache miss,
 then shares vectorized gathering, symmetry, packed mixing and ordered prefetch
 with `batched_processed_katago_numpy`. Its decoded cache is bounded CPU memory;
 it does not convert the dataset or write normalized files. Raw sources disable
-the optional processed-only disk cache for the mixture. Raw filters, channel
-selection and padded board masks are rejected explicitly, without a scalar
-fallback. The legacy iterative reader still serves those distinct contracts;
-it is not recommended for dense mixed training. Rules remain attached. See [Rule annotations for NPZ
+the optional processed-only disk cache for the mixture. Native raw filters and
+padded board masks require `iterative_katago_numpy`; the batched reader rejects
+them instead of automatically falling back to indexed decoding. Arbitrary channel
+selection is not a supported native raw option. Prefer the batched reader when
+its full-board contract fits the input. Rules remain attached. See [Rule annotations for NPZ
 sources](#rule-annotations-for-npz-sources) for the field contract.
 
 ## Prefetch and device handoff
@@ -407,28 +423,46 @@ CUDA training. Enable it only after representative end-to-end validation shows a
 
 Batch-yielding and resumable built-in streams require DataLoader `num_worker: 0`; loader processes are rejected
 because they would duplicate planner ownership and checkpoint state. Parallelism comes from the dataset's
-internal ordered decode workers. The adaptive controller selects their active count; compatibility mode uses
-the legacy `prefetch_threads` setting.
+internal ordered decode workers where supported. Budgeted packed execution selects their active count;
+batched compatibility layouts retain `prefetch_threads`, while serial backends do not gain decode workers.
 
 ## Adaptive resource control
 
 The primary resource interface is the top-level singular `data_pipeline` mapping. It is separate from
-`data_pipelines`, the older list of semantic batch transforms. The adaptive interface supports
-`dataset_type: batched_processed_katago_numpy` or `batched_katago_numpy` and requires `num_worker: 0`. It can compose `data_pipelines`
-whose registered transforms declare themselves parallel and stateless; other semantic transforms remain on the
-compatibility path and are rejected when adaptive control is explicitly requested.
+`data_pipelines`, the list of semantic batch transforms. All built-in dataset families participate in execution
+selection, but their resource capabilities differ:
 
-For the standard training entry point, omitting `data_pipeline` enables its default adaptive policy when those
-requirements hold and no fixed `prefetch_threads`, `prefetch_batches`, `pin_memory`, or loader performance alias is
-present. Existing fixed configurations, nonzero loader-worker configurations, and semantic `data_pipelines` remain
-on their compatibility path. Supplying an explicit `data_pipeline` mapping is strict: incompatible options are
-reported as configuration errors instead of silently disabling adaptation.
+- `continuous` adjusts supported worker/cache/queue capacities; `manual` fixes a supported budgeted layout.
+  Dense and indexed NPZ can reserve host-data memory, although indexed execution remains serial.
+- `observed` is a memory-accounting mode, not an adaptation value. Map, binary, binary-containing composites,
+  and implicit compatibility layouts report observations without enforcing a host-data hard cap or tuning their
+  layout. They accept the automatic continuous policy, not explicit memory/CPU caps or manual layouts.
+- `legacy_fixed` is the execution policy when no runtime spec is passed, as in direct dataset use and current
+  validation setup. Iterable sources still use the common planner/executor. The trainer can preserve that same
+  layout under an implicit continuous request with passive observation; the reported policy alone does not
+  establish that tuning or reserved memory accounting is active.
 
-For `iterative_multi`, opt in explicitly with `data_pipeline: {}` and keep
-`num_worker: 0`. This path supports dense, unfiltered
-`batched_processed_katago_numpy` or `batched_katago_numpy` children, each with one explicit board size,
-and no composite batch transforms. It retains the selected `mixing` policy and supported record-level
-`sample_rate` semantics. Packed record IDs are shuffled and
+In the training entry point, omitting `data_pipeline` enables budgeted defaults for eligible batched NPZ sources.
+Fresh `iterative_multi` runs also use that default when every child is an unfiltered, single-shape batched dense
+NPZ source without channel selectors, and the output shape is guaranteed by `fixed_board_size` or one concrete
+NPZ file per child. The children may have different shapes. Other `iterative_multi` and formerly fixed
+`iterative_*`/sparse sources retain their compatibility layouts. Legacy prefetch/pinning/loader settings or
+transforms without parallel-stateless support also preserve the implicit layout. An explicit mapping, including
+`{}`, opts into the selected backend's supported policy and rejects incompatible options. Budgeted execution
+requires parallel-stateless batch transforms; observed map and
+standalone binary execution retain ordered transform support. Built-in iterable sources require `num_worker: 0`
+in either policy; map loaders can use DataLoader workers.
+
+Validation currently constructs its dataset without the training resource spec, so it uses fixed defaults even
+when training explicitly enables adaptive control. Map evaluation uses its evaluation planner wrapper. Training
+resource-policy settings therefore do not establish validation memory or throughput behavior.
+
+For other supported `iterative_multi` layouts, opt in explicitly with `data_pipeline: {}`. Dense, indexed raw,
+and sparse NPZ children can share a budget; binary-containing mixtures use observed generic execution.
+Parallel-stateless transforms belong on the composite, not its children. Eligible dense mixtures use the packed
+backend; other supported mixtures use generic routing. Format-specific filtering and shape restrictions still
+apply. The selected `mixing` policy
+and supported record-level `sample_rate` semantics are retained. Packed record IDs are shuffled and
 bucketed by shape before the global batch is partitioned across ranks; each
 rank therefore receives the same board size at each step. Queued shape buckets
 and source cursors are included in exact checkpoint/rollback state.
@@ -442,18 +476,20 @@ mixed batches. The generic mixed path also combines compatible numeric child
 arrays directly; tensor and variable-length fields retain compatibility
 collation. Field schemas and batch-shared values are still checked.
 
-The mixed path uses one parent memory budget for decoded RAM caches, bounded
-parallel decoding, pinning, and telemetry. An all-processed mixture may also
-prepare a shared mapped cache; native raw mixtures use only the RAM caches.
+The budgeted mixed path uses one parent memory budget for decoded RAM caches,
+materialized batches, pinning, and telemetry; parallel decoding is available on the packed path.
+An eligible all-processed mixture may also prepare a shared mapped cache; native raw mixtures use only the RAM caches.
 Its output reservations include the temporary coexistence of child decode
 arrays and merged output, plus routing and lazy-key metadata. It does not
 allocate an independent adaptive budget for every child. Keep
 `dataloader_args.batch_by_boardsize: true` for mixed sizes. With
 `cuda_prefetch_batches: 1`, mixed shapes automatically select the existing
 shape-flexible CUDA lookahead loader; uniform streams retain static input slots.
-Mixed datasets without an explicit adaptive mapping retain
-the generic compatibility path. Old generic planner checkpoints cannot be
-resumed into the packed mixed path; start a new run when enabling it.
+Fresh eligible dense mixtures now select the same packed path when the mapping is omitted. All other omitted
+mixtures retain the generic compatibility path. Resume preserves the saved generic or packed backend rather than
+silently changing sample order. This fresh-run default can change the sample order compared with older omitted
+configurations. Enabling an explicit policy does not automatically convert an existing generic checkpoint into
+packed execution.
 
 ### Portable resource resolution
 
@@ -485,7 +521,7 @@ probes vary slightly. Node identities are not included in serialized resource me
 
 ### Run-scoped decoded storage
 
-Automatic processed-NPZ runs keep the source files and their format unchanged. At startup, one leader per node
+Eligible budgeted continuous processed-NPZ runs keep the source files and their format unchanged. At startup, one leader per node
 streams the fixed NPY members into a unique temporary directory. Local ranks then open the same read-only files
 with NumPy mmap, so compressed members are expanded once per node rather than once per rank. The operating system
 shares resident pages and evicts them under ordinary memory pressure; the trainer does not reserve the full
@@ -499,7 +535,7 @@ cache so their explicit byte allocation keeps its literal meaning.
 
 ### Bounded automatic adaptation
 
-`continuous` starts with a throughput-oriented plan that fits the resolved memory and CPU limits. The private-cache
+For budgeted packed NPZ, `continuous` starts with a plan that fits the resolved memory and CPU limits. The private-cache
 working set is estimated from dataset size, batch size, and shuffle lookahead. Decode concurrency starts at half the
 portable CPU ceiling; chunk size and queue depth are balanced around that count. Workers, chunk size, and queue
 depth form one layout: the controller never adjusts one value while leaving the other two in an unrelated
@@ -663,7 +699,7 @@ The four normal `data_pipeline` options are:
 
 | Option | Meaning | Default |
 | --- | --- | --- |
-| `host_memory_budget` | Maximum host-data memory for the whole node; `auto` requires safe effective available memory | `auto` |
+| `host_memory_budget` | Node-total logical host-data budget on reserved paths; observed paths accept only `auto` without enforcing a cap | `auto` |
 | `data_wait_budget` | Maximum tolerated data-wait fraction; accepts a fraction or percentage | `0.01` (1%) |
 | `data_cpu_budget` | Maximum decode CPU count for the whole node; `auto` uses effective/logical CPU facts | `auto` |
 | `adaptation` | Automatic `continuous` or fixed `manual` control | `continuous` |
@@ -677,15 +713,16 @@ configured resource cap. Byte values accept positive integers or strings such as
 the controller changes only bounded performance capacity. `manual` is reserved for an explicitly fixed,
 hardware-specific plan.
 
-Adaptive mode rejects fixed performance keys in `dataset_args`: `prefetch_threads`, `prefetch_batches`, and
-`pin_memory`. It also rejects nonempty `data_pipelines`, because stateful semantic transforms are
-not yet supported by the adaptive runtime. Format, filtering, admission, target, and augmentation options remain
+Explicit policies reject fixed performance keys in `dataset_args`: `prefetch_threads`, `prefetch_batches`, and
+`pin_memory`. Budgeted execution accepts parallel-stateless `data_pipelines`; unsupported transforms require
+the compatibility layout. Format, filtering, admission, target, and augmentation options remain
 under `dataset_args` and keep their existing semantics. Training shuffle is enabled by default and disabled with
-top-level `no_shuffle: true`; only its semantic window belongs in `dataset_args`. Loader aliases `dataloader_args.pin_memory`
-and `dataloader_args.shuffle_buffer_size` are rejected as well: pinning belongs to the adaptive plan, while the
-semantic shuffle window must be configured once as `dataset_args.shuffle_window_size` before runtime sizing.
+top-level `no_shuffle: true`; only its semantic window belongs in `dataset_args`. Explicit iterable policies reject
+loader aliases `dataloader_args.pin_memory` and `dataloader_args.shuffle_buffer_size`: pinning belongs to the
+execution layout, while the semantic shuffle window belongs in `dataset_args.shuffle_window_size`. Observed map
+loaders retain their loader pinning option.
 
-For a completely fixed performance plan, use `adaptation: manual` with all five `advanced` values:
+For a fixed dense-NPZ budgeted plan, use `adaptation: manual` with all five `advanced` values:
 
 ```yaml
 data_pipeline:
@@ -708,8 +745,9 @@ memory must be supported by the runtime.
 
 ### Fixed compatibility configuration
 
-When the adaptive mapping is omitted, explicit legacy performance controls, a nonzero `num_worker`, or nonempty
-semantic `data_pipelines` keep the existing fixed path. This preserves older configurations and direct dataset use:
+When the adaptive mapping is omitted, formerly fixed iterable dataset types, explicit legacy performance
+controls, or transforms without parallel-stateless support retain the existing layout. Nonzero `num_worker`
+does not enable a fallback for built-in iterable sources; it is rejected. Compatibility controls include:
 
 | Option | Meaning | Typical/default value |
 | --- | --- | --- |
@@ -749,7 +787,7 @@ interface. Unknown or removed options are rejected during dataset construction.
 | Packed binary | file descriptors and active readers | bounded raw entries/subrecords | no |
 | Composite | sum of child metadata | one bounded planner state | no |
 
-Automatic processed-NPZ runs normally use one run-scoped mmap cache per node, leaving ready batches and planner
+Eligible budgeted continuous processed-NPZ runs use one run-scoped mmap cache per node, leaving ready batches and planner
 state as the dominant private rank allocations. Private fallback and manual modes retain the bounded decoded NPZ
 LRU. In either backend, Python control-plane memory does not grow with rows or batches processed.
 
@@ -805,8 +843,19 @@ path, offset, row, or subrecord logic remains behind the source interface; it mu
 - Normal binary I/O remains sequential and requires no sidecar.
 - Unsupported resume, partitioning, or evaluation modes fail explicitly.
 - Source-specific physical details stay behind `RecordSource`.
-- Dense uniform NPZ has the strongest production performance coverage; other formats retain the same semantic
-  and memory contracts but should be profiled on their representative real data before performance claims.
+- Dense uniform NPZ has the strongest production performance coverage. Other formats share semantic contracts
+  where their capabilities allow, but memory accounting and execution differ; profile representative real data
+  before making performance claims.
+
+### Possible simplification order
+
+Keep public names as compatibility aliases while recommending fewer entry points for new configurations. Next,
+consolidate duplicated adapter setup where source identity, ordering, and cursor schemas remain unchanged. Only
+optimize or retire a decoder path after checking its real callers, format/filter coverage, complete-epoch field
+and sample-key parity, old-cursor continuation, and representative end-to-end performance. In particular, the
+indexed raw reader still uses the map reader internally, and dense native NPZ does not cover every indexed raw
+input. Retain format backends and saved execution layouts until those dependencies have a validated replacement;
+a shared contract does not require one universal decoder.
 
 ## Rule annotations for NPZ sources
 

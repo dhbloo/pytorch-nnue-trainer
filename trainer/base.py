@@ -770,6 +770,71 @@ class BaseTrainer:
                 )
             )
 
+    @staticmethod
+    def _single_board_size_spec(value):
+        if type(value) is int:
+            return value > 0
+        if isinstance(value, tuple):
+            return len(value) == 2 and all(type(side) is int and side > 0 for side in value)
+        if isinstance(value, list) and len(value) == 1:
+            size = value[0]
+            return (type(size) is int and size > 0) or (
+                isinstance(size, (tuple, list))
+                and len(size) == 2
+                and all(type(side) is int and side > 0 for side in size)
+            )
+        return False
+
+    def _implicit_packed_multi_candidate(self):
+        children = self.dataset_args.get("dataset_dict")
+        if not isinstance(children, dict) or not children:
+            return False
+        saved_state = getattr(self, "_preloaded_state_filename", None)
+        hint = getattr(self, "_resume_execution_hint", None)
+        if saved_state is not None:
+            if hint is None or hint.backend is None:
+                raise RuntimeError(
+                    "Cannot choose the default mixed execution backend: saved "
+                    "continuation state has no unambiguous backend"
+                )
+            if hint.backend == "generic":
+                return False
+        inherited_sizes = self.dataset_args.get("boardsizes")
+        inherited_fixed_size = self.dataset_args.get("fixed_board_size")
+        legacy_options = {"prefetch_threads", "prefetch_batches", "pin_memory"}
+        filtered_options = {
+            "filter_stm", "filter_condition", "board_input_channels",
+            "stm_input_channel", "value_target_channels",
+        }
+        for child in children.values():
+            if not isinstance(child, dict) or child.get("dataset_type") not in {
+                "batched_processed_katago_numpy", "batched_katago_numpy"
+            }:
+                return False
+            if legacy_options.intersection(child):
+                return False
+            if any(child.get(option, self.dataset_args.get(option)) is not None
+                   for option in filtered_options):
+                return False
+            if not self._single_board_size_spec(child.get("boardsizes", inherited_sizes)):
+                return False
+            if saved_state is None and not self._single_board_size_spec(
+                child.get("fixed_board_size", inherited_fixed_size)
+            ):
+                paths = child.get("data_paths", self.train_datas)
+                if isinstance(paths, str):
+                    paths = [paths]
+                if not (
+                    isinstance(paths, list)
+                    and len(paths) == 1
+                    and isinstance(paths[0], str)
+                    and paths[0].endswith(".npz")
+                    and os.path.isfile(paths[0])
+                ):
+                    # A directory can contain filtered-out files of other shapes.
+                    return False
+        return True
+
     def _resolve_adaptive_pipeline_spec(self):
         supported_types = {
             "batched_processed_katago_numpy", "batched_katago_numpy",
@@ -824,13 +889,25 @@ class BaseTrainer:
                 "data_pipeline requires num_worker=0 because its internal "
                 "decode workers own the rank-local memory budget"
             )
+        implicit_packed_multi = (
+            not policy_explicit
+            and self.dataset_type == "iterative_multi"
+            and pipeline_eligible
+            and not legacy_options.intersection(self.dataset_args)
+            and not loader_options.intersection(self.dataloader_args)
+            and self._implicit_packed_multi_candidate()
+        )
         compatibility_layout = (
             not policy_explicit
             and (
                 self.dataset_type in {
                     "iterative_processed_katago_numpy", "iterative_katago_numpy",
-                    "iterative_sparse_numpy", "sparse_numpy", "iterative_multi",
+                    "iterative_sparse_numpy", "sparse_numpy",
                 }
+                or (
+                    self.dataset_type == "iterative_multi"
+                    and not implicit_packed_multi
+                )
                 or not pipeline_eligible
                 or bool(legacy_options.intersection(self.dataset_args))
                 or bool(loader_options.intersection(self.dataloader_args))
@@ -943,7 +1020,7 @@ class BaseTrainer:
             origin="explicit" if policy_explicit else "implicit",
             compatibility_layout=compatibility_layout,
             preferred_backend=(
-                "generic" if not policy_explicit and self.dataset_type == "iterative_multi"
+                "generic" if compatibility_layout and self.dataset_type == "iterative_multi"
                 else None
             ),
             consumer_retained_batches=self.gradient_accumulation_steps,
@@ -1207,6 +1284,7 @@ class BaseTrainer:
         if isinstance(resume, dict) and isinstance(resume.get("ranks"), list):
             rank_states = self._validate_rank_resume_states(resume["ranks"])
             backends = set()
+            missing_backend = False
             for rank_state in rank_states:
                 backend = rank_state.get("execution_backend")
                 if backend is None and rank_state.get("cursor_kind") == "file_stream_v1":
@@ -1216,10 +1294,14 @@ class BaseTrainer:
                         backend = (
                             "packed" if "packed_pending" in source_cursor else "generic"
                         )
-                if backend is not None:
+                if backend is None:
+                    missing_backend = True
+                else:
                     backends.add(backend)
             if len(backends) > 1 or backends.difference({"packed", "generic"}):
                 raise RuntimeError("Cannot resume: mixed execution backends disagree")
+            if missing_backend and backends:
+                raise RuntimeError("Cannot resume: mixed execution backend is missing on some ranks")
             if backends:
                 from dataset.execution import ResumeExecutionHint
 
