@@ -1263,6 +1263,7 @@ class BaseTrainer:
         dataset_args = dict(configured_args)
         dataset_args.pop("steps_per_epoch", None)
         dataset_args.pop("observability", None)
+        dataset_args.pop("quota_child_prefetch", None)
         return dataset_args
 
     def _setup_test_data(self):

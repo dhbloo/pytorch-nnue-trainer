@@ -73,12 +73,14 @@ def _get_sample_data(
     # load dataset
     if datas is None and train_datas is not None:
         datas = train_datas
+    sample_dataset_args = dict(dataset_args)
+    sample_dataset_args.pop("quota_child_prefetch", None)
     dataset = build_dataset(
         dataset_type,
         datas,
         runtime_context=single_process_dataset_context(batch_size, mode="export"),
         shuffle=False,
-        **dataset_args,
+        **sample_dataset_args,
     )
     loader = build_data_loader(
         dataset, batch_size=batch_size, num_workers=0, shuffle=False, **dataloader_args

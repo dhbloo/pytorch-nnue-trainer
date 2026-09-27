@@ -181,6 +181,11 @@ class AdaptiveMultiMixin(PipelineLifecycleMixin):
             minimum_cache_bytes=sum(cache_floors),
             serial_execution=not packed,
             pre_reserved_semantic_bytes=indexed_catalog_bytes,
+            fixed_execution_overhead_bytes=(
+                2 * 1024**3
+                if packed and self._record_source._quota_child_prefetcher is not None
+                else 0
+            ),
             generic_source_count=len(self.datasets),
         )
         self._adaptive_pipeline_runtime = runtime
@@ -258,6 +263,14 @@ class AdaptiveMultiMixin(PipelineLifecycleMixin):
                     planner.close()
                 except Exception as exc:
                     error = error or exc
+            worker = getattr(
+                getattr(self, "_record_source", None), "_quota_child_prefetcher", None
+            )
+            if worker is not None:
+                try:
+                    worker.close()
+                except Exception as exc:
+                    error = error or exc
             for child in self.datasets:
                 close = getattr(child, "close", None)
                 if close is not None:
@@ -269,5 +282,9 @@ class AdaptiveMultiMixin(PipelineLifecycleMixin):
                 raise error
         finally:
             if self._adaptive_pipeline_runtime is not None:
-                self._adaptive_pipeline_runtime.close()
-                self._adaptive_pipeline_runtime = None
+                worker = getattr(
+                    getattr(self, "_record_source", None), "_quota_child_prefetcher", None
+                )
+                if worker is None or not worker.worker_alive:
+                    self._adaptive_pipeline_runtime.close()
+                    self._adaptive_pipeline_runtime = None

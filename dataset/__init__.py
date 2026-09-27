@@ -238,6 +238,7 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         runtime_context: DatasetRuntimeContext | None = None,
         adaptive_pipeline=None,
         resume_execution_hint=None,
+        quota_child_prefetch: bool = False,
     ) -> None:
         super().__init__()
         self.batch_pipelines = tuple(batch_pipelines)
@@ -250,6 +251,9 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
         self.mixing = MixingConfig.parse(mixing)
         self.runtime_context = runtime_context
         self.resume_execution_hint = resume_execution_hint
+        if type(quota_child_prefetch) is not bool:
+            raise TypeError("quota_child_prefetch must be a boolean")
+        self.quota_child_prefetch = quota_child_prefetch
         self.child_ids = tuple(dataset_dict)
         child_runtime = None
         if runtime_context is not None:
@@ -430,12 +434,24 @@ class MultiIterativeDataset(AdaptiveMultiMixin, PlannedBatchDataset):
             if self.execution_decision.backend == "packed"
             else CompositeRecordSource
         )
+        if self.quota_child_prefetch and (
+            self.adaptive_pipeline is None
+            or runtime_context.mode != "train"
+            or self.mixing.mode != "natural"
+            or source_cls is not PackedCompositeRecordSource
+            or not PackedCompositeRecordSource.supports(child_sources)
+        ):
+            raise ValueError(
+                "quota_child_prefetch requires a train-mode adaptive packed "
+                "natural mixture of uniform dense NPZ children"
+            )
         self._record_source = source_cls(
             child_sources,
             self.child_ids,
             weights,
             mixing=self.mixing,
             seed=runtime_context.seed,
+            **({"quota_child_prefetch": True} if self.quota_child_prefetch else {}),
         )
         self._partitioned_stream = DatasetPlanner(
             self._record_source,
@@ -589,7 +605,7 @@ def build_dataset(
         "multi": {"dataset_dict"},
         "iterative_multi": {
             "dataset_dict", "mixing", "shuffle_window_size",
-            "shuffle_buffer_bytes", "steps_per_epoch",
+            "shuffle_buffer_bytes", "steps_per_epoch", "quota_child_prefetch",
         },
     }
     accepted = common_keys | format_keys.get(dataset_type, set())

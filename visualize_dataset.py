@@ -232,6 +232,8 @@ if __name__ == "__main__":
     seed_everything(args.seed)
 
     np.set_printoptions(precision=4)
+    visualization_dataset_args = dict(args.dataset_args)
+    visualization_dataset_args.pop("quota_child_prefetch", None)
     dataset = build_dataset(
         args.dataset_type,
         args.data_paths,
@@ -240,7 +242,7 @@ if __name__ == "__main__":
         ),
         shuffle=args.shuffle,
         pipeline_args=args.data_pipelines,
-        **args.dataset_args,
+        **visualization_dataset_args,
     )
     dataloader = build_data_loader(
         dataset,

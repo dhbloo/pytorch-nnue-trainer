@@ -129,6 +129,7 @@ class AdaptivePipelineRuntime:
         minimum_cache_bytes: int = 0,
         serial_execution: bool = False,
         pre_reserved_semantic_bytes: int = 0,
+        fixed_execution_overhead_bytes: int = 0,
         generic_source_count: int = 1,
         serial_shape_count: int = 1,
     ) -> None:
@@ -157,6 +158,8 @@ class AdaptivePipelineRuntime:
             raise TypeError("serial_execution must be a boolean")
         if type(pre_reserved_semantic_bytes) is not int or pre_reserved_semantic_bytes < 0:
             raise ValueError("pre_reserved_semantic_bytes must be non-negative")
+        if type(fixed_execution_overhead_bytes) is not int or fixed_execution_overhead_bytes < 0:
+            raise ValueError("fixed_execution_overhead_bytes must be non-negative")
         generic_source_count = _positive_int("generic_source_count", generic_source_count)
         serial_shape_count = _positive_int("serial_shape_count", serial_shape_count)
         if memory_budget is not None:
@@ -219,6 +222,14 @@ class AdaptivePipelineRuntime:
                     + spec.h2d_lookahead_batches * generic_token_bytes
                 ),
             )
+        if fixed_execution_overhead_bytes:
+            constraints = replace(
+                constraints,
+                fixed_semantic_floor_bytes=(
+                    constraints.fixed_semantic_floor_bytes
+                    + fixed_execution_overhead_bytes
+                ),
+            )
         self._semantic_reservation_bytes = constraints.fixed_semantic_floor_bytes
         if pre_reserved_semantic_bytes:
             constraints = replace(
@@ -255,7 +266,9 @@ class AdaptivePipelineRuntime:
             self.epoch_lookahead_bytes = fixed_semantic_floor_bytes
             self.constraints = replace(
                 constraints,
-                fixed_semantic_floor_bytes=2 * fixed_semantic_floor_bytes,
+                fixed_semantic_floor_bytes=(
+                    constraints.fixed_semantic_floor_bytes + fixed_semantic_floor_bytes
+                ),
             )
             self.controller.constraints = self.constraints
         self._semantic_reservation = None

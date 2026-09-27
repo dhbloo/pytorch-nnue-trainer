@@ -15,6 +15,7 @@ from .composite_source import (
 from .core import canonical_pipeline_state_bytes
 from .npz_source import DenseNpzSource
 from .packed import PACKED_SOURCE_CHUNK_SIZE, PackedEnvelopeBatch, PackedRecordBlock
+from .quota_child_prefetch import QuotaChildPrefetcher
 
 
 class _CompositeSampleKeys(Sequence):
@@ -81,10 +82,14 @@ class PackedCompositeRecordSource(CompositeRecordSource):
             for source in sources
         )
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, quota_child_prefetch=False, **kwargs):
         super().__init__(*args, **kwargs)
         if not self.supports(self.child_sources):
             raise TypeError("packed mixing requires uniform dense NPZ children")
+        if type(quota_child_prefetch) is not bool:
+            raise TypeError("quota_child_prefetch must be a boolean")
+        if quota_child_prefetch and self.quotas is None:
+            raise ValueError("quota child prefetch requires a quota-based mixture")
         if self.quotas is not None or len(self.shape_codes) == 1:
             self.packed_source_chunk_size = PACKED_SOURCE_CHUNK_SIZE
         self._child_shapes = np.asarray(
@@ -98,6 +103,31 @@ class PackedCompositeRecordSource(CompositeRecordSource):
         self._identity = hashlib.sha256(
             canonical_pipeline_state_bytes(self.manifest_state())
         ).hexdigest()
+        self._quota_child_prefetcher = (
+            QuotaChildPrefetcher(self.seed, len(self.child_sources))
+            if quota_child_prefetch else None
+        )
+
+    def _draw_quota_sources(self, cursor):
+        if self._quota_child_prefetcher is not None:
+            return self._quota_child_prefetcher.next_children(cursor)
+        return super()._draw_quota_sources(cursor)
+
+    def close_cursor(self, cursor):
+        worker_error = None
+        if self._quota_child_prefetcher is not None:
+            try:
+                self._quota_child_prefetcher.close_cursor(cursor)
+            except Exception as exc:
+                worker_error = exc
+        try:
+            super().close_cursor(cursor)
+        except Exception as exc:
+            if worker_error is not None:
+                raise ExceptionGroup("packed composite cursor close failed", [worker_error, exc]) from exc
+            raise
+        if worker_error is not None:
+            raise worker_error
 
     def manifest_state(self):
         return {**super().manifest_state(), "packed_mixing": 2}
